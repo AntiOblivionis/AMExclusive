@@ -66,6 +66,17 @@ To install or upgrade, run `AMExclusive-Setup.exe` and choose `1`. Then open App
 
 To uninstall, run the same setup and choose `2`, or uninstall **AMExclusive** from **Windows Settings > Apps > Installed apps**.
 
+## Acknowledgements
+
+Thanks to the [LINUX DO community](https://linux.do/) for the discussion, support, and feedback provided during the development and testing of this project.
+
+This project uses the following open-source projects:
+
+- [MinHook](https://github.com/TsudaKageyu/minhook) — provides the Windows x64/x86 API hooking foundation.
+- [rigtorp/SPSCQueue](https://github.com/rigtorp/SPSCQueue) — provides the bounded single-producer, single-consumer queue used on the real-time audio path.
+
+Thanks to these projects and their contributors. Complete version, copyright, and license information is available in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## License and Disclaimer
 
 Project-authored source code is released under the [MIT License](LICENSE). Third-party components retain their respective upstream licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
