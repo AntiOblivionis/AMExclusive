@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">AME. logo</title>
+  <desc id="desc">AME. wordmark in a semi-bold JetBrains Mono-derived outline with a red-to-blue gradient on a white background.</desc>
+  <!-- Letterform outlines derived from JetBrains Mono, licensed under SIL Open Font License 1.1. -->
+  <defs>
+    <linearGradient id="ameGradient" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#ff2d55"/>
+      <stop offset="28%" stop-color="#ff3b30"/>
+      <stop offset="58%" stop-color="#af52de"/>
+      <stop offset="100%" stop-color="#007aff"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="360" fill="#ffffff"/>
+  <g fill="url(#ameGradient)" fill-rule="evenodd">
+    <path d="M152.80,0.00 L196.90,185.30 L403.80,185.30 L447.90,0.00 L557.50,0.00 L370.90,730.00 L229.20,730.00 L42.50,0.00 L152.80,0.00 Z M267.30,485.80 C285.00,559.60 296.40,618.10 300.00,639.10 C303.60,618.10 315.30,559.60 333.00,484.80 L382.70,274.50 L217.00,274.50 L267.30,485.80 Z" transform="translate(199.062 315.000) scale(0.38000 -0.38000)"/>
+    <path d="M165.00,0.00 L165.00,325.50 C165.00,463.80 157.50,588.70 145.90,684.10 L252.00,321.20 L342.60,321.20 L452.80,693.10 C442.60,588.70 435.00,437.90 435.00,325.50 L435.00,0.00 L537.00,0.00 L537.00,730.00 L388.40,730.00 L298.30,415.20 L211.00,730.00 L63.00,730.00 L63.00,0.00 L165.00,0.00 Z" transform="translate(411.862 315.000) scale(0.38000 -0.38000)"/>
+    <path d="M523.00,0.00 L523.00,96.40 L200.40,96.40 L200.40,333.00 L488.00,333.00 L488.00,426.20 L200.40,426.20 L200.40,633.60 L523.00,633.60 L523.00,730.00 L94.00,730.00 L94.00,0.00 L523.00,0.00 Z" transform="translate(624.662 315.000) scale(0.38000 -0.38000)"/>
+    <path d="M387.70,75.60 C387.70,127.90 352.30,164.00 300.00,164.00 C247.70,164.00 212.30,127.90 212.30,75.60 C212.30,24.70 247.70,-10.00 300.00,-10.00 C352.30,-10.00 387.70,24.70 387.70,75.60 Z" transform="translate(837.462 315.000) scale(0.38000 -0.38000)"/>
+  </g>
+</svg>

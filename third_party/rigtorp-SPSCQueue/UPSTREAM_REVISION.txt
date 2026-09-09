@@ -1,0 +1,6 @@
+Project: rigtorp/SPSCQueue
+Repository: https://github.com/rigtorp/SPSCQueue
+Revision: 1053918dbd251fbff69b24ef27fa5d51c29ec2af
+Used header: include/rigtorp/SPSCQueue.h
+Used header SHA-256: 18629CC583A1D5FC78CBC10388B4F263546858DE7220110A3031AC766630879B
+License: MIT (see LICENSE)
