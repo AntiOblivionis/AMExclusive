@@ -307,6 +307,8 @@ private:
     bool supports2_{};
     bool supports3_{};
     std::atomic<UINT32> blockAlign_{};
+    UINT32 pumpSampleRate_{};
+    UINT32 pumpQuantumFrames_{};
     UINT32 pumpBufferFrames_{};
     bool pumpMode_{};
     bool pumpStarted_{};
