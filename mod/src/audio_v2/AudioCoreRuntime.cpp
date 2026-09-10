@@ -1,4 +1,6 @@
 #include "AudioCoreRuntime.h"
+#include "../AudioErrors.h"
+#include "../AudioFormatPolicy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -290,15 +292,14 @@ void AudioCoreRuntime::OnConverterCreated(void* converter,
         return;
     }
 
-    const auto sourceBits = (source.bitsPerChannel == 16 || source.bitsPerChannel == 20 ||
+    const auto sourceBits = (source.bitsPerChannel == 16 ||
                              source.bitsPerChannel == 24 || source.bitsPerChannel == 32)
         ? source.bitsPerChannel : 0u;
     const bool localPcm = source.formatId == kAppleLinearPcm;
-    // Local PCM is captured before Apple's local-file SRC. Signed integer
-    // sources <=24-bit use the exact reversible path. Native float32 sources
-    // use the isolated deterministic float->PCM32 compatibility policy. Full
-    // 32-bit integer sources remain unsupported here because float canonical
-    // storage cannot preserve every 32-bit integer code.
+    // Local PCM is captured before Apple's local-file SRC. Register local
+    // signed int32 long enough for the worker to reject it explicitly and
+    // surface the dedicated playback error; it must never reach the float
+    // canonical mapping path.
     constexpr std::uint32_t kAppleFormatFlagIsSignedInteger = 1u << 2;
     const bool localFloat32 = localPcm &&
         (source.formatFlags & kAppleFormatFlagIsFloat) != 0 &&
@@ -306,7 +307,7 @@ void AudioCoreRuntime::OnConverterCreated(void* converter,
     const bool localExactInteger = localPcm &&
         (source.formatFlags & kAppleFormatFlagIsFloat) == 0 &&
         (source.formatFlags & kAppleFormatFlagIsSignedInteger) != 0 &&
-        sourceBits != 0 && sourceBits <= 24;
+        sourceBits != 0 && sourceBits <= 32;
     if (localPcm && ((!localFloat32 && !localExactInteger) ||
                      source.sampleRate < 8000 || source.sampleRate > 768000 ||
                      source.channelsPerFrame != 2 || source.framesPerPacket != 1 ||
@@ -883,6 +884,7 @@ void AudioCoreRuntime::OnPcmFillResult(std::int32_t result,
                                        std::uint32_t producedPackets,
                                        bool outputDataPresent,
                                        bool outputPacketsPresent) noexcept {
+    if (!callbacks_.deepDiagnostics) return;
     rawFillCalls_.fetch_add(1, std::memory_order_relaxed);
     lastFillResult_.store(result, std::memory_order_relaxed);
     lastProducedPackets_.store(producedPackets, std::memory_order_relaxed);
@@ -910,6 +912,7 @@ void AudioCoreRuntime::OnPcmFillResult(std::int32_t result,
 }
 
 void AudioCoreRuntime::RecordPcmReject(AudioCorePcmRejectReason reason) noexcept {
+    if (!callbacks_.deepDiagnostics) return;
     switch (reason) {
     case AudioCorePcmRejectReason::NoDestinationFormat:
         rejectNoDestinationFormat_.fetch_add(1, std::memory_order_relaxed);
@@ -996,8 +999,10 @@ bool AudioCoreRuntime::OnPcmOutput(void* converter, const ApplePcmFormatView& fo
                                                  discontinuity, false);
                     }
                     if (accepted) {
-                        acceptedCalls_.fetch_add(1, std::memory_order_relaxed);
-                        acceptedFrames_.fetch_add(output.frames, std::memory_order_relaxed);
+                        if (callbacks_.deepDiagnostics) {
+                            acceptedCalls_.fetch_add(1, std::memory_order_relaxed);
+                            acceptedFrames_.fetch_add(output.frames, std::memory_order_relaxed);
+                        }
                         Wake();
                     } else {
                         RecordPcmReject(AudioCorePcmRejectReason::Tap);
@@ -1201,6 +1206,20 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     }
 
     if (graphBound_) RetireCaptureLocked(true);
+
+    const bool localSignedInt32 = ammod::audio::IsUnsupportedLocalInt32(
+        snapshot.registration.encodedFormat, snapshot.registration.appleFormatFlags,
+        snapshot.registration.sourceBitDepth);
+    if (localSignedInt32) {
+        // Reject this media item, not the user's AME intent. Keeping the runtime
+        // armed guarantees that replaying the same int32 item is rejected again
+        // instead of falling through to Apple's shared renderer.
+        RetireCaptureLocked(true);
+        lastError_.store(ammod::audio::kUnsupportedLocalInt32, std::memory_order_release);
+        Emit(AudioCoreRuntimeEvent::Faulted, ammod::audio::kUnsupportedLocalInt32);
+        return;
+    }
+
     const auto generation = ++nextMediaGeneration_;
     registry_.UpdateMediaGeneration(graphConverter_, generation);
     if (!registry_.Snapshot(graphConverter_, snapshot)) return;
@@ -1209,6 +1228,19 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     if (!BuildFormat(snapshot, format)) return;
     AudioCoreCoordinatorConfig config{};
     config.sink.format = format;
+    const bool localFloat32 = snapshot.registration.encodedFormat == kAppleLinearPcm &&
+        (snapshot.registration.appleFormatFlags & kAppleFormatFlagIsFloat) != 0 &&
+        snapshot.registration.sourceBitDepth == 32;
+    const auto candidates = ammod::audio::SelectBitPerfectFormatCandidates(
+        snapshot.registration.sourceBitDepth, localFloat32);
+    config.sink.formatCandidateCount = static_cast<std::uint32_t>(candidates.count);
+    for (std::size_t index = 0; index < candidates.count; ++index) {
+        config.sink.formatCandidates[index] = {
+            format.sampleRate, format.channels,
+            candidates.values[index].validBits, candidates.values[index].containerBits,
+            PcmEncoding::SignedInteger, true,
+            static_cast<std::uint16_t>(snapshot.registration.sourceBitDepth)};
+    }
     config.sink.endpointId = nativeEndpoint_;
     config.sink.periodFrames = PeriodFrames(format.sampleRate);
     config.sink.alignmentRetries = 3;
@@ -1216,12 +1248,10 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     config.sink.onLifecycle = callbacks_.onSinkLifecycle;
     config.queueCapacity = kProductionQueueCapacity;
     config.mediaGeneration = generation;
-    const bool localFloat32 = snapshot.registration.encodedFormat == kAppleLinearPcm &&
-        (snapshot.registration.appleFormatFlags & kAppleFormatFlagIsFloat) != 0 &&
-        snapshot.registration.sourceBitDepth == 32;
     config.mappingPolicy = localFloat32
         ? PcmMappingPolicy::LocalFloat32ToPcm32
         : PcmMappingPolicy::ExactSourceInteger;
+    config.verifyBitPerfect = callbacks_.deepDiagnostics;
     const HRESULT enable = coordinator_.Enable(config);
     if (FAILED(enable) || !tap_.BindActive(graphConverter_, format, generation) ||
         !registry_.Bind(graphConverter_, generation)) {
@@ -1236,8 +1266,12 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     boundConverter_.store(graphConverter_, std::memory_order_release);
     boundMediaGeneration_.store(generation, std::memory_order_release);
     graphBound_ = true;
-    requiredPrebufferFrames_ = config.sink.periodFrames
-        ? config.sink.periodFrames : std::max<std::uint32_t>(1u, format.sampleRate / 50u);
+    // Cut over only after roughly 100 ms is already captured. A single 20 ms
+    // device period was too easy to drain during transient CPU scheduling load;
+    // this remains far below the old second-scale reservoir that hurt controls.
+    requiredPrebufferFrames_ = std::max<std::uint32_t>(
+        config.sink.periodFrames ? config.sink.periodFrames * 5u : 0u,
+        std::max<std::uint32_t>(1u, format.sampleRate / 10u));
     nativePumpSampleRate_.store(format.sampleRate, std::memory_order_release);
     nativePumpBufferedFrames_.store(
         static_cast<std::uint64_t>(coordinator_.BufferedFrames()),
@@ -1354,10 +1388,11 @@ void AudioCoreRuntime::TryActivateLocked() noexcept {
             if (SUCCEEDED(resume)) graphStarted_ = true;
         }
         lastError_.store(open, std::memory_order_release);
-        uiEnabled_.store(false, std::memory_order_release);
+        const bool playbackRejected = ammod::audio::IsPlaybackRejection(open);
+        if (!playbackRejected) uiEnabled_.store(false, std::memory_order_release);
         Emit(AudioCoreRuntimeEvent::Faulted, open);
-        RetireCaptureLocked(false);
-        registry_.RetireAll();
+        RetireCaptureLocked(playbackRejected);
+        if (!playbackRejected) registry_.RetireAll();
         return;
     }
     const HRESULT start = coordinator_.Start();
@@ -1473,8 +1508,13 @@ bool AudioCoreRuntime::BuildFormat(const ConverterRegistrationSnapshot& snapshot
     const auto sourceBits = snapshot.registration.sourceBitDepth;
     if (sourceBits == 0 || sourceBits > UINT16_MAX ||
         !IsSupportedSourceDepth(static_cast<std::uint16_t>(sourceBits))) return false;
-    const auto validBits = sourceBits == 32 ? std::uint16_t{32} : std::uint16_t{24};
-    output = {snapshot.registration.outputFormat.sampleRate, 2, validBits, 32,
+    const auto candidates = ammod::audio::SelectBitPerfectFormatCandidates(
+        sourceBits,
+        snapshot.registration.encodedFormat == kAppleLinearPcm &&
+            (snapshot.registration.appleFormatFlags & kAppleFormatFlagIsFloat) != 0);
+    if (candidates.count == 0) return false;
+    output = {snapshot.registration.outputFormat.sampleRate, 2,
+              candidates.values[0].validBits, candidates.values[0].containerBits,
               PcmEncoding::SignedInteger, true, static_cast<std::uint16_t>(sourceBits)};
     return IsValidFormat(output);
 }
@@ -1488,15 +1528,12 @@ std::uint32_t AudioCoreRuntime::NativePumpPeriodMs() const noexcept {
     const auto bufferedFrames = nativePumpBufferedFrames_.load(std::memory_order_acquire);
     if (!UiEnabled() || sampleRate < 8000 || sampleRate > 768000) return kNominalMs;
 
-    // Keep only a few hundred milliseconds of P0 queued. The former 1.0-1.5 s
-    // reservoir masked clock drift but made Pause audibly late because ACv2
-    // could keep draining already-captured audio after Apple stopped producing.
-    // The 9/10/11 ms feedback loop already corrects long-term clock skew, so
-    // 250-400 ms is enough jitter headroom without turning the queue into a
-    // user-visible control-latency buffer.
-    const std::uint64_t lowWaterFrames = sampleRate / 4u;
-    const std::uint64_t highWaterFrames =
-        (static_cast<std::uint64_t>(sampleRate) * 2u) / 5u;
+    // Keep a modest load-jitter reservoir without returning to the old 1+ s
+    // pause-latency buffer. 300-500 ms gives the producer substantially more
+    // scheduling headroom while the 9/10/11 ms loop still corrects clock drift.
+    const std::uint64_t lowWaterFrames =
+        (static_cast<std::uint64_t>(sampleRate) * 3u) / 10u;
+    const std::uint64_t highWaterFrames = sampleRate / 2u;
     if (bufferedFrames < lowWaterFrames) return kCatchUpMs;
     if (bufferedFrames > highWaterFrames) return kBackOffMs;
     return kNominalMs;

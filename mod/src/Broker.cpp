@@ -3,6 +3,7 @@
 #include "IpcTransport.h"
 
 #include <windows.h>
+#include <commctrl.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
@@ -29,6 +30,7 @@ struct Client {
 std::mutex g_mutex;
 std::mutex g_logMutex;
 std::atomic<bool> g_shutdown{};
+std::atomic<std::uint64_t> g_lastPlaybackErrorDialogSignature{};
 std::vector<Client> g_clients;
 Message g_status = [] {
     auto message = NewMessage(MessageType::StatusChanged, Role::Broker);
@@ -38,6 +40,124 @@ Message g_status = [] {
 
 void Log(const std::wstring& text);
 void Broadcast(const Message& message, HANDLE source);
+std::vector<DWORD> FindProcesses(const wchar_t* executableName);
+
+bool UseChineseUi() noexcept {
+    const LANGID language = GetUserDefaultUILanguage();
+    return PRIMARYLANGID(language) == LANG_CHINESE;
+}
+
+HWND FindAppleMusicWindow() noexcept {
+    struct Search final {
+        DWORD pid{};
+        HWND window{};
+    } search;
+    const auto processes = FindProcesses(L"AppleMusic.exe");
+    if (processes.empty()) return nullptr;
+    search.pid = processes.front();
+    EnumWindows(+[](HWND window, LPARAM context) -> BOOL {
+        auto* search = reinterpret_cast<Search*>(context);
+        DWORD pid{};
+        GetWindowThreadProcessId(window, &pid);
+        if (pid != search->pid || !IsWindowVisible(window) || GetWindow(window, GW_OWNER)) {
+            return TRUE;
+        }
+        search->window = window;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&search));
+    return search.window;
+}
+
+HRESULT CALLBACK PlaybackErrorDialogCallback(HWND dialog, UINT notification,
+                                            WPARAM, LPARAM, LONG_PTR callbackData) {
+    if (notification == TDN_CREATED && dialog) {
+        const HWND owner = reinterpret_cast<HWND>(callbackData);
+        RECT dialogRect{};
+        RECT anchorRect{};
+        const bool haveDialog = GetWindowRect(dialog, &dialogRect) != FALSE;
+        bool haveAnchor = owner && IsWindow(owner) && GetWindowRect(owner, &anchorRect) != FALSE;
+        const HMONITOR monitor = MonitorFromWindow(
+            haveAnchor ? owner : dialog, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO monitorInfo{sizeof(monitorInfo)};
+        const bool haveMonitor = monitor && GetMonitorInfoW(monitor, &monitorInfo) != FALSE;
+        if (!haveAnchor && haveMonitor) {
+            anchorRect = monitorInfo.rcWork;
+            haveAnchor = true;
+        }
+        LONG x = 0;
+        LONG y = 0;
+        if (haveDialog && haveAnchor) {
+            const LONG width = dialogRect.right - dialogRect.left;
+            const LONG height = dialogRect.bottom - dialogRect.top;
+            x = anchorRect.left + ((anchorRect.right - anchorRect.left) - width) / 2;
+            y = anchorRect.top + ((anchorRect.bottom - anchorRect.top) - height) / 2;
+            if (haveMonitor) {
+                x = std::clamp(x, monitorInfo.rcWork.left,
+                               std::max(monitorInfo.rcWork.left, monitorInfo.rcWork.right - width));
+                y = std::clamp(y, monitorInfo.rcWork.top,
+                               std::max(monitorInfo.rcWork.top, monitorInfo.rcWork.bottom - height));
+            }
+        }
+        SetWindowPos(dialog, HWND_TOPMOST, x, y, 0, 0,
+                     SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetForegroundWindow(dialog);
+    }
+    return S_OK;
+}
+
+void ShowPlaybackErrorAsync(ErrorCategory error, std::uint64_t generation) {
+    if (error != ErrorCategory::UnsupportedLocalInt32 &&
+        error != ErrorCategory::BitPerfectFormatUnavailable) {
+        return;
+    }
+    const auto signature = (generation << 16u) ^ static_cast<std::uint64_t>(error);
+    if (signature != 0 && g_lastPlaybackErrorDialogSignature.exchange(signature) == signature) {
+        return;
+    }
+    std::thread([error] {
+        const auto previousDpi = SetThreadDpiAwarenessContext(
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        const bool chinese = UseChineseUi();
+        const wchar_t* text = error == ErrorCategory::UnsupportedLocalInt32
+            ? (chinese ? L"不支持本地 32 位整数音频。"
+                       : L"Local 32-bit integer audio is not supported.")
+            : (chinese ? L"DAC 不支持此音频格式。"
+                       : L"The DAC does not support this audio format.");
+        const wchar_t* title = L"AMExclusive";
+        const wchar_t* mainInstruction = chinese ? L"无法播放" : L"Unable to play";
+        const wchar_t* button = chinese ? L"确定" : L"OK";
+        TASKDIALOG_BUTTON buttons[]{{IDOK, button}};
+        TASKDIALOGCONFIG dialog{};
+        dialog.cbSize = sizeof(dialog);
+        dialog.hwndParent = FindAppleMusicWindow();
+        dialog.dwFlags = TDF_POSITION_RELATIVE_TO_WINDOW | TDF_SIZE_TO_CONTENT;
+        dialog.pszWindowTitle = L"AMExclusive";
+        dialog.pszMainIcon = TD_ERROR_ICON;
+        dialog.pszMainInstruction = mainInstruction;
+        dialog.pszContent = text;
+        dialog.cButtons = static_cast<UINT>(std::size(buttons));
+        dialog.pButtons = buttons;
+        dialog.nDefaultButton = IDOK;
+        dialog.pfCallback = PlaybackErrorDialogCallback;
+        dialog.lpCallbackData = reinterpret_cast<LONG_PTR>(dialog.hwndParent);
+        Log(L"playback error dialog show error=" +
+            std::to_wstring(static_cast<unsigned>(error)) +
+            L" parent=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(dialog.hwndParent)));
+        if (dialog.hwndParent) SetForegroundWindow(dialog.hwndParent);
+        int pressed{};
+        const HRESULT hr = TaskDialogIndirect(&dialog, &pressed, nullptr, nullptr);
+        Log(L"playback error dialog closed hr=" + std::to_wstring(hr) +
+            L" button=" + std::to_wstring(pressed));
+        if (FAILED(hr)) {
+            // Extremely old/unusual Common Controls configurations may not
+            // expose TaskDialog. Keep a final fallback rather than losing a
+            // fail-closed playback error entirely.
+            MessageBoxW(dialog.hwndParent, text, title,
+                        MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+        }
+        if (previousDpi) SetThreadDpiAwarenessContext(previousDpi);
+    }).detach();
+}
 
 std::vector<DWORD> FindProcesses(const wchar_t* executableName) {
     std::vector<DWORD> result;
@@ -408,14 +528,30 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             }
         } else if (incoming.type == MessageType::AttemptFailed) {
             const auto generation = std::max(g_status.generation + 1, incoming.generation);
+            const auto persistedIntent = g_status.enabledIntent;
+            const bool playbackRejected =
+                incoming.error == ErrorCategory::UnsupportedLocalInt32 ||
+                incoming.error == ErrorCategory::BitPerfectFormatUnavailable;
             g_status = incoming;
             g_status.type = MessageType::StatusChanged;
             g_status.role = Role::Broker;
             g_status.generation = generation;
-            g_status.enabledIntent = 0;
-            g_status.state = RuntimeState::FailedOff;
+            if (playbackRejected && persistedIntent) {
+                // The item is rejected, not the user's AME preference. Keep
+                // fail-closed interception armed for the next play attempt.
+                g_status.enabledIntent = persistedIntent;
+                g_status.state = RuntimeState::WaitingForStream;
+                ShowPlaybackErrorAsync(incoming.error, generation);
+            } else {
+                g_status.enabledIntent = 0;
+                g_status.state = RuntimeState::FailedOff;
+            }
         }
-        if (incoming.type == MessageType::SetEnabled || incoming.type == MessageType::AttemptFailed) {
+        const bool persistIntentChange = incoming.type == MessageType::SetEnabled ||
+            (incoming.type == MessageType::AttemptFailed &&
+             incoming.error != ErrorCategory::UnsupportedLocalInt32 &&
+             incoming.error != ErrorCategory::BitPerfectFormatUnavailable);
+        if (persistIntentChange) {
             WritePrivateProfileStringW(L"mod", L"mode",
                 g_status.enabledIntent ? L"exclusive" : L"probe", BrokerIniPath().c_str());
         }
@@ -501,6 +637,7 @@ void ClientThread(HANDLE pipe) {
 
 int wmain() {
     using namespace ammod::ipc;
+    (void)SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const auto sid = CurrentUserSid();
     if (sid.empty()) return 2;
     const auto mutexName = L"Local\\AMExclusive.Broker." + sid;

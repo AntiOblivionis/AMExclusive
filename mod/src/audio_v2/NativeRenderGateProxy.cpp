@@ -1,6 +1,7 @@
 #include "NativeRenderGateProxy.h"
 
 #include <algorithm>
+#include <avrt.h>
 #include <ksmedia.h>
 #include <new>
 
@@ -865,12 +866,18 @@ DWORD WINAPI NativeAudioClientProxy::PumpThreadThunk(void* context) noexcept {
     const HANDLE stop = self->pumpStopEvent_;
     if (!stop) return 0;
 
+    DWORD mmcssIndex = 0;
+    HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssIndex);
+    if (!mmcss) mmcss = AvSetMmThreadCharacteristicsW(L"Audio", &mmcssIndex);
+    if (mmcss) (void)AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_CRITICAL);
+
     HANDLE timer = CreateWaitableTimerExW(
         nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
         TIMER_MODIFY_STATE | SYNCHRONIZE);
     if (!timer) timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
     if (!timer) {
         WaitForSingleObject(stop, INFINITE);
+        if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
         return 0;
     }
 
@@ -894,6 +901,7 @@ DWORD WINAPI NativeAudioClientProxy::PumpThreadThunk(void* context) noexcept {
 
     CancelWaitableTimer(timer);
     CloseHandle(timer);
+    if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
     return 0;
 }
 

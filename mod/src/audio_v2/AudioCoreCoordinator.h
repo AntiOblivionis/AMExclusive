@@ -21,6 +21,7 @@ struct AudioCoreCoordinatorConfig final {
     std::size_t queueCapacity{8};
     std::uint64_t mediaGeneration{1};
     PcmMappingPolicy mappingPolicy{PcmMappingPolicy::ExactSourceInteger};
+    bool verifyBitPerfect{};
 };
 
 struct AudioCoreCoordinatorStats final {
@@ -70,7 +71,9 @@ public:
     bool IsEnabled() const noexcept { return gate_.UiEnabled(); }
     AudioCoreGatePhase Phase() const noexcept { return gate_.Phase(); }
     const AudioCoreGate& Gate() const noexcept { return gate_; }
-    const PcmFormat& Format() const noexcept { return config_.sink.format; }
+    const PcmFormat& Format() const noexcept {
+        return sink_.State() == WasapiSinkState::Closed ? config_.sink.format : sink_.Format();
+    }
     std::uint64_t MediaGeneration() const noexcept { return config_.mediaGeneration; }
     const AudioCoreCoordinatorStats Stats() const noexcept;
     const BitPerfectVerifier& Verifier() const noexcept { return verifier_; }

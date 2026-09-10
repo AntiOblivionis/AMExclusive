@@ -116,7 +116,8 @@ bool RestartCurrentItem(const GlobalSystemMediaTransportControlsSession& session
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 2 || _wcsicmp(argv[1], L"restart-current") != 0) return 2;
+    if (argc != 2 || (_wcsicmp(argv[1], L"restart-current") != 0 &&
+                      _wcsicmp(argv[1], L"reject-current") != 0)) return 2;
 
     init_apartment(apartment_type::multi_threaded);
     const auto manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
@@ -129,6 +130,40 @@ int wmain(int argc, wchar_t** argv) {
         }
     }
     if (!appleSession) return 3;
+
+    if (_wcsicmp(argv[1], L"reject-current") == 0) {
+        const bool stopAccepted = appleSession.TryStopAsync().get();
+        bool stopConfirmed = false;
+        if (stopAccepted) {
+            constexpr std::uint32_t pollMs = 25;
+            constexpr std::uint32_t timeoutMs = 750;
+            for (std::uint32_t waited = 0; waited <= timeoutMs; waited += pollMs) {
+                if (appleSession.GetPlaybackInfo().PlaybackStatus() ==
+                    GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped) {
+                    stopConfirmed = true;
+                    break;
+                }
+                Sleep(pollMs);
+            }
+        }
+
+        // Stop is the strongest public GSMTC teardown for the current media
+        // session. If Apple refuses it, fail closed with pause + rewind while
+        // AME has already retired its own captured/load state.
+        bool paused = stopConfirmed;
+        bool reset = stopConfirmed;
+        if (!stopConfirmed) {
+            paused = appleSession.TryPauseAsync().get();
+            const auto timeline = appleSession.GetTimelineProperties();
+            reset = appleSession.TryChangePlaybackPositionAsync(
+                timeline.StartTime().count()).get();
+        }
+        LogRecovery("reject-current stopAccepted=" + std::to_string(stopAccepted) +
+                    " stopConfirmed=" + std::to_string(stopConfirmed) +
+                    " paused=" + std::to_string(paused) +
+                    " reset=" + std::to_string(reset));
+        return (stopConfirmed || (paused && reset)) ? 0 : 5;
+    }
 
     const MediaIdentity original = ReadMediaIdentity(appleSession);
     const auto controls = appleSession.GetPlaybackInfo().Controls();

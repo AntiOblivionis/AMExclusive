@@ -1,5 +1,6 @@
 #include "LosslessQualityLock.h"
 #include "LosslessQualityPolicy.h"
+#include "ApplePrivateOffsets.h"
 
 #include <MinHook.h>
 #include <atomic>
@@ -109,7 +110,8 @@ std::int32_t __cdecl Create(void* allocator, void* name, std::uint32_t priority,
     // Accept only the empirically verified AllowableMediaSubtypes constructor.
     // Unexpected ABI/callback shape fails the strict request, never returns the
     // old codec-only filter and silently claims highest-quality admission.
-    if (!output || !context || !callbacks || priority != 0x375 ||
+    if (!output || !context || !callbacks ||
+        priority != ammod::apple_private::core_media_filter::kStrictConstructorPriority ||
         callbacks->reset || callbacks->visit || !callbacks->accept || callbacks->fallbackCompare) {
         return -1;
     }
@@ -149,21 +151,22 @@ std::uintptr_t Word(void* object, std::size_t offset) {
 bool CollectStrict(void* filter, std::vector<void*>& strict, unsigned depth = 0) {
     if (!filter) return true;
     if (depth > 32 || strict.size() > 4096) return false;
-    auto* table = reinterpret_cast<void*>(Word(filter, 0x18));
+    namespace offsets = ammod::apple_private::core_media_filter;
+    auto* table = reinterpret_cast<void*>(Word(filter, offsets::kFilterClassTable));
     if (!table) return true;
-    auto* methods = reinterpret_cast<void*>(Word(table, 0x10));
+    auto* methods = reinterpret_cast<void*>(Word(table, offsets::kClassTableMethods));
     if (!methods) return true;
-    if (Word(methods, 0x18) == mediaBase + 0x6ca8e0) {
-        if (Word(filter, 0x40) == reinterpret_cast<std::uintptr_t>(&Accept))
+    if (Word(methods, offsets::kSimpleApplySlot) == mediaBase + offsets::kSimpleApplyRva) {
+        if (Word(filter, offsets::kSimplePredicate) == reinterpret_cast<std::uintptr_t>(&Accept))
             strict.push_back(filter);
-    } else if (Word(methods, 0x20) == mediaBase + 0x6e2f10) {
-        auto* children = reinterpret_cast<void*>(Word(filter, 0x30));
+    } else if (Word(methods, offsets::kTreeApplySlot) == mediaBase + offsets::kTreeApplyRva) {
+        auto* children = reinterpret_cast<void*>(Word(filter, offsets::kTreeChildren));
         const auto count = children ? arrayCount(children) : 0;
         if (count < 0 || count > 4096) return false;
         for (std::int64_t i = 0; i < count; ++i) {
             if (!CollectStrict(const_cast<void*>(arrayValue(children, i)), strict, depth + 1)) return false;
         }
-        return CollectStrict(reinterpret_cast<void*>(Word(filter, 0x38)), strict, depth + 1);
+        return CollectStrict(reinterpret_cast<void*>(Word(filter, offsets::kTreeFallback)), strict, depth + 1);
     }
     return true;
 }
@@ -181,7 +184,7 @@ std::int32_t __cdecl ApplyTree(void* tree, void* input, void** output, void* inf
         const auto count = input ? arrayCount(input) : 0;
         if (count < 0 || count > 65536) return -1;
         for (void* filter : strict) {
-            void* context = reinterpret_cast<void*>(Word(filter, 0x68));
+            void* context = reinterpret_cast<void*>(Word(filter, ammod::apple_private::core_media_filter::kStrictContext));
             for (std::int64_t i = 0; i < count; ++i)
                 Observe(const_cast<void*>(arrayValue(input, i)), context, filter);
         }
@@ -193,7 +196,7 @@ std::int32_t __cdecl ApplyTree(void* tree, void* input, void** output, void* inf
             void* alternate = const_cast<void*>(arrayValue(*output, i));
             bool admitted = true;
             for (void* filter : strict) {
-                if (!Accept(alternate, reinterpret_cast<void*>(Word(filter, 0x68)), filter)) {
+                if (!Accept(alternate, reinterpret_cast<void*>(Word(filter, ammod::apple_private::core_media_filter::kStrictContext)), filter)) {
                     admitted = false;
                     break;
                 }
@@ -238,7 +241,8 @@ bool Install(HMODULE media, HMODULE foundation, LogFunction log) {
     const auto status = MH_EnableHook(target);
     if (status != MH_OK && status != MH_ERROR_ENABLED) return false;
     mediaBase = reinterpret_cast<std::uintptr_t>(media);
-    auto* treeTarget = reinterpret_cast<void*>(mediaBase + 0x6e2f10);
+    auto* treeTarget = reinterpret_cast<void*>(mediaBase +
+        ammod::apple_private::core_media_filter::kTreeApplyRva);
     if (!originalTreeApply && MH_CreateHook(treeTarget, reinterpret_cast<void*>(ApplyTree),
         reinterpret_cast<void**>(&originalTreeApply)) != MH_OK) return false;
     const auto treeStatus = MH_EnableHook(treeTarget);

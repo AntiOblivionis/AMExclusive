@@ -1,10 +1,12 @@
 #include "WasapiExclusiveSink.h"
 #include "NativeRenderGateProxy.h"
+#include "../AudioErrors.h"
 
 #include <avrt.h>
 
 #include <algorithm>
 #include <cstring>
+#include <new>
 
 namespace ammod::audio_v2 {
 namespace {
@@ -51,10 +53,25 @@ HRESULT WasapiExclusiveSink::Open(const WasapiSinkConfig& config) noexcept {
     waitingForSource_.store(false, std::memory_order_release);
     resumeBlocked_.store(false, std::memory_order_release);
     endOfStreamSubmitted_.store(false, std::memory_order_release);
-    if (!MakeWasapiFormat(config_.format, waveFormat_)) {
+    const auto candidateCount = config_.formatCandidateCount == 0
+        ? 1u : config_.formatCandidateCount;
+    if (candidateCount > kMaxFormatCandidates) {
         RecordError(E_INVALIDARG);
         NotifyLifecycle(WasapiSinkLifecycleEvent::OpenExit, E_INVALIDARG);
         return E_INVALIDARG;
+    }
+    for (std::uint32_t index = 0; index < candidateCount; ++index) {
+        const auto& candidate = config_.formatCandidateCount == 0
+            ? config_.format : config_.formatCandidates[index];
+        if (!IsValidFormat(candidate) ||
+            candidate.sampleRate != config_.format.sampleRate ||
+            candidate.channels != config_.format.channels ||
+            EffectiveSourceValidBits(candidate) !=
+                EffectiveSourceValidBits(config_.format)) {
+            RecordError(E_INVALIDARG);
+            NotifyLifecycle(WasapiSinkLifecycleEvent::OpenExit, E_INVALIDARG);
+            return E_INVALIDARG;
+        }
     }
 
     const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -115,37 +132,72 @@ HRESULT WasapiExclusiveSink::InitializeClient() noexcept {
     // size returned by AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED, reactivate a fresh
     // client, and retry with a frame-derived periodicity. The format policy
     // and ownership checks around that lifecycle are project-owned.
-    const auto requested = config_.periodFrames
-        ? PeriodForFrames(config_.periodFrames, config_.format.sampleRate)
-        : kDefaultPeriod;
-    REFERENCE_TIME period = requested;
     const auto attempts = std::max<std::uint32_t>(1u, config_.alignmentRetries + 1u);
-
-    for (std::uint32_t attempt = 0; attempt < attempts; ++attempt) {
-        HRESULT hr = client_->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
-                                                 &waveFormat_.Format, nullptr);
-        if (hr == S_FALSE) hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
-        if (FAILED(hr)) return finish(hr);
-
-        hr = client_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
-            AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
-            period, period, &waveFormat_.Format, nullptr);
-        if (hr != AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
-            if (FAILED(hr)) return finish(hr);
-            break;
+    const auto candidateCount = config_.formatCandidateCount == 0
+        ? 1u : config_.formatCandidateCount;
+    bool initialized = false;
+    for (std::uint32_t candidateIndex = 0;
+         candidateIndex < candidateCount && !initialized; ++candidateIndex) {
+        if (candidateIndex != 0) {
+            const HRESULT activate = ActivateClient();
+            if (FAILED(activate)) return finish(activate);
         }
+        config_.format = config_.formatCandidateCount == 0
+            ? config_.format : config_.formatCandidates[candidateIndex];
+        if (!MakeWasapiFormat(config_.format, waveFormat_)) return finish(E_INVALIDARG);
 
-        UINT32 alignedFrames{};
-        hr = client_->GetBufferSize(&alignedFrames);
-         if (FAILED(hr) || alignedFrames == 0) return finish(FAILED(hr) ? hr : E_FAIL);
-        period = PeriodForFrames(alignedFrames, config_.format.sampleRate);
-        if (attempt + 1u >= attempts) return finish(AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED);
-        hr = ActivateClient();
-        if (FAILED(hr)) return finish(hr);
+        const auto requested = config_.periodFrames
+            ? PeriodForFrames(config_.periodFrames, config_.format.sampleRate)
+            : kDefaultPeriod;
+        REFERENCE_TIME period = requested;
+        bool unsupported = false;
+        for (std::uint32_t attempt = 0; attempt < attempts; ++attempt) {
+            HRESULT hr = client_->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                                     &waveFormat_.Format, nullptr);
+            if (hr == S_FALSE) hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
+            if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
+                unsupported = true;
+                break;
+            }
+            if (FAILED(hr)) return finish(hr);
+
+            hr = client_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
+                period, period, &waveFormat_.Format, nullptr);
+            if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
+                unsupported = true;
+                break;
+            }
+            if (hr != AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+                if (FAILED(hr)) return finish(hr);
+                initialized = true;
+                break;
+            }
+
+            UINT32 alignedFrames{};
+            hr = client_->GetBufferSize(&alignedFrames);
+            if (FAILED(hr) || alignedFrames == 0) return finish(FAILED(hr) ? hr : E_FAIL);
+            period = PeriodForFrames(alignedFrames, config_.format.sampleRate);
+            if (attempt + 1u >= attempts) return finish(AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED);
+            hr = ActivateClient();
+            if (FAILED(hr)) return finish(hr);
+        }
+        if (unsupported) continue;
     }
+    if (!initialized) return finish(ammod::audio::kBitPerfectFormatUnavailable);
 
     HRESULT hr = client_->GetBufferSize(&bufferFrames_);
     if (FAILED(hr) || bufferFrames_ == 0) return finish(FAILED(hr) ? hr : E_FAIL);
+    try {
+        if (config_.format.containerBits == 32) {
+            canonicalBuffer_.clear();
+        } else {
+            canonicalBuffer_.resize(static_cast<std::size_t>(bufferFrames_) *
+                                    config_.format.channels);
+        }
+    } catch (const std::bad_alloc&) {
+        return finish(E_OUTOFMEMORY);
+    }
 
     shutdownEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!shutdownEvent_) return finish(HRESULT_FROM_WIN32(GetLastError()));
@@ -214,21 +266,24 @@ HRESULT WasapiExclusiveSink::Start(IIntegerPcmSource& source) noexcept {
 HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
     if (!source_) return E_UNEXPECTED;
     if (!source_->CanProvide(bufferFrames_)) {
-        // Do not acquire an endpoint buffer for a temporary network wait. The
-        // Apple client remains the sole producer and the endpoint thread only
-        // resumes after the P0 mirror reports a complete device buffer. No
-        // AudioUnitRender call is made from this thread.
+        // Publish the waiting state before the second availability check. A
+        // producer that races the first check will either be observed here or
+        // see waitingForSource_ and signal sourceReadyEvent_, so no wakeup is
+        // lost while healthy playback avoids producer-cadence event traffic.
         waitingForSource_.store(true, std::memory_order_release);
-        sourceWaits_.fetch_add(1, std::memory_order_relaxed);
-        if (client_) {
-            const HRESULT stop = client_->Stop();
-            if (FAILED(stop) && stop != AUDCLNT_E_NOT_INITIALIZED) {
-                RecordError(stop);
-                state_.store(WasapiSinkState::Faulted, std::memory_order_release);
-                return stop;
+        if (!source_->CanProvide(bufferFrames_)) {
+            sourceWaits_.fetch_add(1, std::memory_order_relaxed);
+            if (client_) {
+                const HRESULT stop = client_->Stop();
+                if (FAILED(stop) && stop != AUDCLNT_E_NOT_INITIALIZED) {
+                    RecordError(stop);
+                    state_.store(WasapiSinkState::Faulted, std::memory_order_release);
+                    return stop;
+                }
             }
+            return kAudioSourceWouldBlock;
         }
-        return kAudioSourceWouldBlock;
+        waitingForSource_.store(false, std::memory_order_release);
     }
     BYTE* data = nullptr;
     HRESULT hr = render_->GetBuffer(bufferFrames_, &data);
@@ -240,7 +295,15 @@ HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
 
     std::uint32_t written = 0;
     bool endOfStream = false;
-    hr = source_->Fill(reinterpret_cast<std::int32_t*>(data), bufferFrames_, written, endOfStream);
+    auto* canonical = config_.format.containerBits == 32
+        ? reinterpret_cast<std::int32_t*>(data) : canonicalBuffer_.data();
+    hr = source_->Fill(canonical, bufferFrames_, written, endOfStream);
+    if (SUCCEEDED(hr) && written <= bufferFrames_ && config_.format.containerBits != 32) {
+        const auto sampleCount = static_cast<std::size_t>(written) * config_.format.channels;
+        if (!PackCanonicalPcm32(canonical, data, sampleCount, config_.format.containerBits)) {
+            hr = E_INVALIDARG;
+        }
+    }
     DWORD flags = 0;
     // CanProvide() is checked before GetBuffer, and the queue is single
     // consumer. A second would-block here therefore indicates a broken source
@@ -300,7 +363,9 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
     const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool uninitialize = apartment == S_OK || apartment == S_FALSE;
     DWORD mmcssIndex = 0;
-    HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Audio", &mmcssIndex);
+    HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssIndex);
+    if (!mmcss) mmcss = AvSetMmThreadCharacteristicsW(L"Audio", &mmcssIndex);
+    if (mmcss) (void)AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_CRITICAL);
 
     if (SUCCEEDED(apartment) || apartment == RPC_E_CHANGED_MODE) {
         HANDLE handles[3] = {shutdownEvent_, audioEvent_, config_.sourceReadyEvent};
@@ -436,6 +501,8 @@ void WasapiExclusiveSink::ReleaseInterfaces() noexcept {
     }
     Release(device_);
     Release(enumerator_);
+    std::fill(canonicalBuffer_.begin(), canonicalBuffer_.end(), 0);
+    canonicalBuffer_.clear();
     bufferFrames_ = 0;
 }
 

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace ammod::audio_v2 {
 
@@ -67,6 +68,8 @@ using WasapiSinkLifecycleCallback = void (*)(
 
 struct WasapiSinkConfig final {
     PcmFormat format{};
+    std::array<PcmFormat, kMaxFormatCandidates> formatCandidates{};
+    std::uint32_t formatCandidateCount{};
     std::wstring endpointId;
     std::uint32_t periodFrames{};
     std::uint32_t alignmentRetries{2};
@@ -137,6 +140,7 @@ private:
 
     WasapiSinkConfig config_{};
     WAVEFORMATEXTENSIBLE waveFormat_{};
+    std::vector<std::int32_t> canonicalBuffer_;
 
     IMMDeviceEnumerator* enumerator_{};
     IMMDevice* device_{};

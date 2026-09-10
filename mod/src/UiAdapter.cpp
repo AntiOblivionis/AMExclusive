@@ -116,6 +116,14 @@ void Log(const std::wstring& message) {
 
 std::wstring ErrorText(ErrorCategory category) {
     switch (category) {
+    case ErrorCategory::UnsupportedLocalInt32:
+        return Localized(
+            L"本地 32 位整数音频不受支持；已停止当前播放并清空音频加载",
+            L"Local 32-bit integer audio is unsupported; playback was stopped and the audio load was cleared");
+    case ErrorCategory::BitPerfectFormatUnavailable:
+        return Localized(
+            L"当前 DAC 不支持此音源所需的任何 bit-perfect 位深组合；已停止当前播放并清空音频加载",
+            L"The DAC supports none of the bit-perfect depth combinations required by this source; playback was stopped and the audio load was cleared");
     case ErrorCategory::FormatUnsupported:
         return Localized(
             L"Apple 当前共享渲染格式无法直接用于独占输出；这不代表设备不支持独占",

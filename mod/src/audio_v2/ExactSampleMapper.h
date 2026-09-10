@@ -19,22 +19,20 @@ inline bool MapP0Sample(float sample, std::uint16_t validBits,
         return false;
     }
 
+    // Integer-source P0 must already lie exactly on the original PCM lattice.
+    // Scaling an IEEE float by 2^31 is exact for 16/24-bit source codes; do not
+    // run a general-purpose rounding algorithm on the real-time sink thread.
+    // Any fractional result means the sample has been altered and must fail
+    // closed rather than being rounded into a plausible PCM code.
     const double scaled = static_cast<double>(sample) * 2147483648.0;
-    // Do not depend on the calling thread's floating-point rounding mode.
-    // The explicit branch implements round-to-nearest, ties-to-even.
-    const double lower = std::floor(scaled);
-    const double fraction = scaled - lower;
-    const double rounded = fraction < 0.5
-        ? lower
-        : (fraction > 0.5
-               ? lower + 1.0
-               : (std::fmod(lower, 2.0) == 0.0 ? lower : lower + 1.0));
-    if (!std::isfinite(rounded) || rounded < static_cast<double>(std::numeric_limits<std::int32_t>::min()) ||
-        rounded > static_cast<double>(std::numeric_limits<std::int32_t>::max())) {
+    if (!std::isfinite(scaled) ||
+        scaled < static_cast<double>(std::numeric_limits<std::int32_t>::min()) ||
+        scaled > static_cast<double>(std::numeric_limits<std::int32_t>::max())) {
         return false;
     }
 
-    const auto container = static_cast<std::int64_t>(rounded);
+    const auto container = static_cast<std::int64_t>(scaled);
+    if (static_cast<double>(container) != scaled) return false;
     const auto paddingBits = static_cast<std::uint16_t>(32u - validBits);
     const auto paddingMask = paddingBits == 32
         ? std::numeric_limits<std::uint32_t>::max()

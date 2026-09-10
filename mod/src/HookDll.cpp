@@ -14,6 +14,7 @@
 #include "IpcProtocol.h"
 #include "IpcTransport.h"
 #include "AudioFormatPolicy.h"
+#include "ApplePrivateOffsets.h"
 #include "SampleConversion.h"
 #include "LosslessQualityLock.h"
 #include "LosslessQualityPolicy.h"
@@ -176,7 +177,8 @@ using FigAlternateHasLosslessAudioFn = unsigned char(__cdecl*)(void*);
 using FigAlternateAllowableMediaSubtypeFilterCreateFn = AppleOSStatus(__cdecl*)(
     void*, void*, void*, void**);
 // CoreMedia 1.1540.23042.0 x64 ABI. The tenth argument is copied into the
-// playback-bitrate monitor's startsOnFirstEligibleVariant byte at object +0x58.
+// playback-bitrate monitor's startsOnFirstEligibleVariant byte at the field
+// inventoried by ApplePrivateOffsets.h.
 using FigAlternatePlaybackBitrateMonitorCreateFn = AppleOSStatus(__cdecl*)(
     void*, void*, void*, void*, void*, void*, void*, void*, void*, unsigned char, void**);
 using FigAlternateFilterTreeSetFallbackBranchFn = AppleOSStatus(__cdecl*)(void*, void*);
@@ -2012,6 +2014,30 @@ bool LaunchMediaRoundTripAfterFailedNaturalTransition(
     return true;
 }
 
+bool LaunchMediaControlCommand(std::wstring_view action, DWORD& helperPid) {
+    wchar_t modulePath[32768]{};
+    const DWORD chars = GetModuleFileNameW(
+        g_module, modulePath, static_cast<DWORD>(std::size(modulePath)));
+    if (!chars || chars >= std::size(modulePath) || action.empty()) return false;
+    const std::filesystem::path helper =
+        std::filesystem::path(modulePath).parent_path() / L"am_exclusive_media_control.exe";
+    if (GetFileAttributesW(helper.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+    std::wstring command = L"\"" + helper.wstring() + L"\" " + std::wstring(action);
+    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+    mutableCommand.push_back(L'\0');
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(helper.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, helper.parent_path().c_str(),
+                        &startup, &process)) {
+        return false;
+    }
+    helperPid = process.dwProcessId;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
+}
+
 bool RewriteFreshStreamingConverterDestination(
     const AudioStreamBasicDescription* source,
     const AudioStreamBasicDescription* destination,
@@ -2044,7 +2070,7 @@ bool RewriteFreshStreamingConverterDestination(
     const auto age = matchedCommit.committedTick != 0
         ? GetTickCount64() - matchedCommit.committedTick : UINT64_MAX;
     const bool supportedDepth = matchedCommit.sourceBitDepth == 16 ||
-        matchedCommit.sourceBitDepth == 20 || matchedCommit.sourceBitDepth == 24 ||
+        matchedCommit.sourceBitDepth == 24 ||
         matchedCommit.sourceBitDepth == 32;
     if (age > 500 || matchedCommit.localPcm ||
         matchedCommit.sampleRate != sourceRate ||
@@ -2313,10 +2339,10 @@ AppleOSStatus __cdecl HookAudioConverterReset(void* converter) {
         return agentBase && value >= agentBase ? value - agentBase : 0;
     };
     const bool seekReset = resetStackCount >= 3 &&
-        resetRva(resetStack[0]) == 0x40B9FA &&
-        resetRva(resetStack[1]) == 0x82F6BC &&
-        (resetRva(resetStack[2]) == 0xB1E8AD ||
-         resetRva(resetStack[2]) == 0xB1E972);
+        resetRva(resetStack[0]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame0 &&
+        resetRva(resetStack[1]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame1 &&
+        (resetRva(resetStack[2]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame2[0] ||
+         resetRva(resetStack[2]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame2[1]);
     const AppleOSStatus result = g_originalAudioConverterReset(converter);
     std::shared_ptr<LocalPcmQueue> resetQueue;
     {
@@ -2358,15 +2384,15 @@ std::uint32_t ReadBigEndianU32(const std::uint8_t* bytes) {
 bool ParseAlacSpecificConfig(const void* data, std::uint32_t dataSize,
                              std::uint32_t& bitDepth, std::uint32_t& channels,
                              std::uint32_t& sampleRate, std::uint32_t& configOffset) {
-    if (!data || dataSize < 24) return false;
+    namespace offsets = ammod::apple_private::alac_cookie;
+    if (!data || dataSize < offsets::kConfigBytes) return false;
     const auto* bytes = static_cast<const std::uint8_t*>(data);
-    constexpr std::uint32_t offsets[] = {0, 12, 24};
-    for (const auto offset : offsets) {
-        if (offset + 24 > dataSize) continue;
-        const auto candidateBits = static_cast<std::uint32_t>(bytes[offset + 5]);
-        const auto candidateChannels = static_cast<std::uint32_t>(bytes[offset + 9]);
-        const auto candidateRate = ReadBigEndianU32(bytes + offset + 20);
-        if ((candidateBits == 16 || candidateBits == 20 || candidateBits == 24 ||
+    for (const auto offset : offsets::kCandidateOffsets) {
+        if (offset + offsets::kConfigBytes > dataSize) continue;
+        const auto candidateBits = static_cast<std::uint32_t>(bytes[offset + offsets::kBitDepth]);
+        const auto candidateChannels = static_cast<std::uint32_t>(bytes[offset + offsets::kChannels]);
+        const auto candidateRate = ReadBigEndianU32(bytes + offset + offsets::kSampleRate);
+        if ((candidateBits == 16 || candidateBits == 24 ||
              candidateBits == 32) && candidateChannels > 0 && candidateChannels <= 8 &&
             candidateRate >= 8000 && candidateRate <= 768000) {
             bitDepth = candidateBits;
@@ -2386,7 +2412,7 @@ bool IsSupportedSourceBitDepth(std::uint32_t bitDepth) {
 std::uint16_t OutputValidBitsForSource(std::uint32_t sourceBitDepth) {
     // Apple Music lossless is at most 24-bit.  This endpoint rejects packed 16/24-bit
     // containers but accepts 24 valid bits in a 32-bit PCM container.  Padding a
-    // 16/20-bit integer source to 24 valid bits is lossless and adds no information.
+    // A 16-bit integer source carried by a wider endpoint container remains exact.
     return ammod::audio::OutputValidBitsForSource(sourceBitDepth);
 }
 
@@ -3320,15 +3346,12 @@ bool InstallQualityLockHooks() {
     // Apple Music 1.6.4.90 / CoreMedia 1.1540.23042.0 x64. Local-file scrubbing
     // bypasses the public IMFMediaEngine and AVCF seek exports and enters this private
     // itemasync dispatcher. Fail closed on any package drift before touching the RVA.
-    constexpr std::uintptr_t coreMediaSetCurrentTimeRva = 0x008EA2C0;
-    constexpr BYTE expectedSetCurrentTimePrologue[] = {
-        0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18,
-        0x57, 0x41, 0x56, 0x41, 0x57};
     auto* coreMediaSetCurrentTime = reinterpret_cast<BYTE*>(coreMedia) +
-        coreMediaSetCurrentTimeRva;
+        ammod::apple_private::core_media_seek::kSetCurrentTimeRva;
     const bool coreMediaSeekSignature = std::memcmp(
-        coreMediaSetCurrentTime, expectedSetCurrentTimePrologue,
-        sizeof(expectedSetCurrentTimePrologue)) == 0;
+        coreMediaSetCurrentTime,
+        ammod::apple_private::core_media_seek::kSetCurrentTimePrologue.data(),
+        ammod::apple_private::core_media_seek::kSetCurrentTimePrologue.size()) == 0;
     const bool coreMediaSeek = coreMediaSeekSignature && HookAddress(
         coreMediaSetCurrentTime,
         reinterpret_cast<void*>(&HookCoreMediaInternalSetCurrentTime),
@@ -4339,15 +4362,30 @@ void AudioCoreRuntimeEventCallback(void* context,
                        ammod::ipc::RuntimeState::Active, true);
         break;
     }
-    case ammod::audio_v2::AudioCoreRuntimeEvent::Faulted:
-        g_nativeP0Puller.DisableForUiOff();
-        g_ipcEnabled.store(false, std::memory_order_release);
-        g_audioCoreGate.SetUiEnabled(false);
-        Log(L"audio core v2 faulted; UI intent forced off result=" + HResultText(result));
+    case ammod::audio_v2::AudioCoreRuntimeEvent::Faulted: {
+        const bool playbackRejected = ammod::audio::IsPlaybackRejection(result);
+        if (!playbackRejected) {
+            g_nativeP0Puller.DisableForUiOff();
+            g_ipcEnabled.store(false, std::memory_order_release);
+            g_audioCoreGate.SetUiEnabled(false);
+            Log(L"audio core v2 faulted; UI intent forced off result=" + HResultText(result));
+        } else {
+            Log(L"audio core v2 rejected current playback; AME remains armed result=" +
+                HResultText(result));
+            DWORD helperPid{};
+            const bool launched = LaunchMediaControlCommand(L"reject-current", helperPid);
+            Log(L"audio core v2 rejected current playback; stop-and-unload helper launched=" +
+                std::to_wstring(launched) + L" pid=" + std::to_wstring(helperPid));
+        }
         SendAgentEvent(ammod::ipc::MessageType::AttemptFailed,
-                       ammod::ipc::RuntimeState::FailedOff, false, {}, nullptr, result,
-                       ammod::ipc::CategorizeAudioError(result), L"audio_core_v2_faulted");
+                       playbackRejected ? ammod::ipc::RuntimeState::WaitingForStream
+                                        : ammod::ipc::RuntimeState::FailedOff,
+                       playbackRejected, {}, nullptr, result,
+                       ammod::ipc::CategorizeAudioError(result),
+                       playbackRejected ? L"audio_core_v2_playback_rejected"
+                                        : L"audio_core_v2_faulted");
         break;
+    }
     case ammod::audio_v2::AudioCoreRuntimeEvent::Disabled:
         SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
                        ammod::ipc::RuntimeState::Off, false);
@@ -4937,8 +4975,8 @@ AppleOSStatus __cdecl HookV2AudioConverterSetProperty(void* converter,
                                                       std::uint32_t propertyId,
                                                       std::uint32_t dataSize,
                                                       const void* data) {
-    constexpr std::uint32_t nativeCursorProperty = 0x63706563; // 'cpec'
-    const bool serializedCursorUpdate = propertyId == nativeCursorProperty &&
+    const bool serializedCursorUpdate = propertyId ==
+        ammod::apple_private::audio_converter_property::kCursor &&
         g_nativeP0Puller.Tracks(converter);
     std::unique_lock<std::mutex> p0PropertyLock;
     if (serializedCursorUpdate) p0PropertyLock = std::unique_lock<std::mutex>(g_p0FillMutex);
@@ -4980,16 +5018,14 @@ AppleOSStatus __cdecl HookV2AudioConverterSetProperty(void* converter,
                     L" getProperty=" + std::to_wstring(
                         reinterpret_cast<std::uintptr_t>(g_v2OriginalAudioConverterGetProperty)));
                 if (g_v2OriginalAudioConverterGetProperty) {
-                    constexpr std::uint32_t currentInputDescription = 0x61636964; // 'acid'
-                    constexpr std::uint32_t currentOutputDescription = 0x61636F64; // 'acod'
                     AudioStreamBasicDescription refreshedSource{};
                     AudioStreamBasicDescription refreshedDestination{};
                     std::uint32_t sourceSize = sizeof(refreshedSource);
                     std::uint32_t destinationSize = sizeof(refreshedDestination);
                     const auto sourceResult = g_v2OriginalAudioConverterGetProperty(
-                        converter, currentInputDescription, &sourceSize, &refreshedSource);
+                        converter, ammod::apple_private::audio_converter_property::kCurrentInputDescription, &sourceSize, &refreshedSource);
                     const auto destinationResult = g_v2OriginalAudioConverterGetProperty(
-                        converter, currentOutputDescription, &destinationSize,
+                        converter, ammod::apple_private::audio_converter_property::kCurrentOutputDescription, &destinationSize,
                         &refreshedDestination);
                     Log(L"v2 ALAC cookie refresh query converter=" +
                         std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)) +
@@ -5063,19 +5099,19 @@ AppleOSStatus __cdecl HookV2AudioConverterGetProperty(void* converter,
     }
     if (result == 0 && g_audioCoreRuntime.UiEnabled() && data && dataSize &&
         *dataSize >= sizeof(AudioStreamBasicDescription) &&
-        (propertyId == 0x61636964 || propertyId == 0x61636F64)) {
+        (propertyId == ammod::apple_private::audio_converter_property::kCurrentInputDescription ||
+         propertyId == ammod::apple_private::audio_converter_property::kCurrentOutputDescription)) {
         const auto* format = static_cast<const AudioStreamBasicDescription*>(data);
         Log(L"v2 AudioConverterGetProperty converter=" +
             std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)) +
             L" property=" + AppleFormatIdText(propertyId) + L" " +
             AppleFormatText(format));
-        if (propertyId == 0x61636F64 && format->mFormatID == 0x6C70636D &&
+        if (propertyId == ammod::apple_private::audio_converter_property::kCurrentOutputDescription && format->mFormatID == 0x6C70636D &&
             g_v2OriginalAudioConverterGetProperty) {
-            constexpr std::uint32_t currentInputDescription = 0x61636964; // 'acid'
             AudioStreamBasicDescription source{};
             std::uint32_t sourceSize = sizeof(source);
             if (g_v2OriginalAudioConverterGetProperty(
-                    converter, currentInputDescription, &sourceSize, &source) == 0 &&
+                    converter, ammod::apple_private::audio_converter_property::kCurrentInputDescription, &sourceSize, &source) == 0 &&
                 sourceSize >= sizeof(source) && source.mFormatID == 0x716C6163) {
                 const auto sourceView = ApplePcmFormatViewFromAsbd(&source);
                 const auto destinationView = ApplePcmFormatViewFromAsbd(format);
@@ -5299,16 +5335,19 @@ AppleOSStatus __cdecl HookV2AudioConverterReset(void* converter) {
     const auto localQueue = FindV2LocalQueue(converter);
     bool localSeekReset{};
     if (localQueue) {
-        void* resetStack[3]{};
-        const auto count = CaptureStackBackTrace(1, 3, resetStack, nullptr);
+        std::array<void*, ammod::apple_private::agent_stack::kLocalSeekResetFrames> resetStack{};
+        const auto count = CaptureStackBackTrace(
+            1, static_cast<DWORD>(resetStack.size()), resetStack.data(), nullptr);
         const auto agentBase = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
         const auto rva = [agentBase](void* address) -> std::uintptr_t {
             const auto value = reinterpret_cast<std::uintptr_t>(address);
             return agentBase && value >= agentBase ? value - agentBase : 0;
         };
-        localSeekReset = count >= 3 && rva(resetStack[0]) == 0x40B9FA &&
-            rva(resetStack[1]) == 0x82F6BC &&
-            (rva(resetStack[2]) == 0xB1E8AD || rva(resetStack[2]) == 0xB1E972);
+        localSeekReset = count >= 3 &&
+            rva(resetStack[0]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame0 &&
+            rva(resetStack[1]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame1 &&
+            (rva(resetStack[2]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame2[0] ||
+             rva(resetStack[2]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame2[1]);
     }
     const bool trackedP0 = g_nativeP0Puller.Tracks(converter);
     if (trackedP0) g_nativeP0Puller.PauseForReset(converter);
@@ -5483,12 +5522,14 @@ AppleOSStatus __cdecl HookV2AudioUnitSetProperty(void* unit, std::uint32_t prope
 AppleOSStatus __cdecl HookV2AudioUnitRender(void* unit, std::uint32_t* actionFlags,
                                               const void* timestamp, std::uint32_t bus,
                                               std::uint32_t frames, void* buffers) {
-    // Observation only. Apple's own scheduler remains the sole caller that
-    // pulls the graph; the v2 sink never calls AudioUnitRender itself.
-    const auto enterQpc = CurrentQpc();
+    // Production is observation-only and must stay effectively transparent on
+    // Apple's real-time render thread. Deep PCM signatures/timestamp diagnostics
+    // are opt-in through native_trace; they are never needed for playback.
+    const bool deepDiagnostics = g_nativeTraceEnabled.load(std::memory_order_relaxed);
+    const auto enterQpc = deepDiagnostics ? CurrentQpc() : 0;
     AppleAudioTimeStamp observed{};
     const bool hasTimestamp = timestamp != nullptr;
-    if (hasTimestamp) {
+    if (hasTimestamp && (!kNativeAcquisitionPassthrough || deepDiagnostics)) {
         std::memcpy(&observed, timestamp, sizeof(observed));
         std::lock_guard lock(g_audioUnitRenderTemplateMutex);
         g_v2RenderTemplateSequence.fetch_add(1, std::memory_order_acq_rel);
@@ -5501,9 +5542,11 @@ AppleOSStatus __cdecl HookV2AudioUnitRender(void* unit, std::uint32_t* actionFla
     }
     const auto result = g_v2OriginalAudioUnitRender
         ? g_v2OriginalAudioUnitRender(unit, actionFlags, timestamp, bus, frames, buffers) : -1;
-    const auto returnQpc = CurrentQpc();
     const auto call = g_v2ObservedRenderCalls.fetch_add(1, std::memory_order_relaxed) + 1;
     if (result != 0) g_v2P1RenderErrors.fetch_add(1, std::memory_order_relaxed);
+    if (!deepDiagnostics) return result;
+
+    const auto returnQpc = CurrentQpc();
     if (!hasTimestamp) g_v2P1TimestampMissingCalls.fetch_add(1, std::memory_order_relaxed);
 
     std::uint32_t bufferCount{};
@@ -5823,7 +5866,9 @@ void V2OnNativeReset(void* context, void* client, HRESULT result) noexcept {
 void V2OnNativeGetBuffer(void*, void* client, std::uint32_t frames,
                          HRESULT result, bool shadow) noexcept {
     const auto call = g_v2NativeGetBufferCalls.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (call <= 12 || FAILED(result) || shadow) {
+    const bool trace = g_nativeTraceEnabled.load(std::memory_order_relaxed);
+    if (FAILED(result) || (!shadow && call <= 4) ||
+        (trace && (call <= 12 || call % 256u == 0))) {
         Log(L"v2 native GetBuffer client=" +
             std::to_wstring(reinterpret_cast<std::uintptr_t>(client)) +
             L" frames=" + std::to_wstring(frames) + L" result=" +
@@ -5835,7 +5880,9 @@ void V2OnNativeGetBuffer(void*, void* client, std::uint32_t frames,
 void V2OnNativeReleaseBuffer(void*, void* client, std::uint32_t frames,
                              HRESULT result, bool shadow) noexcept {
     const auto call = g_v2NativeReleaseBufferCalls.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (call <= 12 || FAILED(result) || shadow) {
+    const bool trace = g_nativeTraceEnabled.load(std::memory_order_relaxed);
+    if (FAILED(result) || (!shadow && call <= 4) ||
+        (trace && (call <= 12 || call % 256u == 0))) {
         Log(L"v2 native ReleaseBuffer client=" +
             std::to_wstring(reinterpret_cast<std::uintptr_t>(client)) +
             L" frames=" + std::to_wstring(frames) + L" result=" +
@@ -5845,6 +5892,9 @@ void V2OnNativeReleaseBuffer(void*, void* client, std::uint32_t frames,
 }
 
 void V2OnNativeMethod(void*, void* client, const wchar_t* method, HRESULT result) noexcept {
+    // GetCurrentPadding is called at render cadence. Successful proxy-method
+    // tracing is therefore opt-in; failures remain visible in production.
+    if (SUCCEEDED(result) && !g_nativeTraceEnabled.load(std::memory_order_relaxed)) return;
     Log(L"v2 native client method=" + (method ? std::wstring(method) : std::wstring()) +
         L" client=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(client)) +
         L" result=" + HResultText(result) + L" qpc=" +
@@ -6232,8 +6282,7 @@ public:
         const bool commitIsFresh = commit.committedTick != 0 &&
             GetTickCount64() - commit.committedTick <= 500 && commit.channels == 2;
         const bool restoringFloatDecoder = commitIsFresh && IsWaveFloat(format) &&
-            (commit.sourceBitDepth == 16 || commit.sourceBitDepth == 20 ||
-             commit.sourceBitDepth == 24);
+            (commit.sourceBitDepth == 16 || commit.sourceBitDepth == 24);
         const auto committedContainerBits = restoringFloatDecoder && commit.sourceBitDepth == 16
             ? std::uint16_t{16} : std::uint16_t{32};
         const auto committedValidBits = restoringFloatDecoder && commit.sourceBitDepth == 16
@@ -6296,8 +6345,7 @@ public:
         renderFloatToInteger_ = ExclusiveRequested() && IsWaveFloat(appleRequestedFormat) &&
             IsWaveInteger(format) && format && format->nChannels == 2 &&
             supportedIntegerContainer &&
-            (conversionSourceBitDepth == 16 || conversionSourceBitDepth == 20 ||
-             conversionSourceBitDepth == 24);
+            (conversionSourceBitDepth == 16 || conversionSourceBitDepth == 24);
         renderConversionSourceBitDepth_ = renderFloatToInteger_
             ? conversionSourceBitDepth : 0;
         renderConversionChannels_ = format ? format->nChannels : 0;
@@ -7909,7 +7957,8 @@ DWORD WINAPI InitializeHooks(void*) {
         &g_audioCoreRuntime, &AudioCoreRuntimeEventCallback, &V2OnSinkLifecycle,
         &V2PrepareNativeHandoff, &V2FinalizeNativeHandoff,
         &V2ResumeNativeAfterFailedHandoff, &V2PrepareNativeGraphHandoff,
-        &V2ResumeNativeGraphAfterFailedHandoff, kNativeAcquisitionPassthrough};
+        &V2ResumeNativeGraphAfterFailedHandoff, kNativeAcquisitionPassthrough,
+        g_nativeTraceEnabled.load(std::memory_order_acquire)};
     if (!g_audioCoreRuntime.Start(runtimeCallbacks)) {
         Log(L"audio core v2 runtime worker failed to start; core remains fail-closed");
     }

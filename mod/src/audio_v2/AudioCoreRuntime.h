@@ -37,6 +37,9 @@ struct AudioCoreRuntimeCallbacks final {
     // Passthrough handoff keeps Apple's AudioUnit and software IAudioClient
     // scheduler running while only the physical endpoint ownership changes.
     bool nativeHandoffPreservesScheduling{};
+    // Expensive per-sample verification is diagnostic-only. Production keeps
+    // the exact mapper fail-closed but does not remap every sample a second time.
+    bool deepDiagnostics{};
 };
 
 struct AudioCorePcmFillStats final {

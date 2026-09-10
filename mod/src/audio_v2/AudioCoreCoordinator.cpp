@@ -48,8 +48,10 @@ HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) n
     token_ = *token;
     nextSequence_ = 0;
     verifier_.Reset(config_.sink.format, config_.mediaGeneration);
-    BitPerfectVerifier* verifier = config_.mappingPolicy == PcmMappingPolicy::ExactSourceInteger
-        ? &verifier_ : nullptr;
+    BitPerfectVerifier* verifier =
+        config_.verifyBitPerfect &&
+        config_.mappingPolicy == PcmMappingPolicy::ExactSourceInteger
+            ? &verifier_ : nullptr;
     source_.emplace(*queue_, config_.sink.format, config_.mediaGeneration,
                     verifier, config_.mappingPolicy);
     capturedBlocks_.store(0, std::memory_order_release);
@@ -90,7 +92,10 @@ bool AudioCoreCoordinator::PushResult(bool pushed, std::uint32_t frames) noexcep
             (frames + kMaxBlockFrames - 1u) / kMaxBlockFrames,
             std::memory_order_relaxed);
         capturedFrames_.fetch_add(frames, std::memory_order_relaxed);
-        if (sourceReadyEvent_) SetEvent(sourceReadyEvent_);
+        // The producer notification exists only to restart a sink that had to
+        // stop for source starvation. Signaling it for every healthy P0 block
+        // needlessly wakes the real-time render thread at producer cadence.
+        if (sourceReadyEvent_ && sink_.WaitingForSource()) SetEvent(sourceReadyEvent_);
     } else {
         droppedBlocks_.fetch_add(
             (frames + kMaxBlockFrames - 1u) / kMaxBlockFrames,

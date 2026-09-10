@@ -1,5 +1,7 @@
 #pragma once
 
+#include "AudioErrors.h"
+
 #include <windows.h>
 #include <audioclient.h>
 
@@ -77,6 +79,8 @@ enum class ErrorCategory : std::uint16_t {
     InitializeFailed,
     Timeout,
     Internal,
+    UnsupportedLocalInt32,
+    BitPerfectFormatUnavailable,
 };
 
 #pragma pack(push, 1)
@@ -117,6 +121,10 @@ inline bool IsValid(const Message& message) noexcept {
 inline ErrorCategory CategorizeAudioError(HRESULT hr) noexcept {
     switch (hr) {
     case S_OK: return ErrorCategory::None;
+    case ammod::audio::kUnsupportedLocalInt32:
+        return ErrorCategory::UnsupportedLocalInt32;
+    case ammod::audio::kBitPerfectFormatUnavailable:
+        return ErrorCategory::BitPerfectFormatUnavailable;
     case AUDCLNT_E_UNSUPPORTED_FORMAT: return ErrorCategory::FormatUnsupported;
     case AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED: return ErrorCategory::ExclusiveNotAllowed;
     case AUDCLNT_E_DEVICE_IN_USE: return ErrorCategory::DeviceInUse;
@@ -131,6 +139,9 @@ inline ErrorCategory CategorizeAudioError(HRESULT hr) noexcept {
 inline std::wstring_view MessageKey(ErrorCategory category) noexcept {
     switch (category) {
     case ErrorCategory::None: return L"none";
+    case ErrorCategory::UnsupportedLocalInt32: return L"unsupported_local_int32";
+    case ErrorCategory::BitPerfectFormatUnavailable:
+        return L"bit_perfect_format_unavailable";
     case ErrorCategory::FormatUnsupported: return L"format_unsupported";
     case ErrorCategory::ExclusiveNotAllowed: return L"exclusive_not_allowed";
     case ErrorCategory::DeviceInUse: return L"device_in_use";
