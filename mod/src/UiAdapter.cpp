@@ -484,8 +484,10 @@ void ApplyStatus(const Controls::ToggleSwitch& toggle) {
 }
 
 void ApplyHardwareBufferStatus(const Controls::TextBox& input) {
-    if (!input || g_hardwareBufferInputDirty.load() ||
-        input.FocusState() != Xaml::FocusState::Unfocused) return;
+    if (!input) return;
+    const bool empty = input.Text().empty();
+    if (!empty && (g_hardwareBufferInputDirty.load() ||
+                   input.FocusState() != Xaml::FocusState::Unfocused)) return;
     const int requested = g_requestedHardwareBufferMs.load();
     const auto value = requested >= 0
         ? static_cast<std::uint32_t>(requested)
@@ -556,6 +558,7 @@ void RememberToggle(const Controls::ToggleSwitch& toggle) {
 
 void RememberHardwareBufferBox(const Controls::TextBox& input) {
     std::lock_guard lock(g_uiTargetMutex);
+    if (!g_hardwareBufferBox.get()) g_hardwareBufferInputDirty.store(false);
     g_hardwareBufferBox = make_weak(input);
     auto current = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
     if (!g_dispatcher) g_dispatcher = current ? current : input.DispatcherQueue();
