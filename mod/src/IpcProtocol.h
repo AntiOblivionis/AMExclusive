@@ -12,7 +12,7 @@
 namespace ammod::ipc {
 
 inline constexpr std::uint32_t kMagic = 0x50494D41; // "AMIP" little-endian
-inline constexpr std::uint16_t kProtocolMajor = 1;
+inline constexpr std::uint16_t kProtocolMajor = 2;
 inline constexpr std::uint16_t kProtocolMinor = 0;
 inline constexpr std::size_t kEndpointIdChars = 256;
 inline constexpr std::size_t kEndpointNameChars = 128;
@@ -42,6 +42,7 @@ enum class MessageType : std::uint16_t {
     // Message layout is deliberately reused: `detail` carries the action and
     // `generation` carries the seek gesture epoch.
     TransportIntent = 9,
+    SetHardwareBuffer = 10,
 };
 
 enum class RuntimeState : std::uint16_t {
@@ -100,6 +101,7 @@ struct Message {
     RuntimeState state{RuntimeState::Off};
     ErrorCategory error{ErrorCategory::None};
     HRESULT hresult{S_OK};
+    std::uint32_t hardwareBufferMs{20};
     std::uint8_t enabledIntent{};
     std::uint8_t reserved[7]{};
     wchar_t endpointId[kEndpointIdChars]{};

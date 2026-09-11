@@ -56,6 +56,11 @@ std::atomic<bool> g_connected{};
 std::atomic<bool> g_suppressToggle{};
 std::atomic<int> g_programmaticToggleValue{-1};
 std::atomic<int> g_pendingEnabled{-1};
+std::atomic<int> g_pendingHardwareBufferMs{-1};
+std::atomic<int> g_requestedHardwareBufferMs{-1};
+std::atomic<ULONGLONG> g_hardwareBufferAckDeadlineTick{};
+std::atomic<bool> g_hardwareBufferInputDirty{};
+std::atomic<bool> g_hardwareBufferTextUpdating{};
 std::atomic<std::uint64_t> g_lastLoggedGeneration{UINT64_MAX};
 std::atomic<HHOOK> g_uiHook{};
 std::atomic<std::uint64_t> g_transportEpoch{};
@@ -73,6 +78,7 @@ std::uintptr_t g_scrubberIdentity{};
 std::uintptr_t g_scrubberThumbIdentity{};
 HWND g_mainWindow{};
 winrt::weak_ref<Controls::ToggleSwitch> g_toggle;
+winrt::weak_ref<Controls::TextBox> g_hardwareBufferBox;
 Microsoft::UI::Dispatching::DispatcherQueue g_dispatcher{nullptr};
 Microsoft::UI::Dispatching::DispatcherQueueTimer g_statusRefreshTimer{nullptr};
 
@@ -143,8 +149,12 @@ std::wstring ErrorText(ErrorCategory category) {
                          L"The Windows Audio service is currently unavailable");
     case ErrorCategory::Timeout:
         return Localized(
-            L"独占设备已启动，但 Apple Music 未继续提交音频；已自动关闭独占模式",
-            L"Apple Music stopped sending audio; exclusive mode was turned off automatically");
+            L"独占设备已启动，但 Apple Music 未继续提交音频；独占模式仍保持开启，将在下一首歌曲重试",
+            L"Apple Music stopped sending audio; exclusive mode remains enabled and will retry on the next song");
+    case ErrorCategory::BufferSizeNotAligned:
+        return Localized(
+            L"声卡驱动拒绝了当前硬件缓冲区；请调整硬件缓冲区后重试",
+            L"The audio driver rejected the current hardware buffer; adjust Hardware buffer and try again");
     case ErrorCategory::HookLoadFailed:
     case ErrorCategory::BrokerUnavailable:
     case ErrorCategory::PipeUnavailable:
@@ -165,6 +175,16 @@ Message StatusSnapshot() {
 bool SendEnabled(bool enabled) {
     if (!g_connected.load()) return false;
     g_pendingEnabled.store(enabled ? 1 : 0);
+    return true;
+}
+
+bool SendHardwareBuffer(std::uint32_t milliseconds) {
+    // Keep the requested value across a transient Broker disconnect. The pipe
+    // thread sends it immediately when connected and retains it until the
+    // Broker echoes the value after verifying the INI write.
+    g_requestedHardwareBufferMs.store(static_cast<int>(milliseconds));
+    g_pendingHardwareBufferMs.store(static_cast<int>(milliseconds));
+    g_hardwareBufferAckDeadlineTick.store(0);
     return true;
 }
 
@@ -463,6 +483,52 @@ void ApplyStatus(const Controls::ToggleSwitch& toggle) {
     g_suppressToggle.store(false);
 }
 
+void ApplyHardwareBufferStatus(const Controls::TextBox& input) {
+    if (!input || g_hardwareBufferInputDirty.load() ||
+        input.FocusState() != Xaml::FocusState::Unfocused) return;
+    const int requested = g_requestedHardwareBufferMs.load();
+    const auto value = requested >= 0
+        ? static_cast<std::uint32_t>(requested)
+        : StatusSnapshot().hardwareBufferMs;
+    const auto text = std::to_wstring(value ? value : 20u);
+    if (input.Text() != text) {
+        g_hardwareBufferTextUpdating.store(true);
+        input.Text(text);
+        g_hardwareBufferTextUpdating.store(false);
+    }
+}
+
+void CommitHardwareBuffer(const Controls::TextBox& input) {
+    if (!input) return;
+    const std::wstring text = input.Text().c_str();
+    wchar_t* end{};
+    const auto value = wcstoul(text.c_str(), &end, 10);
+    if (end == text.c_str() || *end != L'\0' || value < 1 || value > 100) {
+        Log(L"hardware buffer edit rejected value=" + text);
+        const auto saved = StatusSnapshot().hardwareBufferMs;
+        g_hardwareBufferInputDirty.store(false);
+        g_hardwareBufferTextUpdating.store(true);
+        input.Text(std::to_wstring(saved ? saved : 20u));
+        g_hardwareBufferTextUpdating.store(false);
+        input.Focus(Xaml::FocusState::Programmatic);
+        input.SelectAll();
+        return;
+    }
+    const auto milliseconds = static_cast<std::uint32_t>(value);
+    if (milliseconds == StatusSnapshot().hardwareBufferMs &&
+        g_requestedHardwareBufferMs.load() < 0) {
+        g_hardwareBufferInputDirty.store(false);
+        return;
+    }
+    if (!SendHardwareBuffer(milliseconds)) {
+        Log(L"hardware buffer edit could not reach broker");
+        ApplyHardwareBufferStatus(input);
+        return;
+    }
+    Log(L"hardware buffer edit queued milliseconds=" +
+        std::to_wstring(milliseconds));
+}
+
 void RememberToggle(const Controls::ToggleSwitch& toggle) {
     std::lock_guard lock(g_uiTargetMutex);
     g_toggle = make_weak(toggle);
@@ -474,28 +540,41 @@ void RememberToggle(const Controls::ToggleSwitch& toggle) {
         g_statusRefreshTimer.IsRepeating(true);
         g_statusRefreshTimer.Tick([](auto&&, auto&&) {
             winrt::weak_ref<Controls::ToggleSwitch> target;
+            winrt::weak_ref<Controls::TextBox> hardwareBuffer;
             {
                 std::lock_guard targetLock(g_uiTargetMutex);
                 target = g_toggle;
+                hardwareBuffer = g_hardwareBufferBox;
             }
             if (auto control = target.get()) ApplyStatus(control);
+            if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
         });
         g_statusRefreshTimer.Start();
         Log(L"UI status refresh timer started intervalMs=250");
     }
 }
 
+void RememberHardwareBufferBox(const Controls::TextBox& input) {
+    std::lock_guard lock(g_uiTargetMutex);
+    g_hardwareBufferBox = make_weak(input);
+    auto current = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+    if (!g_dispatcher) g_dispatcher = current ? current : input.DispatcherQueue();
+}
+
 void ScheduleStatusRefresh() {
     winrt::weak_ref<Controls::ToggleSwitch> toggle;
+    winrt::weak_ref<Controls::TextBox> hardwareBuffer;
     Microsoft::UI::Dispatching::DispatcherQueue dispatcher{nullptr};
     {
         std::lock_guard lock(g_uiTargetMutex);
         toggle = g_toggle;
+        hardwareBuffer = g_hardwareBufferBox;
         dispatcher = g_dispatcher;
     }
     if (dispatcher) {
-        dispatcher.TryEnqueue([toggle] {
+        dispatcher.TryEnqueue([toggle, hardwareBuffer] {
             if (auto control = toggle.get()) ApplyStatus(control);
+            if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
         });
     }
 }
@@ -663,6 +742,11 @@ void AttachOrRefreshToggle() {
                 RememberToggle(toggle);
                 ApplyStatus(toggle);
             }
+            if (auto input = FindByName(page, L"AMExclusiveHardwareBufferInput")
+                                 .try_as<Controls::TextBox>()) {
+                RememberHardwareBufferBox(input);
+                ApplyHardwareBufferStatus(input);
+            }
             return;
         }
 
@@ -744,8 +828,8 @@ void AttachOrRefreshToggle() {
         title.Text(Localized(L"独占模式", L"Exclusive mode"));
         Controls::TextBlock description;
         description.Text(Localized(
-            L"对当前默认播放设备使用 WASAPI 独占输出；无损播放只允许 ALAC。",
-            L"Use WASAPI exclusive output on the current default playback device; lossless playback allows ALAC only."));
+            L"对当前默认播放设备使用 WASAPI 独占输出。",
+            L"Use WASAPI exclusive output on the current default playback device."));
         description.TextWrapping(Xaml::TextWrapping::Wrap);
         Controls::TextBlock statusText;
         statusText.Name(L"AMExclusiveModeStatus");
@@ -898,9 +982,86 @@ void AttachOrRefreshToggle() {
             });
         }
         target.Children().Append(card);
+
+        Controls::TextBlock bufferTitle;
+        bufferTitle.Text(Localized(L"硬件缓冲区", L"Hardware buffer"));
+        Controls::TextBlock bufferDescription;
+        bufferDescription.Text(Localized(
+            L"设置 WASAPI 独占输出的硬件缓冲时长（毫秒）。",
+            L"Set the WASAPI exclusive hardware buffer duration in milliseconds."));
+        bufferDescription.TextWrapping(Xaml::TextWrapping::Wrap);
+        if (!nativeText.empty()) bufferTitle.Style(nativeText[0].Style());
+        if (nativeText.size() > 1) bufferDescription.Style(nativeText[1].Style());
+
+        Controls::StackPanel bufferLabels;
+        bufferLabels.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        bufferLabels.Children().Append(bufferTitle);
+        bufferLabels.Children().Append(bufferDescription);
+
+        Controls::TextBox bufferInput;
+        bufferInput.Name(L"AMExclusiveHardwareBufferInput");
+        bufferInput.Width(96.0);
+        bufferInput.MaxLength(3);
+        bufferInput.TextAlignment(Xaml::TextAlignment::Right);
+        bufferInput.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        bufferInput.TextChanged([](auto&&, auto&&) {
+            if (!g_hardwareBufferTextUpdating.load()) {
+                g_hardwareBufferInputDirty.store(true);
+            }
+        });
+        Automation::AutomationProperties::SetName(
+            bufferInput, Localized(L"硬件缓冲区（毫秒）", L"Hardware buffer in milliseconds"));
+        Automation::AutomationProperties::SetHelpText(
+            bufferInput, Localized(L"请输入 1 到 100 之间的整数",
+                                   L"Enter an integer from 1 through 100"));
+        Controls::Button bufferApply;
+        bufferApply.Content(box_value(Localized(L"确定", L"Apply")));
+        bufferApply.MinWidth(72.0);
+        bufferApply.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        Automation::AutomationProperties::SetName(
+            bufferApply, Localized(L"应用硬件缓冲区", L"Apply hardware buffer"));
+        bufferApply.Click([bufferInput](auto&&, auto&&) {
+            CommitHardwareBuffer(bufferInput);
+        });
+
+        Controls::ColumnDefinition bufferLabelColumn;
+        bufferLabelColumn.Width(Xaml::GridLength{1.0, Xaml::GridUnitType::Star});
+        Controls::ColumnDefinition bufferInputColumn;
+        bufferInputColumn.Width(Xaml::GridLength{1.0, Xaml::GridUnitType::Auto});
+        Controls::Grid bufferContent;
+        bufferContent.ColumnDefinitions().Append(bufferLabelColumn);
+        bufferContent.ColumnDefinitions().Append(bufferInputColumn);
+        bufferContent.Children().Append(bufferLabels);
+        Controls::StackPanel bufferRightSide;
+        bufferRightSide.Orientation(Controls::Orientation::Horizontal);
+        bufferRightSide.Spacing(8.0);
+        bufferRightSide.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        bufferRightSide.Children().Append(bufferInput);
+        bufferRightSide.Children().Append(bufferApply);
+        Controls::Grid::SetColumn(bufferRightSide, 1);
+        bufferContent.Children().Append(bufferRightSide);
+
+        Controls::Border bufferCard;
+        bufferCard.Name(L"AMExclusiveHardwareBufferCard");
+        bufferCard.Child(bufferContent);
+        bufferCard.Background(card.Background());
+        bufferCard.BorderBrush(card.BorderBrush());
+        bufferCard.BorderThickness(card.BorderThickness());
+        bufferCard.CornerRadius(card.CornerRadius());
+        bufferCard.Padding(card.Padding());
+        bufferCard.Margin(card.Margin());
+        bufferCard.HorizontalAlignment(card.HorizontalAlignment());
+        bufferCard.VerticalAlignment(card.VerticalAlignment());
+        bufferCard.MinHeight(card.MinHeight());
+        bufferCard.MaxWidth(card.MaxWidth());
+        target.Children().Append(bufferCard);
+
         RememberToggle(toggle);
+        RememberHardwareBufferBox(bufferInput);
         ApplyStatus(toggle);
+        ApplyHardwareBufferStatus(bufferInput);
         Log(L"Exclusive mode settings card attached to PlaybackSettingsPage");
+        Log(L"Hardware buffer settings card attached to PlaybackSettingsPage");
     } catch (const hresult_error& error) {
         std::wostringstream text;
         text << L"UI attach failed hr=0x" << std::hex << error.code().value << L" " << error.message().c_str();
@@ -970,6 +1131,10 @@ DWORD WINAPI PipeThread(void*) {
             g_connected.store(true);
         }
         Log(L"UI broker IPC connected");
+        if (const int requested = g_requestedHardwareBufferMs.load(); requested >= 0) {
+            g_pendingHardwareBufferMs.store(requested);
+            g_hardwareBufferAckDeadlineTick.store(0);
+        }
         Message incoming{};
         for (;;) {
             Message transport{};
@@ -1010,14 +1175,52 @@ DWORD WINAPI PipeThread(void*) {
                     break;
                 }
             }
+            const int pendingHardwareBufferMs = g_pendingHardwareBufferMs.exchange(-1);
+            if (pendingHardwareBufferMs >= 0) {
+                auto message = NewMessage(MessageType::SetHardwareBuffer, Role::Ui);
+                message.uiPid = GetCurrentProcessId();
+                message.hardwareBufferMs =
+                    static_cast<std::uint32_t>(pendingHardwareBufferMs);
+                bool written{};
+                {
+                    std::lock_guard writeLock(g_pipeWriteMutex);
+                    written = WriteMessage(pipe, message);
+                }
+                if (!written) {
+                    g_pendingHardwareBufferMs.store(pendingHardwareBufferMs);
+                    break;
+                }
+                g_hardwareBufferAckDeadlineTick.store(GetTickCount64() + 1000);
+            }
             if (!ReadMessageTimeout(pipe, incoming, 100)) {
-                if (GetLastError() == ERROR_TIMEOUT) continue;
+                if (GetLastError() == ERROR_TIMEOUT) {
+                    const int requested = g_requestedHardwareBufferMs.load();
+                    const auto deadline = g_hardwareBufferAckDeadlineTick.load();
+                    if (requested >= 0 && deadline != 0 && GetTickCount64() >= deadline) {
+                        int empty = -1;
+                        if (g_pendingHardwareBufferMs.compare_exchange_strong(empty, requested)) {
+                            g_hardwareBufferAckDeadlineTick.store(0);
+                            Log(L"hardware buffer confirmation timed out; retry queued milliseconds=" +
+                                std::to_wstring(requested));
+                        }
+                    }
+                    continue;
+                }
                 break;
             }
             if (incoming.type == MessageType::StatusChanged) {
                 {
                     std::lock_guard lock(g_statusMutex);
                     g_status = incoming;
+                }
+                const int requested = g_requestedHardwareBufferMs.load();
+                if (requested >= 0 &&
+                    incoming.hardwareBufferMs == static_cast<std::uint32_t>(requested)) {
+                    g_requestedHardwareBufferMs.store(-1);
+                    g_hardwareBufferAckDeadlineTick.store(0);
+                    g_hardwareBufferInputDirty.store(false);
+                    Log(L"hardware buffer confirmed milliseconds=" +
+                        std::to_wstring(requested));
                 }
                 ScheduleStatusRefresh();
             } else if (incoming.type == MessageType::Goodbye) {

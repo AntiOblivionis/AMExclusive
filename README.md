@@ -42,6 +42,7 @@ In Apple Music, open **Settings > Playback** and use the following settings:
 - Set both audio-quality selectors below Lossless Audio to **Hi-Res Lossless (ALAC)**.
 - Turn **Dolby Atmos** off.
 - Turn **Exclusive Mode** on.
+- Enter an integer from `1` through `100` milliseconds in **Hardware buffer** field and select **Apply**. The setting is used when exclusive output opens for the next song. The default is `20` ms; try a higher value if encountering playback problems.
 - Turn **Spatial sound** off.
 
 With a separate DAC and amplifier, keep the Apple Music app volume, Windows output volume, and DAC output volume at maximum, and adjust listening volume only on the amplifier. With an integrated DAC/amp, keep the Apple Music app volume and Windows output volume at maximum, and adjust listening volume using the DAC/amp hardware control. Before applying these settings for the first time, lower the amplifier or DAC/amp hardware volume to avoid an unexpectedly high sound level.

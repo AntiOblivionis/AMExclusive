@@ -19,6 +19,37 @@
 
 namespace {
 
+constexpr std::uint32_t kDefaultHardwareBufferMs = 20;
+constexpr std::uint32_t kMinimumHardwareBufferMs = 1;
+constexpr std::uint32_t kMaximumHardwareBufferMs = 100;
+
+std::filesystem::path BrokerIniPath();
+
+std::uint32_t ReadHardwareBufferMs() {
+    wchar_t value[32]{};
+    GetPrivateProfileStringW(L"mod", L"period_100ns", L"200000", value,
+        static_cast<DWORD>(std::size(value)), BrokerIniPath().c_str());
+    wchar_t* end{};
+    const auto period100ns = wcstoull(value, &end, 10);
+    if (end == value || *end != L'\0') return kDefaultHardwareBufferMs;
+    const auto milliseconds = (period100ns + 5000u) / 10000u;
+    if (milliseconds < kMinimumHardwareBufferMs ||
+        milliseconds > kMaximumHardwareBufferMs) {
+        return kDefaultHardwareBufferMs;
+    }
+    return static_cast<std::uint32_t>(milliseconds);
+}
+
+bool WriteHardwareBufferMs(std::uint32_t milliseconds) {
+    const auto value = std::to_wstring(static_cast<std::uint64_t>(milliseconds) * 10000u);
+    const auto path = BrokerIniPath();
+    if (!WritePrivateProfileStringW(L"mod", L"period_100ns", value.c_str(), path.c_str())) {
+        return false;
+    }
+    (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+    return ReadHardwareBufferMs() == milliseconds;
+}
+
 using namespace ammod::ipc;
 
 struct Client {
@@ -30,7 +61,7 @@ struct Client {
 std::mutex g_mutex;
 std::mutex g_logMutex;
 std::atomic<bool> g_shutdown{};
-std::atomic<std::uint64_t> g_lastPlaybackErrorDialogSignature{};
+std::atomic<std::uint64_t> g_lastErrorDialogSignature{};
 std::vector<Client> g_clients;
 Message g_status = [] {
     auto message = NewMessage(MessageType::StatusChanged, Role::Broker);
@@ -68,8 +99,8 @@ HWND FindAppleMusicWindow() noexcept {
     return search.window;
 }
 
-HRESULT CALLBACK PlaybackErrorDialogCallback(HWND dialog, UINT notification,
-                                            WPARAM, LPARAM, LONG_PTR callbackData) {
+HRESULT CALLBACK ErrorDialogCallback(HWND dialog, UINT notification,
+                                     WPARAM, LPARAM, LONG_PTR callbackData) {
     if (notification == TDN_CREATED && dialog) {
         const HWND owner = reinterpret_cast<HWND>(callbackData);
         RECT dialogRect{};
@@ -105,54 +136,161 @@ HRESULT CALLBACK PlaybackErrorDialogCallback(HWND dialog, UINT notification,
     return S_OK;
 }
 
-void ShowPlaybackErrorAsync(ErrorCategory error, std::uint64_t generation) {
-    if (error != ErrorCategory::UnsupportedLocalInt32 &&
-        error != ErrorCategory::BitPerfectFormatUnavailable) {
-        return;
+bool ClearPlayerLoad() {
+    wchar_t modulePath[32768]{};
+    const DWORD chars = GetModuleFileNameW(
+        nullptr, modulePath, static_cast<DWORD>(std::size(modulePath)));
+    if (!chars || chars >= std::size(modulePath)) return false;
+    const auto helper = std::filesystem::path(modulePath).parent_path() /
+        L"am_exclusive_media_control.exe";
+    if (GetFileAttributesW(helper.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+    std::wstring command = L"\"" + helper.wstring() + L"\" reject-current";
+    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+    mutableCommand.push_back(L'\0');
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(helper.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, helper.parent_path().c_str(),
+                        &startup, &process)) {
+        return false;
     }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
+}
+
+void ShowErrorDialogAsync(ErrorCategory error, HRESULT result,
+                          std::uint64_t generation) {
+    if (error == ErrorCategory::None) error = ErrorCategory::Internal;
     const auto signature = (generation << 16u) ^ static_cast<std::uint64_t>(error);
-    if (signature != 0 && g_lastPlaybackErrorDialogSignature.exchange(signature) == signature) {
+    if (signature != 0 && g_lastErrorDialogSignature.exchange(signature) == signature) {
         return;
     }
-    std::thread([error] {
+    std::thread([error, result] {
+        // Let a normal Apple Music shutdown remove its window before deciding
+        // whether a disconnected Agent represents a user-visible failure.
+        Sleep(250);
         const auto previousDpi = SetThreadDpiAwarenessContext(
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         const bool chinese = UseChineseUi();
-        const wchar_t* text = error == ErrorCategory::UnsupportedLocalInt32
-            ? (chinese ? L"不支持本地 32 位整数音频。"
-                       : L"Local 32-bit integer audio is not supported.")
-            : (chinese ? L"DAC 不支持此音频格式。"
-                       : L"The DAC does not support this audio format.");
+        const HWND owner = FindAppleMusicWindow();
+        if (!owner) {
+            Log(L"error dialog suppressed because Apple Music has no visible window error=" +
+                std::to_wstring(static_cast<unsigned>(error)));
+            if (previousDpi) SetThreadDpiAwarenessContext(previousDpi);
+            return;
+        }
+        const bool loadClearLaunched = ClearPlayerLoad();
+        Log(L"error cleanup clear-player-load launched=" +
+            std::to_wstring(loadClearLaunched));
+        const wchar_t* reason{};
+        switch (error) {
+        case ErrorCategory::UnsupportedLocalInt32:
+            reason = chinese ? L"不支持本地 32 位整数音频。"
+                             : L"Local 32-bit integer audio is not supported.";
+            break;
+        case ErrorCategory::BitPerfectFormatUnavailable:
+            reason = chinese ? L"DAC 不支持当前音源格式。"
+                             : L"The DAC does not support the current source format.";
+            break;
+        case ErrorCategory::FormatUnsupported:
+            reason = chinese ? L"声卡驱动拒绝了当前独占格式。"
+                             : L"The audio driver rejected the current exclusive format.";
+            break;
+        case ErrorCategory::ExclusiveNotAllowed:
+            reason = chinese ? L"当前播放设备未允许应用使用独占模式。"
+                             : L"Exclusive mode is disabled for the current playback device.";
+            break;
+        case ErrorCategory::DeviceInUse:
+            reason = chinese ? L"当前播放设备正被其他程序独占。"
+                             : L"The current playback device is in exclusive use by another app.";
+            break;
+        case ErrorCategory::DeviceChanged:
+        case ErrorCategory::DeviceInvalidated:
+            reason = chinese ? L"播放设备已变化或不可用。"
+                             : L"The playback device changed or is unavailable.";
+            break;
+        case ErrorCategory::EndpointUnavailable:
+            reason = chinese ? L"当前默认播放设备不可用。"
+                             : L"The current default playback device is unavailable.";
+            break;
+        case ErrorCategory::AudioServiceUnavailable:
+            reason = chinese ? L"Windows 音频服务当前不可用。"
+                             : L"The Windows Audio service is currently unavailable.";
+            break;
+        case ErrorCategory::BufferSizeNotAligned:
+            reason = chinese ? L"声卡驱动不支持当前硬件缓冲区。"
+                             : L"The audio driver does not support the current hardware buffer.";
+            break;
+        case ErrorCategory::Timeout:
+            reason = chinese ? L"独占设备已启动，但 Apple Music 未继续提交音频。"
+                             : L"The exclusive device started, but Apple Music stopped submitting audio.";
+            break;
+        case ErrorCategory::HookLoadFailed:
+        case ErrorCategory::PipeUnavailable:
+        case ErrorCategory::BrokerUnavailable:
+        case ErrorCategory::AgentNotFound:
+        case ErrorCategory::AgentExited:
+        case ErrorCategory::AgentNotOwner:
+            reason = chinese ? L"独占音频组件意外断开或未能启动。"
+                             : L"The exclusive audio component disconnected or could not start.";
+            break;
+        case ErrorCategory::AccessDenied:
+            reason = chinese ? L"Windows 拒绝了独占音频组件所需的访问权限。"
+                             : L"Windows denied access required by the exclusive audio component.";
+            break;
+        default:
+            reason = chinese ? L"初始化或输出独占音频时发生错误。"
+                             : L"An error occurred while initializing or rendering exclusive audio.";
+            break;
+        }
+        std::wstring text = reason;
+        if (FAILED(result)) {
+            std::wostringstream code;
+            code << L"\n\n" << (chinese ? L"错误代码：0x" : L"Error code: 0x")
+                 << std::uppercase << std::hex << std::setw(8) << std::setfill(L'0')
+                 << static_cast<std::uint32_t>(result);
+            text += code.str();
+        }
+        text += loadClearLaunched
+            ? (chinese ? L"\n\n已清空当前播放；独占模式保持开启。"
+                       : L"\n\nThe current load was cleared; Exclusive mode remains enabled.")
+            : (chinese ? L"\n\n无法清空当前播放；独占模式仍保持开启。"
+                       : L"\n\nThe current load could not be cleared; Exclusive mode remains enabled.");
         const wchar_t* title = L"AMExclusive";
-        const wchar_t* mainInstruction = chinese ? L"无法播放" : L"Unable to play";
+        const wchar_t* mainInstruction =
+            (error == ErrorCategory::UnsupportedLocalInt32 ||
+             error == ErrorCategory::BitPerfectFormatUnavailable)
+            ? (chinese ? L"无法播放" : L"Unable to play")
+            : (chinese ? L"独占输出失败" : L"Exclusive output failed");
         const wchar_t* button = chinese ? L"确定" : L"OK";
         TASKDIALOG_BUTTON buttons[]{{IDOK, button}};
         TASKDIALOGCONFIG dialog{};
         dialog.cbSize = sizeof(dialog);
-        dialog.hwndParent = FindAppleMusicWindow();
+        dialog.hwndParent = owner;
         dialog.dwFlags = TDF_POSITION_RELATIVE_TO_WINDOW | TDF_SIZE_TO_CONTENT;
         dialog.pszWindowTitle = L"AMExclusive";
         dialog.pszMainIcon = TD_ERROR_ICON;
         dialog.pszMainInstruction = mainInstruction;
-        dialog.pszContent = text;
+        dialog.pszContent = text.c_str();
         dialog.cButtons = static_cast<UINT>(std::size(buttons));
         dialog.pButtons = buttons;
         dialog.nDefaultButton = IDOK;
-        dialog.pfCallback = PlaybackErrorDialogCallback;
+        dialog.pfCallback = ErrorDialogCallback;
         dialog.lpCallbackData = reinterpret_cast<LONG_PTR>(dialog.hwndParent);
-        Log(L"playback error dialog show error=" +
+        Log(L"error dialog show error=" +
             std::to_wstring(static_cast<unsigned>(error)) +
             L" parent=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(dialog.hwndParent)));
         if (dialog.hwndParent) SetForegroundWindow(dialog.hwndParent);
         int pressed{};
         const HRESULT hr = TaskDialogIndirect(&dialog, &pressed, nullptr, nullptr);
-        Log(L"playback error dialog closed hr=" + std::to_wstring(hr) +
+        Log(L"error dialog closed hr=" + std::to_wstring(hr) +
             L" button=" + std::to_wstring(pressed));
         if (FAILED(hr)) {
             // Extremely old/unusual Common Controls configurations may not
             // expose TaskDialog. Keep a final fallback rather than losing a
-            // fail-closed playback error entirely.
-            MessageBoxW(dialog.hwndParent, text, title,
+            // user-visible exclusive-output error entirely.
+            MessageBoxW(dialog.hwndParent, text.c_str(), title,
                         MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
         }
         if (previousDpi) SetThreadDpiAwarenessContext(previousDpi);
@@ -382,6 +520,7 @@ void Log(const std::wstring& text) {
 void RemoveClient(HANDLE pipe) {
     Message status{};
     bool publishStatus = false;
+    bool showError = false;
     {
         std::lock_guard lock(g_mutex);
         Role removedRole = Role::Unknown;
@@ -396,19 +535,29 @@ void RemoveClient(HANDLE pipe) {
             const bool anyAgent = std::any_of(g_clients.begin(), g_clients.end(),
                 [](const Client& client) { return client.role == Role::Agent; });
             if (!anyAgent) {
+                const bool failedWhileRunning = g_status.enabledIntent &&
+                    (g_status.state == RuntimeState::Requested ||
+                     g_status.state == RuntimeState::Probing ||
+                     g_status.state == RuntimeState::Initializing ||
+                     g_status.state == RuntimeState::AlignRetry ||
+                     g_status.state == RuntimeState::Active);
                 ++g_status.generation;
                 g_status.state = g_status.enabledIntent
                     ? RuntimeState::WaitingForStream : RuntimeState::Off;
-                g_status.error = ErrorCategory::None;
-                g_status.hresult = S_OK;
+                g_status.error = failedWhileRunning
+                    ? ErrorCategory::PipeUnavailable : ErrorCategory::None;
+                g_status.hresult = failedWhileRunning
+                    ? HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE) : S_OK;
                 g_status.senderPid = GetCurrentProcessId();
                 GetSystemTimeAsFileTime(&g_status.timestampUtc);
                 status = g_status;
                 publishStatus = true;
+                showError = failedWhileRunning;
             }
         }
     }
     if (publishStatus) Broadcast(status, nullptr);
+    if (showError) ShowErrorDialogAsync(status.error, status.hresult, status.generation);
 }
 
 std::vector<std::pair<HANDLE, DWORD>> SnapshotTargets(HANDLE source) {
@@ -492,6 +641,7 @@ void HandleMessage(const Message& incoming, HANDLE source) {
         return;
     }
     Message status{};
+    bool showError = false;
     {
         std::lock_guard lock(g_mutex);
         if (incoming.type == MessageType::SetEnabled) {
@@ -508,20 +658,38 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             }
             g_status.error = ErrorCategory::None;
             g_status.hresult = S_OK;
+        } else if (incoming.type == MessageType::SetHardwareBuffer &&
+                   (incoming.role == Role::Ui || incoming.role == Role::Controller)) {
+            if (incoming.hardwareBufferMs >= kMinimumHardwareBufferMs &&
+                incoming.hardwareBufferMs <= kMaximumHardwareBufferMs) {
+                if (WriteHardwareBufferMs(incoming.hardwareBufferMs)) {
+                    g_status.generation++;
+                    g_status.hardwareBufferMs = incoming.hardwareBufferMs;
+                    g_status.error = ErrorCategory::None;
+                    g_status.hresult = S_OK;
+                    Log(L"hardware buffer persisted milliseconds=" +
+                        std::to_wstring(g_status.hardwareBufferMs));
+                } else {
+                    Log(L"hardware buffer persistence failed milliseconds=" +
+                        std::to_wstring(incoming.hardwareBufferMs) + L" error=" +
+                        std::to_wstring(GetLastError()));
+                }
+            }
         } else if (incoming.type == MessageType::StatusChanged) {
             const auto generation = std::max(g_status.generation + 1, incoming.generation);
             const auto persistedIntent = g_status.enabledIntent;
+            const auto persistedHardwareBufferMs = g_status.hardwareBufferMs;
             g_status = incoming;
             g_status.type = MessageType::StatusChanged;
             g_status.role = Role::Broker;
             g_status.generation = generation;
             // Agent lifecycle/status events describe the current processing
-            // phase; they do not represent a user toggle.  Preserve the
-            // broker-owned intent so an Agent's initial Off/Disabled event
-            // cannot erase a persisted exclusive request.  An explicit
-            // AttemptFailed remains the only Agent message that clears it.
+            // phase; they do not represent a user toggle. Preserve the
+            // broker-owned intent so an Agent event cannot erase the user's
+            // persisted exclusive request.
             if (incoming.role == Role::Agent) {
                 g_status.enabledIntent = persistedIntent;
+                g_status.hardwareBufferMs = persistedHardwareBufferMs;
                 if (persistedIntent && incoming.state == RuntimeState::Off) {
                     g_status.state = RuntimeState::WaitingForStream;
                 }
@@ -529,29 +697,25 @@ void HandleMessage(const Message& incoming, HANDLE source) {
         } else if (incoming.type == MessageType::AttemptFailed) {
             const auto generation = std::max(g_status.generation + 1, incoming.generation);
             const auto persistedIntent = g_status.enabledIntent;
-            const bool playbackRejected =
-                incoming.error == ErrorCategory::UnsupportedLocalInt32 ||
-                incoming.error == ErrorCategory::BitPerfectFormatUnavailable;
+            const auto persistedHardwareBufferMs = g_status.hardwareBufferMs;
             g_status = incoming;
             g_status.type = MessageType::StatusChanged;
             g_status.role = Role::Broker;
             g_status.generation = generation;
-            if (playbackRejected && persistedIntent) {
-                // The item is rejected, not the user's AME preference. Keep
-                // fail-closed interception armed for the next play attempt.
+            g_status.hardwareBufferMs = persistedHardwareBufferMs;
+            if (persistedIntent) {
+                // Retire the failed attempt, not the user's AME preference.
+                // The Agent receives this status and arms a fresh generation
+                // for the next naturally opened song.
                 g_status.enabledIntent = persistedIntent;
                 g_status.state = RuntimeState::WaitingForStream;
-                ShowPlaybackErrorAsync(incoming.error, generation);
+                showError = true;
             } else {
                 g_status.enabledIntent = 0;
-                g_status.state = RuntimeState::FailedOff;
+                g_status.state = RuntimeState::Off;
             }
         }
-        const bool persistIntentChange = incoming.type == MessageType::SetEnabled ||
-            (incoming.type == MessageType::AttemptFailed &&
-             incoming.error != ErrorCategory::UnsupportedLocalInt32 &&
-             incoming.error != ErrorCategory::BitPerfectFormatUnavailable);
-        if (persistIntentChange) {
+        if (incoming.type == MessageType::SetEnabled) {
             WritePrivateProfileStringW(L"mod", L"mode",
                 g_status.enabledIntent ? L"exclusive" : L"probe", BrokerIniPath().c_str());
         }
@@ -560,6 +724,7 @@ void HandleMessage(const Message& incoming, HANDLE source) {
         status = g_status;
     }
     Broadcast(status, source);
+    if (showError) ShowErrorDialogAsync(status.error, status.hresult, status.generation);
 }
 
 void ClientThread(HANDLE pipe) {
@@ -651,9 +816,11 @@ int wmain() {
     GetPrivateProfileStringW(L"mod", L"mode", L"probe", savedMode,
         static_cast<DWORD>(std::size(savedMode)), BrokerIniPath().c_str());
     g_status.enabledIntent = _wcsicmp(savedMode, L"exclusive") == 0 ? 1 : 0;
+    g_status.hardwareBufferMs = ReadHardwareBufferMs();
     g_status.state = g_status.enabledIntent ? RuntimeState::WaitingForStream : RuntimeState::Off;
     Log(L"companion started pid=" + std::to_wstring(GetCurrentProcessId()) +
-        L" persistedIntent=" + std::to_wstring(g_status.enabledIntent));
+        L" persistedIntent=" + std::to_wstring(g_status.enabledIntent) +
+        L" hardwareBufferMs=" + std::to_wstring(g_status.hardwareBufferMs));
     const auto pipeName = PipeName();
     PipeSecurity security;
     if (pipeName.empty() || !security.IsValid()) {

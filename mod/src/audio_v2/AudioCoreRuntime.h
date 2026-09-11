@@ -106,6 +106,7 @@ public:
     bool Start(const AudioCoreRuntimeCallbacks& callbacks) noexcept;
     void Stop() noexcept;
     void SetUiEnabled(bool enabled) noexcept;
+    void SetHardwareBufferMilliseconds(std::uint32_t milliseconds) noexcept;
     bool UiEnabled() const noexcept { return uiEnabled_.load(std::memory_order_acquire); }
 
     // UI transport intents are control-plane only. They gate when the exact
@@ -236,6 +237,7 @@ private:
     std::atomic<bool> running_{};
     std::atomic<bool> uiEnabled_{};
     std::atomic<bool> workerStop_{};
+    std::atomic<std::uint32_t> hardwareBufferMs_{20};
     HANDLE wakeEvent_{};
     HANDLE workerThread_{};
 

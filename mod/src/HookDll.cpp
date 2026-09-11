@@ -4365,22 +4365,21 @@ void AudioCoreRuntimeEventCallback(void* context,
     case ammod::audio_v2::AudioCoreRuntimeEvent::Faulted: {
         const bool playbackRejected = ammod::audio::IsPlaybackRejection(result);
         if (!playbackRejected) {
+            // Stop this failed generation locally. The Broker owns the user's
+            // persisted intent and immediately re-arms the Agent from the
+            // WaitingForStream status sent below.
             g_nativeP0Puller.DisableForUiOff();
             g_ipcEnabled.store(false, std::memory_order_release);
             g_audioCoreGate.SetUiEnabled(false);
-            Log(L"audio core v2 faulted; UI intent forced off result=" + HResultText(result));
+            Log(L"audio core v2 faulted; current attempt retired, exclusive intent remains armed result=" +
+                HResultText(result));
         } else {
             Log(L"audio core v2 rejected current playback; AME remains armed result=" +
                 HResultText(result));
-            DWORD helperPid{};
-            const bool launched = LaunchMediaControlCommand(L"reject-current", helperPid);
-            Log(L"audio core v2 rejected current playback; stop-and-unload helper launched=" +
-                std::to_wstring(launched) + L" pid=" + std::to_wstring(helperPid));
         }
         SendAgentEvent(ammod::ipc::MessageType::AttemptFailed,
-                       playbackRejected ? ammod::ipc::RuntimeState::WaitingForStream
-                                        : ammod::ipc::RuntimeState::FailedOff,
-                       playbackRejected, {}, nullptr, result,
+                       ammod::ipc::RuntimeState::WaitingForStream,
+                       true, {}, nullptr, result,
                        ammod::ipc::CategorizeAudioError(result),
                        playbackRejected ? L"audio_core_v2_playback_rejected"
                                         : L"audio_core_v2_faulted");
@@ -6162,12 +6161,15 @@ void DisableExclusiveIntent(const std::wstring& reason, HRESULT hr,
                             const std::wstring& endpoint = {},
                             const WAVEFORMATEX* format = nullptr,
                             ammod::ipc::ErrorCategory category = ammod::ipc::ErrorCategory::None) {
-    WritePrivateProfileStringW(L"mod", L"mode", L"probe", g_iniPath.c_str());
+    // Retire only the current attempt. The Broker remains the owner of the
+    // persisted exclusive preference and re-arms this Agent for the next song.
     g_ipcEnabled.store(false);
-    Log(L"exclusive intent auto-disabled reason=" + reason + L" result=" + HResultText(hr));
+    Log(L"exclusive attempt retired; intent remains armed reason=" + reason +
+        L" result=" + HResultText(hr));
     if (category == ammod::ipc::ErrorCategory::None) category = ammod::ipc::CategorizeAudioError(hr);
-    SendAgentEvent(ammod::ipc::MessageType::AttemptFailed, ammod::ipc::RuntimeState::FailedOff,
-                   false, endpoint, format, hr, category, reason);
+    SendAgentEvent(ammod::ipc::MessageType::AttemptFailed,
+                   ammod::ipc::RuntimeState::WaitingForStream,
+                   true, endpoint, format, hr, category, reason);
 }
 
 void CheckExclusiveRenderTimeout() {
@@ -7877,13 +7879,17 @@ DWORD WINAPI PipeClientLoop(void*) {
             }
             if (incoming.type == MessageType::StatusChanged) {
                 const bool enabled = incoming.enabledIntent != 0;
+                const auto hardwareBufferMs = incoming.hardwareBufferMs
+                    ? incoming.hardwareBufferMs : 20u;
+                g_audioCoreRuntime.SetHardwareBufferMilliseconds(hardwareBufferMs);
                 g_ipcEnabled.store(enabled, std::memory_order_release);
                 if (!enabled) g_nativeP0Puller.DisableForUiOff();
                 g_audioCoreGate.SetUiEnabled(enabled);
                 g_audioCoreRuntime.SetUiEnabled(enabled);
                 Log(L"broker status received enabled=" +
                     std::to_wstring(incoming.enabledIntent) + L" state=" +
-                    std::to_wstring(static_cast<unsigned>(incoming.state)));
+                    std::to_wstring(static_cast<unsigned>(incoming.state)) +
+                    L" hardwareBufferMs=" + std::to_wstring(hardwareBufferMs));
             } else if (incoming.type == MessageType::TransportIntent) {
                 if (wcscmp(incoming.detail, L"play_pause") == 0) {
                     g_audioCoreRuntime.OnTransportPlayPause();
@@ -7923,7 +7929,7 @@ DWORD WINAPI PipeClientLoop(void*) {
             if (g_pipe == pipe) g_pipe = INVALID_HANDLE_VALUE;
         }
         CloseHandle(pipe);
-        Log(L"broker IPC disconnected; exclusive intent forced off");
+        Log(L"broker IPC disconnected; local runtime retired while broker-owned intent is preserved");
         Sleep(1000);
     }
 }

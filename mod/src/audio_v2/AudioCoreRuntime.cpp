@@ -169,6 +169,14 @@ void AudioCoreRuntime::SetUiEnabled(bool enabled) noexcept {
     Emit(AudioCoreRuntimeEvent::Disabled, S_OK);
 }
 
+void AudioCoreRuntime::SetHardwareBufferMilliseconds(std::uint32_t milliseconds) noexcept {
+    if (milliseconds < 1 || milliseconds > 100) return;
+    // Match the exclusive-enable lifecycle: persist/arm the new value now, but
+    // never disturb the current song's tap, queue, converter or endpoint. The
+    // next naturally created sink reads this value through PeriodFrames().
+    hardwareBufferMs_.store(milliseconds, std::memory_order_release);
+}
+
 void AudioCoreRuntime::OnTransportPlayPause() noexcept {
     if (!UiEnabled()) return;
     std::lock_guard lock(controlMutex_);
@@ -1091,6 +1099,16 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
         {
             std::lock_guard lock(controlMutex_);
             nextDiagnosticTelemetryTick_ = 0;
+            if (graphBound_ && coordinator_.SinkState() == WasapiSinkState::Faulted) {
+                HRESULT sinkError = coordinator_.Sink().Stats().lastError;
+                if (SUCCEEDED(sinkError)) sinkError = E_UNEXPECTED;
+                lastError_.store(sinkError, std::memory_order_release);
+                uiEnabled_.store(false, std::memory_order_release);
+                Emit(AudioCoreRuntimeEvent::Faulted, sinkError);
+                RetireCaptureLocked(false);
+                registry_.RetireAll();
+                continue;
+            }
             FinalizeEndOfStreamDrainLocked();
             if (!graphBound_) {
                 if (void* pendingLocal =
@@ -1541,7 +1559,8 @@ std::uint32_t AudioCoreRuntime::NativePumpPeriodMs() const noexcept {
 
 std::uint32_t AudioCoreRuntime::PeriodFrames(std::uint32_t sampleRate) const noexcept {
     if (!sampleRate) return 0;
-    constexpr std::uint32_t period100ns = 200000; // 20 ms, fixed production default
+    const auto period100ns =
+        static_cast<std::uint64_t>(hardwareBufferMs_.load(std::memory_order_acquire)) * 10000u;
     const auto frames = (static_cast<std::uint64_t>(sampleRate) * period100ns +
                          kReferenceTimePerSecond / 2u) / kReferenceTimePerSecond;
     return static_cast<std::uint32_t>(std::max<std::uint64_t>(1u, frames));

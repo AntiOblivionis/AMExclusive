@@ -362,6 +362,7 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
     // mixer, resampler or shared-mode fallback.
     const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool uninitialize = apartment == S_OK || apartment == S_FALSE;
+    HRESULT threadFailure = S_OK;
     DWORD mmcssIndex = 0;
     HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssIndex);
     if (!mmcss) mmcss = AvSetMmThreadCharacteristicsW(L"Audio", &mmcssIndex);
@@ -394,12 +395,14 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
                 waitingForSource_.store(false, std::memory_order_release);
                 const HRESULT fill = RenderOneBuffer();
                 if (fill == kAudioSourceWouldBlock) continue;
-                if (FAILED(fill)) break;
+                if (FAILED(fill)) {
+                    threadFailure = fill;
+                    break;
+                }
                 if (stopRequested_.load(std::memory_order_acquire)) break;
                 const HRESULT resume = client_ ? client_->Start() : E_UNEXPECTED;
                 if (FAILED(resume)) {
-                    RecordError(resume);
-                    state_.store(WasapiSinkState::Faulted, std::memory_order_release);
+                    threadFailure = resume;
                     break;
                 }
                 continue;
@@ -410,17 +413,24 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
             if (config_.sourceReadyEvent && wait == WAIT_OBJECT_0 + 2) continue;
             if (wait == WAIT_TIMEOUT) continue;
             if (wait != WAIT_OBJECT_0 + 1) {
-                RecordError(HRESULT_FROM_WIN32(GetLastError()));
-                state_.store(WasapiSinkState::Faulted, std::memory_order_release);
+                threadFailure = wait == WAIT_FAILED
+                    ? HRESULT_FROM_WIN32(GetLastError()) : E_UNEXPECTED;
                 break;
             }
             const HRESULT render = RenderOneBuffer();
             if (render == kAudioSourceWouldBlock) continue;
-            if (FAILED(render)) break;
+            if (FAILED(render)) {
+                threadFailure = render;
+                break;
+            }
         }
     } else {
-        RecordError(apartment);
+        threadFailure = apartment;
         stopRequested_.store(true, std::memory_order_release);
+    }
+
+    if (FAILED(threadFailure)) {
+        RecordError(threadFailure);
         state_.store(WasapiSinkState::Faulted, std::memory_order_release);
     }
 
