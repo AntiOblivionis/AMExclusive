@@ -34,11 +34,6 @@ constexpr bool IsSupportedSourceBitDepth(std::uint32_t bitDepth) noexcept {
     return bitDepth == 16 || bitDepth == 24 || bitDepth == 32;
 }
 
-constexpr std::uint16_t OutputValidBitsForSource(std::uint32_t sourceBitDepth) noexcept {
-    return sourceBitDepth == 16 || sourceBitDepth == 24 || sourceBitDepth == 32
-        ? static_cast<std::uint16_t>(sourceBitDepth) : 0;
-}
-
 struct BitPerfectFormatTuple final {
     std::uint16_t validBits{};
     std::uint16_t containerBits{};
@@ -83,14 +78,6 @@ static_assert(SelectBitPerfectFormatCandidates(24).values[1] == BitPerfectFormat
 static_assert(SelectBitPerfectFormatCandidates(32, true).count == 1);
 static_assert(SelectBitPerfectFormatCandidates(32, true).values[0] == BitPerfectFormatTuple{32, 32});
 static_assert(SelectBitPerfectFormatCandidates(20).count == 0);
-
-constexpr std::uint32_t ScaleFrameCount(std::uint32_t frames,
-                                        std::uint32_t fromRate,
-                                        std::uint32_t toRate) noexcept {
-    if (!frames || !fromRate || !toRate) return 0;
-    return static_cast<std::uint32_t>(
-        (static_cast<std::uint64_t>(frames) * toRate + fromRate / 2u) / fromRate);
-}
 
 constexpr bool PreferExistingCompressedCandidate(std::uint32_t existingFormat,
                                                   std::uint32_t existingRate,

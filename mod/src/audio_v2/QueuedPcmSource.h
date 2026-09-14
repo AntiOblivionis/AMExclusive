@@ -16,11 +16,7 @@ enum class PcmMappingPolicy : std::uint8_t {
 };
 
 struct QueuedPcmSourceStats final {
-    std::uint64_t mappedFrames{};
-    std::uint64_t queueUnderruns{};
     std::uint64_t mappingFailures{};
-    std::uint64_t continuityFailures{};
-    std::uint64_t verificationFailures{};
     std::uint64_t integerizedSamples{};
     std::uint64_t clippedSamples{};
     std::uint64_t nonFiniteSamples{};
@@ -78,21 +74,18 @@ public:
                     endOfStream = true;
                     return S_OK;
                 }
-                ++stats_.queueUnderruns;
                 // Preserve the recoverable-wait status. The sink preflights
                 // availability before GetBuffer, so this path is only a
                 // producer/consumer race or a direct source diagnostic call.
                 return kAudioSourceWouldBlock;
             }
             if (!ValidateBlock(*block)) {
-                ++stats_.continuityFailures;
                 return E_FAIL;
             }
 
             const std::uint32_t available = block->frames - blockOffsetFrames_;
             if (available == 0) {
                 // A malformed block must never make the consumer spin.
-                ++stats_.continuityFailures;
                 return E_FAIL;
             }
 
@@ -129,14 +122,12 @@ public:
                 }
                 if (verifier_ && !verifier_->VerifyBlockSpan(
                         *block, blockOffsetFrames_, destination + outputOffset, take)) {
-                    ++stats_.verificationFailures;
                     return E_FAIL;
                 }
             }
 
             blockOffsetFrames_ += take;
             writtenFrames += take;
-            stats_.mappedFrames += take;
             if (blockOffsetFrames_ != block->frames) continue;
 
             const bool blockEnd = block->endOfStream;
@@ -147,7 +138,6 @@ public:
             firstBlock_ = false;
             if (blockEnd) {
                 if (queue_.Size() != 0) {
-                    ++stats_.continuityFailures;
                     return E_FAIL;
                 }
                 ended_ = true;
@@ -167,7 +157,6 @@ public:
     }
 
     const QueuedPcmSourceStats& Stats() const noexcept { return stats_; }
-    bool Ended() const noexcept { return ended_; }
 
 private:
     bool ValidateBlock(const PcmBlock& block) const noexcept {

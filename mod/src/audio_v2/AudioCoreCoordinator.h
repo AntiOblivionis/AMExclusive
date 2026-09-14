@@ -25,9 +25,7 @@ struct AudioCoreCoordinatorConfig final {
 };
 
 struct AudioCoreCoordinatorStats final {
-    std::uint64_t capturedBlocks{};
     std::uint64_t capturedFrames{};
-    std::uint64_t droppedBlocks{};
     std::uint64_t droppedFrames{};
     QueuedPcmSourceStats source{};
 };
@@ -70,17 +68,13 @@ public:
     bool ShouldSuppressNative() const noexcept;
     bool IsEnabled() const noexcept { return gate_.UiEnabled(); }
     AudioCoreGatePhase Phase() const noexcept { return gate_.Phase(); }
-    const AudioCoreGate& Gate() const noexcept { return gate_; }
     const PcmFormat& Format() const noexcept {
         return sink_.State() == WasapiSinkState::Closed ? config_.sink.format : sink_.Format();
     }
     std::uint64_t MediaGeneration() const noexcept { return config_.mediaGeneration; }
     const AudioCoreCoordinatorStats Stats() const noexcept;
-    const BitPerfectVerifier& Verifier() const noexcept { return verifier_; }
     const WasapiExclusiveSink& Sink() const noexcept { return sink_; }
     WasapiSinkState SinkState() const noexcept { return sink_.State(); }
-    bool SinkWaitingForSource() const noexcept { return sink_.WaitingForSource(); }
-    std::uint32_t SinkBufferFrames() const noexcept { return sink_.BufferFrames(); }
     void SetSinkResumeBlocked(bool blocked) noexcept { sink_.SetResumeBlocked(blocked); }
     std::size_t BufferedBlocks() const noexcept { return queue_ ? queue_->Size() : 0; }
     std::size_t BufferedFrames() const noexcept {
@@ -110,9 +104,7 @@ private:
     WasapiExclusiveSink sink_{};
     HANDLE sourceReadyEvent_{};
     std::uint64_t nextSequence_{};
-    std::atomic<std::uint64_t> capturedBlocks_{};
     std::atomic<std::uint64_t> capturedFrames_{};
-    std::atomic<std::uint64_t> droppedBlocks_{};
     std::atomic<std::uint64_t> droppedFrames_{};
 };
 

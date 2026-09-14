@@ -9,10 +9,6 @@ namespace ammod::audio_v2 {
 
 struct ApplePcmTapStats final {
     std::uint64_t acceptedFrames{};
-    std::uint64_t acceptedBlocks{};
-    std::uint64_t ignoredFrames{};
-    std::uint64_t droppedFrames{};
-    std::uint64_t bindingFailures{};
 };
 
 // A deliberately small Apple-facing adapter. The coordinator thread binds a
@@ -37,7 +33,6 @@ public:
         if (!converter || format != coordinator_.Format() ||
             mediaGeneration != coordinator_.MediaGeneration() ||
             coordinator_.Phase() != AudioCoreGatePhase::Capturing) {
-            bindingFailures_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         endSeen_.store(false, std::memory_order_release);
@@ -61,19 +56,13 @@ public:
                        bool discontinuity,
                        bool endOfStream) noexcept {
         if (!Bound(converter) || endSeen_.load(std::memory_order_acquire)) {
-            ignoredFrames_.fetch_add(frames, std::memory_order_relaxed);
             return false;
         }
         const bool accepted = coordinator_.PushP0Interleaved(
             firstFrame, samples, frames, discontinuity, endOfStream);
         if (accepted) {
             acceptedFrames_.fetch_add(frames, std::memory_order_relaxed);
-            acceptedBlocks_.fetch_add(
-                (frames + kMaxBlockFrames - 1u) / kMaxBlockFrames,
-                std::memory_order_relaxed);
             if (endOfStream) endSeen_.store(true, std::memory_order_release);
-        } else {
-            droppedFrames_.fetch_add(frames, std::memory_order_relaxed);
         }
         return accepted;
     }
@@ -86,35 +75,19 @@ public:
                   bool discontinuity,
                   bool endOfStream) noexcept {
         if (!Bound(converter) || endSeen_.load(std::memory_order_acquire)) {
-            ignoredFrames_.fetch_add(frames, std::memory_order_relaxed);
             return false;
         }
         const bool accepted = coordinator_.PushP0Planar(
             firstFrame, left, right, frames, discontinuity, endOfStream);
         if (accepted) {
             acceptedFrames_.fetch_add(frames, std::memory_order_relaxed);
-            acceptedBlocks_.fetch_add(
-                (frames + kMaxBlockFrames - 1u) / kMaxBlockFrames,
-                std::memory_order_relaxed);
             if (endOfStream) endSeen_.store(true, std::memory_order_release);
-        } else {
-            droppedFrames_.fetch_add(frames, std::memory_order_relaxed);
         }
         return accepted;
     }
 
-    bool IsBound(void* converter) const noexcept {
-        return Bound(converter);
-    }
-
     ApplePcmTapStats Stats() const noexcept {
-        return ApplePcmTapStats{
-            acceptedFrames_.load(std::memory_order_acquire),
-            acceptedBlocks_.load(std::memory_order_acquire),
-            ignoredFrames_.load(std::memory_order_acquire),
-            droppedFrames_.load(std::memory_order_acquire),
-            bindingFailures_.load(std::memory_order_acquire),
-        };
+        return ApplePcmTapStats{acceptedFrames_.load(std::memory_order_acquire)};
     }
 
 private:
@@ -129,10 +102,6 @@ private:
     std::atomic<std::uint64_t> mediaGeneration_{};
     std::atomic<bool> endSeen_{};
     std::atomic<std::uint64_t> acceptedFrames_{};
-    std::atomic<std::uint64_t> acceptedBlocks_{};
-    std::atomic<std::uint64_t> ignoredFrames_{};
-    std::atomic<std::uint64_t> droppedFrames_{};
-    std::atomic<std::uint64_t> bindingFailures_{};
 };
 
 } // namespace ammod::audio_v2

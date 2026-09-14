@@ -54,9 +54,7 @@ HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) n
             ? &verifier_ : nullptr;
     source_.emplace(*queue_, config_.sink.format, config_.mediaGeneration,
                     verifier, config_.mappingPolicy);
-    capturedBlocks_.store(0, std::memory_order_release);
     capturedFrames_.store(0, std::memory_order_release);
-    droppedBlocks_.store(0, std::memory_order_release);
     droppedFrames_.store(0, std::memory_order_release);
     return S_OK;
 }
@@ -88,18 +86,12 @@ void AudioCoreCoordinator::Disable() noexcept {
 
 bool AudioCoreCoordinator::PushResult(bool pushed, std::uint32_t frames) noexcept {
     if (pushed) {
-        capturedBlocks_.fetch_add(
-            (frames + kMaxBlockFrames - 1u) / kMaxBlockFrames,
-            std::memory_order_relaxed);
         capturedFrames_.fetch_add(frames, std::memory_order_relaxed);
         // The producer notification exists only to restart a sink that had to
         // stop for source starvation. Signaling it for every healthy P0 block
         // needlessly wakes the real-time render thread at producer cadence.
         if (sourceReadyEvent_ && sink_.WaitingForSource()) SetEvent(sourceReadyEvent_);
     } else {
-        droppedBlocks_.fetch_add(
-            (frames + kMaxBlockFrames - 1u) / kMaxBlockFrames,
-            std::memory_order_relaxed);
         droppedFrames_.fetch_add(frames, std::memory_order_relaxed);
         gate_.Fail(token_);
     }
@@ -112,7 +104,6 @@ bool AudioCoreCoordinator::PushP0Interleaved(std::uint64_t firstFrame,
                                              bool discontinuity,
                                              bool endOfStream) noexcept {
     if (!queue_ || !gate_.CanCapture(token_)) {
-        droppedBlocks_.fetch_add(1, std::memory_order_relaxed);
         droppedFrames_.fetch_add(frames, std::memory_order_relaxed);
         return false;
     }
@@ -129,7 +120,6 @@ bool AudioCoreCoordinator::PushP0Planar(std::uint64_t firstFrame,
                                         bool discontinuity,
                                         bool endOfStream) noexcept {
     if (!queue_ || !gate_.CanCapture(token_)) {
-        droppedBlocks_.fetch_add(1, std::memory_order_relaxed);
         droppedFrames_.fetch_add(frames, std::memory_order_relaxed);
         return false;
     }
@@ -205,9 +195,7 @@ bool AudioCoreCoordinator::ShouldSuppressNative() const noexcept {
 
 const AudioCoreCoordinatorStats AudioCoreCoordinator::Stats() const noexcept {
     AudioCoreCoordinatorStats stats{};
-    stats.capturedBlocks = capturedBlocks_.load(std::memory_order_acquire);
     stats.capturedFrames = capturedFrames_.load(std::memory_order_acquire);
-    stats.droppedBlocks = droppedBlocks_.load(std::memory_order_acquire);
     stats.droppedFrames = droppedFrames_.load(std::memory_order_acquire);
     if (source_) stats.source = source_->Stats();
     return stats;

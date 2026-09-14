@@ -114,7 +114,6 @@ public:
         endOfStreamSealed_.store(false, std::memory_order_release);
     }
     std::size_t Size() const noexcept { return queue_.size(); }
-    std::size_t Capacity() const noexcept { return queue_.capacity(); }
     std::size_t QueuedFrames() const noexcept {
         return queuedFrames_.load(std::memory_order_acquire);
     }

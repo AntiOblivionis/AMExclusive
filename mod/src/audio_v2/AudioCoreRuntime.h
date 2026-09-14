@@ -80,10 +80,6 @@ enum class AudioCorePcmRejectReason : std::uint8_t {
 };
 
 struct AudioCoreRuntimeStats final {
-    AudioCoreRuntimeEvent event{AudioCoreRuntimeEvent::Disabled};
-    AudioCoreGatePhase phase{AudioCoreGatePhase::Off};
-    bool uiEnabled{};
-    std::size_t bufferedBlocks{};
     std::size_t bufferedFrames{};
     AudioCoreCoordinatorStats coordinator{};
     ApplePcmTapStats tap{};
@@ -206,12 +202,6 @@ public:
     // coordinator/SPSC lifetime directly.
     std::uint32_t NativePumpPeriodMs() const noexcept;
 
-    AudioCoreRuntimeEvent LastEvent() const noexcept {
-        return lastEvent_.load(std::memory_order_acquire);
-    }
-    HRESULT LastError() const noexcept {
-        return static_cast<HRESULT>(lastError_.load(std::memory_order_acquire));
-    }
     AudioCoreRuntimeStats Stats() const noexcept;
     const AudioCoreCoordinator& Coordinator() const noexcept { return coordinator_; }
 
@@ -228,7 +218,6 @@ private:
     bool BeginEndOfStreamDrainLocked(void* converter, bool requireShortTail) noexcept;
     void FinalizeEndOfStreamDrainLocked() noexcept;
     void RetireCaptureLocked(bool keepGraph) noexcept;
-    void RetireGraphLocked(void* unit) noexcept;
     bool BuildFormat(const ConverterRegistrationSnapshot& snapshot,
                      PcmFormat& output) const noexcept;
     std::uint32_t PeriodFrames(std::uint32_t sampleRate) const noexcept;
@@ -299,8 +288,6 @@ private:
     // observer-only run never arms the v2 graph or endpoint.
     ULONGLONG nextDiagnosticTelemetryTick_{};
 
-    std::atomic<AudioCoreRuntimeEvent> lastEvent_{AudioCoreRuntimeEvent::Disabled};
-    std::atomic<LONG> lastError_{S_OK};
     // A decoder cookie may arrive before its float32 P0 converter is
     // registered (or on a different converter handle).  Keep the latest
     // validated precision so a later registration can inherit it.

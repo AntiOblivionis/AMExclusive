@@ -7,16 +7,9 @@
 namespace ammod::audio_v2 {
 
 struct BitPerfectVerifierStats final {
-    std::uint64_t comparedFrames{};
-    std::uint64_t comparedSamples{};
-    std::uint64_t changedFrames{};
     std::uint64_t changedSamples{};
-    std::uint64_t missingFrames{};
-    std::uint64_t duplicatedFrames{};
-    std::uint64_t reorderedBlocks{};
     std::uint64_t metadataFailures{};
     std::uint64_t mappingFailures{};
-    bool endOfStream{};
 };
 
 // Compares the integer samples submitted by the sink with the exact mapping
@@ -55,7 +48,6 @@ public:
             !IsValidFormat(format_) || block.format != format_ ||
             block.mediaGeneration != generation_) {
             ++stats_.metadataFailures;
-            ClassifyMetadataFailure(block, offsetFrames, frames);
             return false;
         }
 
@@ -65,7 +57,6 @@ public:
                  (!block.discontinuity && block.firstFrame != nextFrame_));
             if (offsetFrames != 0 || badContinuation) {
                 ++stats_.metadataFailures;
-                ClassifyMetadataFailure(block, offsetFrames, frames);
                 return false;
             }
             currentSequence_ = block.sequence;
@@ -78,12 +69,10 @@ public:
                    block.frames != currentBlockFrames_ ||
                    offsetFrames != currentOffsetFrames_) {
             ++stats_.metadataFailures;
-            ClassifyMetadataFailure(block, offsetFrames, frames);
             return false;
         }
 
         const auto validBits = EffectiveSourceValidBits(block.format);
-        bool equal = true;
         for (std::uint32_t frame = 0; frame < frames; ++frame) {
             const auto sourceOffset = static_cast<std::size_t>(offsetFrames + frame) *
                                       kSupportedChannels;
@@ -94,15 +83,10 @@ public:
                     ++stats_.mappingFailures;
                     return false;
                 }
-                ++stats_.comparedSamples;
                 if (expected != submitted[outputOffset + channel]) {
-                    equal = false;
                     ++stats_.changedSamples;
                 }
             }
-            ++stats_.comparedFrames;
-            if (!equal) ++stats_.changedFrames;
-            equal = true;
         }
 
         currentOffsetFrames_ += frames;
@@ -113,38 +97,13 @@ public:
             haveBlock_ = false;
             if (block.endOfStream) {
                 ended_ = true;
-                stats_.endOfStream = true;
             }
         }
         return stats_.changedSamples == 0 && stats_.metadataFailures == 0 &&
                stats_.mappingFailures == 0;
     }
 
-    const BitPerfectVerifierStats& Stats() const noexcept { return stats_; }
-
-    bool Proven() const noexcept {
-        return ended_ && stats_.comparedFrames != 0 &&
-               stats_.changedSamples == 0 && stats_.missingFrames == 0 &&
-               stats_.duplicatedFrames == 0 && stats_.reorderedBlocks == 0 &&
-               stats_.metadataFailures == 0 && stats_.mappingFailures == 0;
-    }
-
 private:
-    void ClassifyMetadataFailure(const PcmBlock& block,
-                                 std::uint32_t offsetFrames,
-                                 std::uint32_t frames) noexcept {
-        if (!firstBlock_ && block.sequence > nextSequence_) {
-            stats_.missingFrames += frames;
-            ++stats_.reorderedBlocks;
-        } else if (haveBlock_ && block.sequence == currentSequence_ &&
-                   offsetFrames < currentOffsetFrames_) {
-            stats_.duplicatedFrames += frames;
-            ++stats_.reorderedBlocks;
-        } else if (!firstBlock_ && block.sequence != nextSequence_) {
-            ++stats_.reorderedBlocks;
-        }
-    }
-
     PcmFormat format_{};
     std::uint64_t generation_{};
     BitPerfectVerifierStats stats_{};

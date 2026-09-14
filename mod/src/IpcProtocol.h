@@ -5,9 +5,8 @@
 #include <windows.h>
 #include <audioclient.h>
 
-#include <array>
 #include <cstdint>
-#include <string_view>
+#include <type_traits>
 
 namespace ammod::ipc {
 
@@ -138,25 +137,5 @@ inline ErrorCategory CategorizeAudioError(HRESULT hr) noexcept {
     }
 }
 
-inline std::wstring_view MessageKey(ErrorCategory category) noexcept {
-    switch (category) {
-    case ErrorCategory::None: return L"none";
-    case ErrorCategory::UnsupportedLocalInt32: return L"unsupported_local_int32";
-    case ErrorCategory::BitPerfectFormatUnavailable:
-        return L"bit_perfect_format_unavailable";
-    case ErrorCategory::FormatUnsupported: return L"format_unsupported";
-    case ErrorCategory::ExclusiveNotAllowed: return L"exclusive_not_allowed";
-    case ErrorCategory::DeviceInUse: return L"device_in_use";
-    case ErrorCategory::DeviceChanged: return L"device_changed";
-    case ErrorCategory::DeviceInvalidated: return L"device_invalidated";
-    case ErrorCategory::AudioServiceUnavailable: return L"audio_service_unavailable";
-    case ErrorCategory::BufferSizeNotAligned: return L"buffer_size_not_aligned";
-    case ErrorCategory::EndpointUnavailable: return L"endpoint_unavailable";
-    case ErrorCategory::HookLoadFailed: return L"hook_load_failed";
-    case ErrorCategory::PipeUnavailable:
-    case ErrorCategory::BrokerUnavailable: return L"broker_unavailable";
-    default: return L"initialization_error";
-    }
-}
 
 } // namespace ammod::ipc

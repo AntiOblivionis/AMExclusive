@@ -64,10 +64,6 @@ public:
         return phase == AudioCoreGatePhase::Active || phase == AudioCoreGatePhase::Faulted;
     }
 
-    std::uint64_t SuppressedGeneration() const noexcept {
-        return suppressedGeneration_.load(std::memory_order_acquire);
-    }
-
 private:
     AudioCoreGate& coreGate_;
     std::atomic<std::uint64_t> suppressedGeneration_{};

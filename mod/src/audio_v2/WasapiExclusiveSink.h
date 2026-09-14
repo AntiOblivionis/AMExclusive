@@ -113,7 +113,6 @@ public:
 
     WasapiSinkState State() const noexcept { return state_.load(std::memory_order_acquire); }
     WasapiSinkStats Stats() const noexcept;
-    std::uint32_t BufferFrames() const noexcept { return bufferFrames_; }
     const PcmFormat& Format() const noexcept { return config_.format; }
     bool WaitingForSource() const noexcept {
         return waitingForSource_.load(std::memory_order_acquire);

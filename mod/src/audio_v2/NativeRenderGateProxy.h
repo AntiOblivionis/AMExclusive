@@ -293,7 +293,6 @@ private:
     void Trace(const wchar_t* method, HRESULT result) noexcept;
     void TraceService(REFIID iid, HRESULT result) noexcept;
     IAudioClient2* Inner2() const noexcept;
-    IAudioClient3* Inner3() const noexcept;
     static DWORD WINAPI PumpThreadThunk(void* context) noexcept;
     void StartPumpThread() noexcept;
     void StopPumpThread() noexcept;

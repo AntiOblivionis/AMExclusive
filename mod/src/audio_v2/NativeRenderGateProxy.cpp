@@ -14,12 +14,12 @@ constexpr REFERENCE_TIME kReferenceTimePerSecond = 10000000;
 // Apple never needs to observe the physical endpoint's Windows shared-mode
 // contract.  AME presents one stable software terminal to Apple's scheduler;
 // the real device is opened separately by ACv2 in source-native exclusive mode.
-constexpr UINT32 kVirtualSampleRate = 384000u;
-constexpr WORD kVirtualChannels = 2u;
-constexpr WORD kVirtualBitsPerSample = 32u;
-constexpr WORD kVirtualBlockAlign = 8u;
-constexpr REFERENCE_TIME kVirtualEnginePeriod = 100000; // 10 ms
-constexpr REFERENCE_TIME kVirtualBufferDuration = 220000; // 22 ms
+constexpr UINT32 kDefaultSoftwareSampleRate = 384000u;
+constexpr WORD kDefaultSoftwareChannels = 2u;
+constexpr WORD kDefaultSoftwareBitsPerSample = 32u;
+constexpr WORD kDefaultSoftwareBlockAlign = 8u;
+constexpr REFERENCE_TIME kSoftwareEnginePeriod = 100000; // 10 ms
+constexpr REFERENCE_TIME kSoftwareBufferDuration = 220000; // 22 ms
 
 UINT32 FramesForDuration(UINT32 sampleRate, REFERENCE_TIME duration) noexcept {
     if (sampleRate == 0 || duration <= 0) return 0;
@@ -30,60 +30,44 @@ UINT32 FramesForDuration(UINT32 sampleRate, REFERENCE_TIME duration) noexcept {
     return static_cast<UINT32>(std::max<std::uint64_t>(1u, frames));
 }
 
-UINT32 VirtualQuantumFrames() noexcept {
-    return FramesForDuration(kVirtualSampleRate, kVirtualEnginePeriod);
+UINT32 SoftwareQuantumFrames(UINT32 sampleRate) noexcept {
+    return FramesForDuration(sampleRate, kSoftwareEnginePeriod);
 }
 
-UINT32 VirtualBufferFrames() noexcept {
-    return FramesForDuration(kVirtualSampleRate, kVirtualBufferDuration);
+UINT32 SoftwareBufferFrames(UINT32 sampleRate) noexcept {
+    return FramesForDuration(sampleRate, kSoftwareBufferDuration);
 }
 
-WAVEFORMATEXTENSIBLE VirtualMixFormat() noexcept {
+WAVEFORMATEXTENSIBLE DefaultSoftwareMixFormat(UINT32 sampleRate = kDefaultSoftwareSampleRate) noexcept {
     WAVEFORMATEXTENSIBLE format{};
     format.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
-    format.Format.nChannels = kVirtualChannels;
-    format.Format.nSamplesPerSec = kVirtualSampleRate;
-    format.Format.wBitsPerSample = kVirtualBitsPerSample;
-    format.Format.nBlockAlign = kVirtualBlockAlign;
-    format.Format.nAvgBytesPerSec = kVirtualSampleRate * kVirtualBlockAlign;
+    format.Format.nChannels = kDefaultSoftwareChannels;
+    format.Format.nSamplesPerSec = sampleRate;
+    format.Format.wBitsPerSample = kDefaultSoftwareBitsPerSample;
+    format.Format.nBlockAlign = kDefaultSoftwareBlockAlign;
+    format.Format.nAvgBytesPerSec = sampleRate * kDefaultSoftwareBlockAlign;
     format.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-    format.Samples.wValidBitsPerSample = kVirtualBitsPerSample;
+    format.Samples.wValidBitsPerSample = kDefaultSoftwareBitsPerSample;
     format.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
     format.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
     return format;
 }
 
-HRESULT AllocateVirtualMixFormat(WAVEFORMATEX** format) noexcept {
+HRESULT AllocateSoftwareMixFormat(WAVEFORMATEX** format,
+                                  UINT32 sampleRate = kDefaultSoftwareSampleRate) noexcept {
     if (!format) return E_POINTER;
     *format = nullptr;
     auto* allocated = static_cast<WAVEFORMATEXTENSIBLE*>(
         CoTaskMemAlloc(sizeof(WAVEFORMATEXTENSIBLE)));
     if (!allocated) return E_OUTOFMEMORY;
-    *allocated = VirtualMixFormat();
+    *allocated = DefaultSoftwareMixFormat(sampleRate);
     *format = &allocated->Format;
     return S_OK;
 }
 
-bool IsVirtualMixFormat(const WAVEFORMATEX* format) noexcept {
-    if (!format || format->nChannels != kVirtualChannels ||
-        format->nSamplesPerSec != kVirtualSampleRate ||
-        format->wBitsPerSample != kVirtualBitsPerSample ||
-        format->nBlockAlign != kVirtualBlockAlign) {
-        return false;
-    }
-    if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return true;
-    if (format->wFormatTag != WAVE_FORMAT_EXTENSIBLE ||
-        format->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
-        return false;
-    }
-    const auto* extensible = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format);
-    return extensible->Samples.wValidBitsPerSample == kVirtualBitsPerSample &&
-        extensible->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-}
-
-bool IsAppleSharedGraphClient(AUDCLNT_SHAREMODE shareMode,
-                              const WAVEFORMATEX* format) noexcept {
-    return shareMode == AUDCLNT_SHAREMODE_SHARED && IsVirtualMixFormat(format);
+bool IsUsableSharedFormat(const WAVEFORMATEX* format) noexcept {
+    return format && format->nSamplesPerSec != 0 && format->nChannels != 0 &&
+        format->nBlockAlign != 0;
 }
 
 class PumpAudioClock final : public IAudioClock {
@@ -426,9 +410,11 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Initialize(
     {
         std::lock_guard lock(innerMutex_);
         if (shareMode == AUDCLNT_SHAREMODE_SHARED) {
-            // Shared mode is a pure AME software terminal. Never initialize or
-            // consult the physical Windows shared endpoint from this path.
-            if (!IsAppleSharedGraphClient(shareMode, format)) {
+            // Shared mode is a pure AME software terminal. The caller's shared
+            // engine format is scheduler metadata, not source identity and not
+            // the physical Windows endpoint contract. Accept any structurally
+            // usable shared format and clock the software pump from that request.
+            if (!IsUsableSharedFormat(format)) {
                 result = AUDCLNT_E_UNSUPPORTED_FORMAT;
             } else {
                 pumpMode_ = true;
@@ -436,10 +422,10 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Initialize(
                     pumpClock_->Release();
                     pumpClock_ = nullptr;
                 }
-                pumpSampleRate_ = kVirtualSampleRate;
-                pumpQuantumFrames_ = VirtualQuantumFrames();
-                pumpBufferFrames_ = VirtualBufferFrames();
-                blockAlign_.store(kVirtualBlockAlign, std::memory_order_release);
+                pumpSampleRate_ = format->nSamplesPerSec;
+                pumpQuantumFrames_ = SoftwareQuantumFrames(pumpSampleRate_);
+                pumpBufferFrames_ = SoftwareBufferFrames(pumpSampleRate_);
+                blockAlign_.store(format->nBlockAlign, std::memory_order_release);
                 result = S_OK;
             }
         } else if (inner_) {
@@ -484,7 +470,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetStreamLatency(REFERENCE_TIM
         if (pumpMode_) {
             if (!latency) result = E_POINTER;
             else {
-                *latency = kVirtualBufferDuration;
+                *latency = kSoftwareBufferDuration;
                 result = S_OK;
             }
         } else {
@@ -527,14 +513,11 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::IsFormatSupported(
         if (mode == AUDCLNT_SHAREMODE_SHARED) {
             if (!format) {
                 result = E_POINTER;
-            } else if (IsVirtualMixFormat(format)) {
+            } else if (IsUsableSharedFormat(format)) {
                 if (closest) *closest = nullptr;
                 result = S_OK;
-            } else if (closest) {
-                result = AllocateVirtualMixFormat(closest);
-                if (SUCCEEDED(result)) result = S_FALSE;
             } else {
-                result = S_FALSE;
+                result = AUDCLNT_E_UNSUPPORTED_FORMAT;
             }
         } else {
             result = inner_ ? inner_->IsFormatSupported(mode, format, closest)
@@ -546,9 +529,10 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::IsFormatSupported(
 }
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetMixFormat(WAVEFORMATEX** format) {
-    // GetMixFormat is the earliest point where the Windows shared endpoint used
-    // to leak into Apple's graph. Always expose AME's fixed software terminal.
-    const HRESULT result = AllocateVirtualMixFormat(format);
+    // This is only AME's advertised software-engine default. It is not source
+    // metadata, not a physical Windows endpoint setting, and not an admission
+    // requirement for a later shared Initialize call.
+    const HRESULT result = AllocateSoftwareMixFormat(format);
     Trace(L"GetMixFormat", result);
     return result;
 }
@@ -559,8 +543,8 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetDevicePeriod(
     if (!defaultPeriod && !minimumPeriod) {
         result = E_POINTER;
     } else {
-        if (defaultPeriod) *defaultPeriod = kVirtualEnginePeriod;
-        if (minimumPeriod) *minimumPeriod = kVirtualEnginePeriod;
+        if (defaultPeriod) *defaultPeriod = kSoftwareEnginePeriod;
+        if (minimumPeriod) *minimumPeriod = kSoftwareEnginePeriod;
     }
     Trace(L"GetDevicePeriod", result);
     return result;
@@ -763,11 +747,11 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::SetClientProperties(
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetBufferSizeLimits(
     const WAVEFORMATEX* format, BOOL eventDriven, REFERENCE_TIME* minimum,
     REFERENCE_TIME* maximum) {
-    if (IsVirtualMixFormat(format)) {
+    if (IsUsableSharedFormat(format)) {
         if (!minimum || !maximum) return E_POINTER;
         (void)eventDriven;
-        *minimum = kVirtualEnginePeriod;
-        *maximum = kVirtualBufferDuration;
+        *minimum = kSoftwareEnginePeriod;
+        *maximum = kSoftwareBufferDuration;
         return S_OK;
     }
     auto* client = Inner2();
@@ -783,8 +767,8 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetSharedModeEnginePeriod(
     if (!format || !defaultFrames || !fundamentalFrames || !minimumFrames || !maximumFrames) {
         return E_POINTER;
     }
-    if (!IsVirtualMixFormat(format)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
-    const auto quantum = VirtualQuantumFrames();
+    if (!IsUsableSharedFormat(format)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
+    const auto quantum = SoftwareQuantumFrames(format->nSamplesPerSec);
     *defaultFrames = quantum;
     *fundamentalFrames = quantum;
     *minimumFrames = quantum;
@@ -795,20 +779,27 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetSharedModeEnginePeriod(
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetCurrentSharedModeEnginePeriod(
     WAVEFORMATEX** format, UINT32* frames) {
     if (!format || !frames) return E_POINTER;
-    const HRESULT result = AllocateVirtualMixFormat(format);
+    UINT32 sampleRate{};
+    {
+        std::lock_guard lock(innerMutex_);
+        sampleRate = pumpSampleRate_ ? pumpSampleRate_ : kDefaultSoftwareSampleRate;
+    }
+    const HRESULT result = AllocateSoftwareMixFormat(format, sampleRate);
     if (FAILED(result)) return result;
-    *frames = VirtualQuantumFrames();
+    *frames = SoftwareQuantumFrames(sampleRate);
     return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::InitializeSharedAudioStream(
     DWORD flags, UINT32 periodFrames, const WAVEFORMATEX* format, LPCGUID sessionGuid) {
     if (!format) return E_POINTER;
-    if (!IsVirtualMixFormat(format)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
-    if (periodFrames != VirtualQuantumFrames()) return AUDCLNT_E_INVALID_DEVICE_PERIOD;
+    if (!IsUsableSharedFormat(format)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
+    if (periodFrames != SoftwareQuantumFrames(format->nSamplesPerSec)) {
+        return AUDCLNT_E_INVALID_DEVICE_PERIOD;
+    }
     // Route IAudioClient3 shared initialization through the same software-only
     // contract as IAudioClient::Initialize. No physical shared client is touched.
-    return Initialize(AUDCLNT_SHAREMODE_SHARED, flags, kVirtualBufferDuration, 0,
+    return Initialize(AUDCLNT_SHAREMODE_SHARED, flags, kSoftwareBufferDuration, 0,
                       format, sessionGuid);
 }
 
@@ -818,14 +809,6 @@ IAudioClient2* NativeAudioClientProxy::Inner2() const noexcept {
     IAudioClient2* client{};
     return SUCCEEDED(inner_->QueryInterface(
         __uuidof(IAudioClient2), reinterpret_cast<void**>(&client))) ? client : nullptr;
-}
-
-IAudioClient3* NativeAudioClientProxy::Inner3() const noexcept {
-    std::lock_guard lock(innerMutex_);
-    if (!inner_ || !supports3_) return nullptr;
-    IAudioClient3* client{};
-    return SUCCEEDED(inner_->QueryInterface(
-        __uuidof(IAudioClient3), reinterpret_cast<void**>(&client))) ? client : nullptr;
 }
 
 void NativeAudioClientProxy::Trace(const wchar_t* method, HRESULT result) noexcept {
@@ -940,13 +923,13 @@ void NativeAudioClientProxy::StopPumpThread() noexcept {
 HRESULT NativeAudioClientProxy::PrepareForExclusiveHandoff() noexcept {
     {
         std::lock_guard lock(innerMutex_);
-        // Handoff must not re-read any state from the physical shared client.
-        // Reassert the canonical virtual terminal in case the proxy reached
-        // this point through an unusual lifecycle edge.
-        pumpSampleRate_ = kVirtualSampleRate;
-        pumpQuantumFrames_ = VirtualQuantumFrames();
-        pumpBufferFrames_ = VirtualBufferFrames();
-        blockAlign_.store(kVirtualBlockAlign, std::memory_order_release);
+        // Preserve the software scheduler contract established by the actual
+        // shared Initialize call. Handoff must not replace it with a guessed
+        // 192/384 kHz Windows or downstream work-format assumption.
+        if (pumpSampleRate_ == 0 || pumpQuantumFrames_ == 0 || pumpBufferFrames_ == 0 ||
+            blockAlign_.load(std::memory_order_acquire) == 0) {
+            return AUDCLNT_E_NOT_INITIALIZED;
+        }
     }
 
     // The parent AudioUnit remains Started and the native client is not

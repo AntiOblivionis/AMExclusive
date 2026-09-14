@@ -45,14 +45,6 @@ inline constexpr std::array<std::uintptr_t, 2> kLocalSeekResetFrame2{
     0x00B1E8AD, 0x00B1E972};
 } // namespace agent_stack
 
-namespace core_media_seek {
-// Retired hook inventory. Fingerprint: exact prologue match before any hook.
-inline constexpr std::uintptr_t kSetCurrentTimeRva = 0x008EA2C0;
-inline constexpr std::array<std::uint8_t, 15> kSetCurrentTimePrologue{
-    0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18,
-    0x57, 0x41, 0x56, 0x41, 0x57};
-} // namespace core_media_seek
-
 namespace audio_converter_property {
 inline constexpr std::uint32_t kCursor = 0x63706563; // 'cpec'
 inline constexpr std::uint32_t kCurrentInputDescription = 0x61636964; // 'acid'
@@ -68,10 +60,5 @@ inline constexpr std::uint32_t kBitDepth = 5;
 inline constexpr std::uint32_t kChannels = 9;
 inline constexpr std::uint32_t kSampleRate = 20;
 } // namespace alac_cookie
-
-namespace playback_bitrate_monitor {
-// Observed constructor ABI: the tenth argument is stored at this object field.
-inline constexpr std::size_t kStartsOnFirstEligibleVariant = 0x58;
-} // namespace playback_bitrate_monitor
 
 } // namespace ammod::apple_private
