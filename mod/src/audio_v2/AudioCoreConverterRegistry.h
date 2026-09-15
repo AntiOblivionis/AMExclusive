@@ -195,7 +195,7 @@ public:
             }
             const auto encoded = slot.encodedFormat.load(std::memory_order_relaxed);
             if (encoded != 0x616C6163u && encoded != 0x716C6163u &&
-                encoded != 0x6C70636Du) { // 'alac', 'qlac' or 'lpcm'
+                encoded != 0x71616163u && encoded != 0x6C70636Du) { // alac/qlac/qaac/lpcm
                 return false;
             }
             const auto observed = slot.observationId.load(std::memory_order_relaxed);
@@ -247,12 +247,13 @@ public:
                 continue;
             }
             const auto encoded = slot.encodedFormat.load(std::memory_order_relaxed);
-            if (encoded != 0x616C6163u && encoded != 0x716C6163u) continue;
+            if (encoded != 0x616C6163u && encoded != 0x716C6163u &&
+                encoded != 0x71616163u) continue;
             const auto depth = slot.sourceBitDepth.load(std::memory_order_relaxed);
-            // Zero is a valid provisional state: the P0 converter can be
-            // attached to the AudioUnit before the ALAC cookie arrives.  The
-            // coordinator will remain Capturing until UpdateSourcePrecision
-            // supplies a supported depth, then complete the bind.
+            // Zero is a valid provisional state for ALAC/QLAC before the
+            // decoder cookie arrives. QAAC registrations carry an explicit
+            // 32-bit decoded-float precision from creation.
+            // The coordinator remains Capturing until precision is usable.
             if (depth != 0 && !IsSupportedSourceDepth(static_cast<std::uint16_t>(depth))) continue;
             const auto observed = slot.observationId.load(std::memory_order_relaxed);
             if (observationId != 0 && observed != observationId) continue;

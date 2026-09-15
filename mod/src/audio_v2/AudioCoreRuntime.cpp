@@ -10,6 +10,7 @@ namespace {
 
 constexpr std::uint32_t kAlac = 0x616C6163u; // 'alac'
 constexpr std::uint32_t kQlac = 0x716C6163u; // 'qlac'
+constexpr std::uint32_t kQaac = 0x71616163u; // 'qaac'
 constexpr std::uint32_t kReferenceTimePerSecond = 10000000u;
 // Apple can return several large P0 fills while WASAPI is still negotiating
 // the replacement endpoint. One P0 fill is commonly 19,200 frames at 96 kHz
@@ -18,8 +19,13 @@ constexpr std::uint32_t kReferenceTimePerSecond = 10000000u;
 // observed cold-start burst without making the decoder callback wait.
 constexpr std::size_t kProductionQueueCapacity = 256;
 
+bool IsLossyAacFormat(std::uint32_t formatId) noexcept {
+    return formatId == kQaac;
+}
+
 bool IsCandidateEncodedFormat(std::uint32_t formatId) noexcept {
-    return formatId == kAlac || formatId == kQlac || formatId == kAppleLinearPcm;
+    return formatId == kAlac || formatId == kQlac || IsLossyAacFormat(formatId) ||
+        formatId == kAppleLinearPcm;
 }
 
 } // namespace
@@ -304,6 +310,12 @@ void AudioCoreRuntime::OnConverterCreated(void* converter,
                              source.bitsPerChannel == 24 || source.bitsPerChannel == 32)
         ? source.bitsPerChannel : 0u;
     const bool localPcm = source.formatId == kAppleLinearPcm;
+    const bool decodedLossyAac = IsLossyAacFormat(source.formatId);
+    // AAC is lossy before P0, so the compressed stream has no source integer
+    // bit depth to recover from a cookie. Apple exposes decoded stereo float32;
+    // AME deterministically maps that work format back to signed PCM32 for the
+    // exclusive endpoint, while ALAC/QLAC keep their source-lattice depth.
+    const auto mappingSourceBits = decodedLossyAac ? 32u : sourceBits;
     // Local PCM is captured before Apple's local-file SRC. Register local
     // signed int32 long enough for the worker to reject it explicitly and
     // surface the dedicated playback error; it must never reach the float
@@ -323,18 +335,18 @@ void AudioCoreRuntime::OnConverterCreated(void* converter,
                      (source.formatFlags & kAppleFormatFlagIsNonInterleaved) != 0)) {
         return;
     }
-    const auto endpointBits = localFloat32 || sourceBits == 32
+    const auto endpointBits = localFloat32 || mappingSourceBits == 32
         ? std::uint16_t{32} : std::uint16_t{24};
     const auto captureRate = localPcm ? source.sampleRate : destination.sampleRate;
     const auto captureChannels = localPcm ? source.channelsPerFrame : destination.channelsPerFrame;
     const PcmFormat outputFormat{
         captureRate, static_cast<std::uint16_t>(captureChannels),
         endpointBits, 32, PcmEncoding::SignedInteger, true,
-        static_cast<std::uint16_t>(sourceBits)};
+        static_cast<std::uint16_t>(mappingSourceBits)};
     ConverterRegistration registration{};
     registration.converter = converter;
     registration.outputFormat = outputFormat;
-    registration.sourceBitDepth = sourceBits;
+    registration.sourceBitDepth = mappingSourceBits;
     registration.encodedFormat = source.formatId;
     registration.observationId = observationId;
     registration.mediaGeneration = 1;
@@ -366,7 +378,8 @@ bool AudioCoreRuntime::IsP0Converter(void* converter) const noexcept {
     ConverterRegistrationSnapshot snapshot{};
     if (!converter || !registry_.Snapshot(converter, snapshot)) return false;
     return snapshot.registration.encodedFormat == kAlac ||
-           snapshot.registration.encodedFormat == kQlac;
+           snapshot.registration.encodedFormat == kQlac ||
+           IsLossyAacFormat(snapshot.registration.encodedFormat);
 }
 
 bool AudioCoreRuntime::IsConverterBound(void* converter) const noexcept {
@@ -1242,6 +1255,7 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     const bool localFloat32 = snapshot.registration.encodedFormat == kAppleLinearPcm &&
         (snapshot.registration.appleFormatFlags & kAppleFormatFlagIsFloat) != 0 &&
         snapshot.registration.sourceBitDepth == 32;
+    const bool decodedLossyAac = IsLossyAacFormat(snapshot.registration.encodedFormat);
     const auto candidates = ammod::audio::SelectBitPerfectFormatCandidates(
         snapshot.registration.sourceBitDepth, localFloat32);
     config.sink.formatCandidateCount = static_cast<std::uint32_t>(candidates.count);
@@ -1261,8 +1275,10 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     config.mediaGeneration = generation;
     config.mappingPolicy = localFloat32
         ? PcmMappingPolicy::LocalFloat32ToPcm32
-        : PcmMappingPolicy::ExactSourceInteger;
-    config.verifyBitPerfect = callbacks_.deepDiagnostics;
+        : decodedLossyAac
+            ? PcmMappingPolicy::DecodedLossyFloat32ToPcm32
+            : PcmMappingPolicy::ExactSourceInteger;
+    config.verifyBitPerfect = callbacks_.deepDiagnostics && !decodedLossyAac;
     const HRESULT enable = coordinator_.Enable(config);
     if (FAILED(enable) || !tap_.BindActive(graphConverter_, format, generation) ||
         !registry_.Bind(graphConverter_, generation)) {

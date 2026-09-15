@@ -1185,7 +1185,7 @@ void ObserveDecodedSourceFormat(const AudioStreamBasicDescription* source,
         if (ammod::audio::PreferExistingCompressedCandidate(
                 g_threadGraphFormat.encodedFormat, g_threadGraphFormat.sampleRate,
                 g_threadGraphFormat.channels, existingAge, local.sampleRate, local.channels)) {
-            Log(L"Local LPCM candidate suppressed by fresh compressed predecessor rate=" +
+            Log(L"Pre-SRC LPCM candidate suppressed by fresh compressed predecessor rate=" +
                 std::to_wstring(local.sampleRate) + L" predecessor=" +
                 AppleFormatIdText(g_threadGraphFormat.encodedFormat) + L" observation=" +
                 std::to_wstring(g_threadGraphFormat.observationId));
@@ -1195,7 +1195,7 @@ void ObserveDecodedSourceFormat(const AudioStreamBasicDescription* source,
         g_threadGraphFormat = {local.sampleRate, local.channels, local.sourceBitDepth,
                                now, source->mFormatID, observationId,
                                GetCurrentThreadId(), CurrentQpc(), converter, caller};
-        Log(L"Local LPCM source format observed rate=" +
+        Log(L"Pre-SRC LPCM source format observed rate=" +
             std::to_wstring(local.sampleRate) + L" channels=" +
             std::to_wstring(local.channels) + L" sourceBitDepth=" +
             std::to_wstring(local.sourceBitDepth) + L" numeric=" +
@@ -1353,14 +1353,10 @@ AppleOSStatus __cdecl HookFigAlternateEligibleLosslessFilterCreate(
         void* allowed = alacNumber && qlacNumber
             ? g_cfArrayCreate(nullptr, values, 2, g_cfTypeArrayCallbacks) : nullptr;
         if (allowed) {
-            if (g_configuredStreamQuality.load(std::memory_order_acquire) == 20) {
-                result = ammod::quality::CreateHighestLosslessFilter(
-                    g_figAlternateAllowableMediaSubtypeFilterCreate, allocator, allowed,
-                    static_cast<void**>(outFilter));
-            } else {
-                result = g_figAlternateAllowableMediaSubtypeFilterCreate(
-                    allocator, allowed, nullptr, static_cast<void**>(outFilter));
-            }
+            result = ammod::quality::CreateStrictLosslessFilter(
+                g_figAlternateAllowableMediaSubtypeFilterCreate, allocator, allowed,
+                g_configuredStreamQuality.load(std::memory_order_acquire),
+                static_cast<void**>(outFilter));
             strictSubtypeFilter = result == 0 && *static_cast<void**>(outFilter);
             g_cfRelease(allowed);
         } else {
@@ -1976,7 +1972,7 @@ std::shared_ptr<LocalPcmQueue> CreateV2LocalQueue(
         g_converterProbes[converter] = {queue};
     }
     g_v2PendingLocalConverter.store(converter, std::memory_order_release);
-    Log(L"v2 local PCM staging queue created converter=" +
+    Log(L"v2 pre-SRC PCM staging queue created converter=" +
         std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)) + L" rate=" +
         std::to_wstring(local.sampleRate) + L" bits=" +
         std::to_wstring(local.sourceBitDepth) + L" numeric=" +
@@ -2074,7 +2070,7 @@ bool DrainV2LocalQueue(void* converter, const std::shared_ptr<LocalPcmQueue>& qu
         if (!queue->Pop(raw.data(), frames, &copied) || copied != frames) break;
         if (!ConvertV2LocalToCanonical(*queue, raw.data(), frames, canonical.data())) {
             queue->droppedFrames += frames;
-            Log(L"v2 local PCM canonicalization failed converter=" +
+            Log(L"v2 pre-SRC PCM canonicalization failed converter=" +
                 std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)));
             break;
         }
@@ -2089,7 +2085,7 @@ bool DrainV2LocalQueue(void* converter, const std::shared_ptr<LocalPcmQueue>& qu
         const ammod::audio_v2::ApplePcmBufferListView list{1u, &buffer};
         if (!g_audioCoreRuntime.OnPcmOutput(converter, canonicalFormat, list, frames)) {
             queue->droppedFrames += frames;
-            Log(L"v2 local PCM ACv2 intake rejected after staging dequeue converter=" +
+            Log(L"v2 pre-SRC PCM ACv2 intake rejected after staging dequeue converter=" +
                 std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)) +
                 L" frames=" + std::to_wstring(frames));
             break;
@@ -2105,7 +2101,7 @@ bool PromoteV2LocalQueue(void* converter) {
     {
         std::lock_guard lock(queue->mutex);
         if (queue->droppedFrames != 0) {
-            Log(L"v2 local PCM promotion refused because staging already dropped frames converter=" +
+            Log(L"v2 pre-SRC PCM promotion refused because staging already dropped frames converter=" +
                 std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)) +
                 L" droppedFrames=" + std::to_wstring(queue->droppedFrames));
             return false;
@@ -2117,7 +2113,7 @@ bool PromoteV2LocalQueue(void* converter) {
     void* expected = converter;
     g_v2PendingLocalConverter.compare_exchange_strong(
         expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
-    Log(L"v2 local PCM staging promoted converter=" +
+    Log(L"v2 pre-SRC PCM staging promoted converter=" +
         std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)) + L" queuedFrames=" +
         std::to_wstring(V2LocalQueueAvailableFrames(queue)));
     return true;
@@ -2336,14 +2332,15 @@ AppleOSStatus __cdecl HookV2AudioConverterGetProperty(void* converter,
             std::uint32_t sourceSize = sizeof(source);
             if (g_v2OriginalAudioConverterGetProperty(
                     converter, ammod::apple_private::audio_converter_property::kCurrentInputDescription, &sourceSize, &source) == 0 &&
-                sourceSize >= sizeof(source) && source.mFormatID == 0x716C6163) {
+                sourceSize >= sizeof(source) &&
+                (source.mFormatID == 0x716C6163 || source.mFormatID == 0x71616163)) {
                 const auto sourceView = ApplePcmFormatViewFromAsbd(&source);
                 const auto destinationView = ApplePcmFormatViewFromAsbd(format);
                 ObserveDecodedSourceFormat(&source, format, converter, _ReturnAddress());
                 g_audioCoreRuntime.OnConverterCreated(
                     converter, sourceView, destinationView,
                     g_threadGraphFormat.observationId);
-                Log(L"v2 converter registered from output ASBD converter=" +
+                Log(L"v2 streaming converter registered from output ASBD converter=" +
                     std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)) +
                     L" registered=" + std::to_wstring(
                         g_audioCoreRuntime.IsConverterRegistered(converter)));
@@ -2516,9 +2513,10 @@ AppleOSStatus __cdecl HookV2AudioConverterFillComplexBuffer(
             L" accepted=" + std::to_wstring(accepted) +
             L" qpc=" + std::to_wstring(CurrentQpc()));
     }
-    // For local PCM, the source-side callback is Local P0. The converter
-    // output is Apple's already-resampled work-format PCM and must never be
-    // forwarded into ACv2.
+    // For a pre-SRC LPCM bridge, the source-side callback is the earliest PCM
+    // boundary we can prove. This covers native local PCM and decoded streaming
+    // PCM (for example AAC after QAAC). The converter output is Apple's later
+    // work-format/SRC PCM and must never be forwarded into ACv2.
     if (localQueue) return result;
     // Apple can return a nonzero status when its input callback has no new
     // encoded packet while the converter still flushes decoded PCM already
@@ -2607,7 +2605,7 @@ AppleOSStatus __cdecl HookV2AudioConverterReset(void* converter) {
             localEndSealed = g_audioCoreRuntime.OnLocalEndOfStream(converter);
         }
         if (localQueue) {
-            Log(L"v2 local PCM reset converter=" +
+            Log(L"v2 pre-SRC PCM reset converter=" +
                 std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)) +
                 L" seekReset=" + std::to_wstring(localSeekReset) +
                 L" flushed=" + std::to_wstring(localSeekReset) +
@@ -2638,7 +2636,7 @@ AppleOSStatus __cdecl HookV2AudioConverterDispose(void* converter) {
     const bool localEndSealed = uiEnabled && localQueue &&
         g_audioCoreRuntime.OnLocalEndOfStream(converter);
     if (localEndSealed) {
-        Log(L"v2 local PCM end-of-stream sealed before dispose converter=" +
+        Log(L"v2 pre-SRC PCM end-of-stream sealed before dispose converter=" +
             std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)) +
             L" queuedFrames=" + std::to_wstring(V2LocalQueueAvailableFrames(localQueue)));
     }
@@ -2673,12 +2671,12 @@ AppleOSStatus __cdecl HookV2AudioConverterDispose(void* converter) {
                 // Do not let the prefetched successor steal the endpoint until
                 // the old generation's terminal buffer is actually released.
                 g_audioCoreRuntime.SetPendingLocalSuccessor(successor);
-                Log(L"v2 local PCM successor queued behind terminal tail old=" +
+                Log(L"v2 pre-SRC PCM successor queued behind terminal tail old=" +
                     std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)) +
                     L" new=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(successor)));
             } else if (g_audioCoreRuntime.TryBindLocalSuccessor(successor)) {
                 (void)PromoteV2LocalQueue(successor);
-                Log(L"v2 local PCM successor rebound after natural dispose old=" +
+                Log(L"v2 pre-SRC PCM successor rebound after natural dispose old=" +
                     std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)) +
                     L" new=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(successor)));
             }
@@ -2717,19 +2715,25 @@ AppleOSStatus __cdecl HookV2AudioUnitSetProperty(void* unit, std::uint32_t prope
         g_threadGraphFormat.sampleRate == rate &&
         g_threadGraphFormat.channels == streamFormat->mChannelsPerFrame;
     constexpr std::uint32_t qlac = 0x716C6163; // 'qlac'
+    constexpr std::uint32_t qaac = 0x71616163; // 'qaac'
     const bool qlacCandidateMatches = hasFreshCandidate &&
         g_threadGraphFormat.encodedFormat == qlac &&
         IsSupportedSourceBitDepth(g_threadGraphFormat.sourceBitDepth);
+    const bool qaacCandidateMatches = hasFreshCandidate &&
+        g_threadGraphFormat.encodedFormat == qaac;
     const bool localPcmCandidateMatches = hasFreshCandidate &&
         g_threadGraphFormat.encodedFormat == ammod::audio::kLinearPcm &&
         IsSupportedSourceBitDepth(g_threadGraphFormat.sourceBitDepth);
-    std::uint32_t sourceBitDepth = (qlacCandidateMatches || localPcmCandidateMatches)
-        ? g_threadGraphFormat.sourceBitDepth : 0;
-    std::uint64_t observationId = (qlacCandidateMatches || localPcmCandidateMatches)
+    std::uint32_t sourceBitDepth = qaacCandidateMatches ? 32u :
+        ((qlacCandidateMatches || localPcmCandidateMatches)
+            ? g_threadGraphFormat.sourceBitDepth : 0u);
+    std::uint64_t observationId = (qlacCandidateMatches || qaacCandidateMatches ||
+                                   localPcmCandidateMatches)
         ? g_threadGraphFormat.observationId : 0;
-    std::wstring binding = qlacCandidateMatches ? L"same-thread-qlac" :
-        (localPcmCandidateMatches ? L"same-thread-local-lpcm" :
-         (hasFreshCandidate ? L"fresh-non-qlac" : L"unknown"));
+    std::wstring binding = qaacCandidateMatches ? L"same-thread-qaac" :
+        (qlacCandidateMatches ? L"same-thread-qlac" :
+         (localPcmCandidateMatches ? L"same-thread-pre-src-lpcm" :
+          (hasFreshCandidate ? L"fresh-non-p0" : L"unknown")));
     if (!sourceBitDepth && ResolveUnambiguousQlacBitDepth(
             rate, streamFormat->mChannelsPerFrame, sourceBitDepth, observationId)) {
         binding = L"cross-thread-unambiguous";
@@ -2916,7 +2920,16 @@ AppleOSStatus __cdecl HookV2AudioUnitInitialize(void* unit) {
         const bool sameObservedCandidate = fresh &&
             (!hasRemembered || remembered.observationId == 0 ||
              remembered.observationId == g_threadGraphFormat.observationId);
-        void* candidateConverter = sameObservedCandidate ? g_threadGraphFormat.converter : nullptr;
+        // A fresh thread-local observation is only a direct bind candidate when
+        // that converter is actually registered as a P0 source. Apple commonly
+        // creates later LPCM->LPCM work/SRC converters on the same setup thread;
+        // those observations may overwrite g_threadGraphFormat but are not P0.
+        // Treating such an unregistered work converter as authoritative skips
+        // ResolveCandidate() and can leave a seek rebuild started but unbound.
+        const bool registeredObservedCandidate = sameObservedCandidate &&
+            g_audioCoreRuntime.IsConverterRegistered(g_threadGraphFormat.converter);
+        void* candidateConverter = registeredObservedCandidate
+            ? g_threadGraphFormat.converter : nullptr;
         std::uint32_t resolvedSourceBitDepth = sourceBitDepth;
         if (!candidateConverter && rate != 0 && channels == 2) {
             const bool resolved = g_audioCoreRuntime.ResolveCandidate(
@@ -2967,7 +2980,7 @@ AppleOSStatus __cdecl HookV2AudioOutputUnitStart(void* unit) {
                 unit, g_threadGraphFormat.converter, g_threadGraphFormat.sampleRate,
                 g_threadGraphFormat.channels, g_threadGraphFormat.sourceBitDepth,
                 g_threadGraphFormat.observationId);
-            Log(L"v2 local PCM graph bound from fresh AudioOutputUnitStart converter=" +
+            Log(L"v2 pre-SRC PCM graph bound from fresh AudioOutputUnitStart converter=" +
                 std::to_wstring(reinterpret_cast<std::uintptr_t>(g_threadGraphFormat.converter)) +
                 L" rate=" + std::to_wstring(g_threadGraphFormat.sampleRate) +
                 L" bits=" + std::to_wstring(g_threadGraphFormat.sourceBitDepth));

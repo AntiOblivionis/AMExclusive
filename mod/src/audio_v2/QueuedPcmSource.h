@@ -13,6 +13,7 @@ namespace ammod::audio_v2 {
 enum class PcmMappingPolicy : std::uint8_t {
     ExactSourceInteger = 0,
     LocalFloat32ToPcm32 = 1,
+    DecodedLossyFloat32ToPcm32 = 2,
 };
 
 struct QueuedPcmSourceStats final {
@@ -96,7 +97,8 @@ public:
                                      kSupportedChannels;
             const auto outputOffset = static_cast<std::size_t>(writtenFrames) *
                                       kSupportedChannels;
-            if (mappingPolicy_ == PcmMappingPolicy::LocalFloat32ToPcm32) {
+            if (mappingPolicy_ == PcmMappingPolicy::LocalFloat32ToPcm32 ||
+                mappingPolicy_ == PcmMappingPolicy::DecodedLossyFloat32ToPcm32) {
                 LocalFloatIntegerizerStats integerizer{};
                 if (!IntegerizeLocalFloatInterleaved(
                         block->samples.data() + inputOffset,

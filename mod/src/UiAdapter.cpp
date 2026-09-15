@@ -41,6 +41,8 @@ namespace Input = Microsoft::UI::Xaml::Input;
 namespace Media = Microsoft::UI::Xaml::Media;
 namespace Automation = Microsoft::UI::Xaml::Automation;
 using namespace ammod::ipc;
+using ObserverRef = winrt::weak_ref<Xaml::DependencyObject>;
+using WindowObserverRef = winrt::weak_ref<Xaml::Window>;
 
 HMODULE g_module{};
 std::filesystem::path g_logPath;
@@ -63,24 +65,83 @@ std::atomic<bool> g_hardwareBufferInputDirty{};
 std::atomic<bool> g_hardwareBufferTextUpdating{};
 std::atomic<std::uint64_t> g_lastLoggedGeneration{UINT64_MAX};
 std::atomic<HHOOK> g_uiHook{};
+std::atomic<DWORD> g_uiHookThreadId{};
 std::atomic<std::uint64_t> g_transportEpoch{};
 std::atomic<std::uint64_t> g_activeSeekEpoch{};
+std::atomic<std::uintptr_t> g_activeSeekOwner{};
 std::atomic<ULONGLONG> g_lastSkipPointerTick{};
 std::deque<Message> g_transportPending;
-std::uintptr_t g_transportButtonIdentity{};
-std::uintptr_t g_skipBackIdentity{};
-std::uintptr_t g_skipForwardIdentity{};
-std::uintptr_t g_trackListPointerRootIdentity{};
+std::vector<ObserverRef> g_transportButtonObservers;
+std::vector<ObserverRef> g_skipBackObservers;
+std::vector<ObserverRef> g_skipForwardObservers;
+std::vector<ObserverRef> g_trackListPointerRootObservers;
+std::vector<ObserverRef> g_scrubberObservers;
+std::vector<ObserverRef> g_scrubberThumbObservers;
+std::vector<ObserverRef> g_transportPopupObservers;
+std::vector<WindowObserverRef> g_transportWindowObservers;
+std::atomic<bool> g_transportAttachScheduled{};
 std::uintptr_t g_lastTrackRowPressIdentity{};
 std::uint64_t g_lastTrackRowPressEpoch{};
 ULONGLONG g_lastTrackRowPressTick{};
-std::uintptr_t g_scrubberIdentity{};
-std::uintptr_t g_scrubberThumbIdentity{};
+HWINEVENTHOOK g_windowLifecycleHook{};
 HWND g_mainWindow{};
 winrt::weak_ref<Controls::ToggleSwitch> g_toggle;
 winrt::weak_ref<Controls::TextBox> g_hardwareBufferBox;
 Microsoft::UI::Dispatching::DispatcherQueue g_dispatcher{nullptr};
 Microsoft::UI::Dispatching::DispatcherQueueTimer g_statusRefreshTimer{nullptr};
+
+void AttachTransportObservers();
+void AttachOrRefreshToggle();
+void ScheduleTransportObserverAttach();
+LRESULT CALLBACK UiThreadHook(int code, WPARAM wParam, LPARAM lParam);
+
+bool ArmUiThreadRefresh(HWND window) {
+    if (!window || !IsWindow(window)) return false;
+    DWORD pid{};
+    const DWORD threadId = GetWindowThreadProcessId(window, &pid);
+    if (!threadId || pid != GetCurrentProcessId()) return false;
+
+    for (;;) {
+        HHOOK current = g_uiHook.load(std::memory_order_acquire);
+        const DWORD currentThread = g_uiHookThreadId.load(std::memory_order_acquire);
+        if (current && currentThread == threadId) {
+            PostMessageW(window, WM_NULL, 0, 0);
+            return true;
+        }
+        if (current) {
+            HHOOK expected = current;
+            if (!g_uiHook.compare_exchange_strong(
+                    expected, nullptr, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                continue;
+            }
+            g_uiHookThreadId.store(0, std::memory_order_release);
+            UnhookWindowsHookEx(current);
+        }
+
+        HHOOK hook = SetWindowsHookExW(WH_GETMESSAGE, UiThreadHook, g_module, threadId);
+        if (!hook) return false;
+        HHOOK expected{};
+        if (g_uiHook.compare_exchange_strong(
+                expected, hook, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            g_uiHookThreadId.store(threadId, std::memory_order_release);
+            PostMessageW(window, WM_NULL, 0, 0);
+            return true;
+        }
+        UnhookWindowsHookEx(hook);
+    }
+}
+
+void CALLBACK WindowLifecycleEvent(HWINEVENTHOOK, DWORD event, HWND window,
+                                   LONG objectId, LONG childId, DWORD, DWORD) {
+    if ((event != EVENT_OBJECT_CREATE && event != EVENT_OBJECT_SHOW) ||
+        objectId != OBJID_WINDOW || childId != CHILDID_SELF || !window ||
+        GetAncestor(window, GA_ROOT) != window) {
+        return;
+    }
+    (void)ArmUiThreadRefresh(window);
+}
 
 bool UseChineseUi() {
     static const bool chinese = [] {
@@ -232,19 +293,28 @@ void QueueSkipIntent(bool pointerEvent) {
     QueueTransport(L"skip", epoch);
 }
 
-void BeginSeekGesture() {
-    if (g_activeSeekEpoch.load(std::memory_order_acquire) != 0) return;
+void BeginSeekGesture(std::uintptr_t owner) {
+    if (!owner || g_activeSeekEpoch.load(std::memory_order_acquire) != 0) return;
     const auto epoch = g_transportEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     std::uint64_t expected{};
     if (g_activeSeekEpoch.compare_exchange_strong(
             expected, epoch, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        g_activeSeekOwner.store(owner, std::memory_order_release);
         QueueTransport(L"seek_begin", epoch);
     }
 }
 
-void CommitSeekGesture() {
+void CommitSeekGesture(std::uintptr_t owner = 0, std::wstring_view reason = {}) {
+    const auto activeOwner = g_activeSeekOwner.load(std::memory_order_acquire);
+    if (owner != 0 && activeOwner != owner) return;
     const auto epoch = g_activeSeekEpoch.exchange(0, std::memory_order_acq_rel);
-    if (epoch) QueueTransport(L"seek_commit", epoch);
+    if (!epoch) return;
+    g_activeSeekOwner.store(0, std::memory_order_release);
+    QueueTransport(L"seek_commit", epoch);
+    if (!reason.empty()) {
+        Log(L"transport seek terminal reason=" + std::wstring(reason) +
+            L" epoch=" + std::to_wstring(epoch));
+    }
 }
 
 HWND FindMainWindow() {
@@ -264,20 +334,53 @@ HWND FindMainWindow() {
 
 using GetAppPropertyFn = Windows::Foundation::IInspectable(__cdecl*)(hstring const&);
 
-Xaml::Window GetMainXamlWindow() {
-    HMODULE utils = GetModuleHandleW(L"AMP.Utils.dll");
-    if (!utils) return nullptr;
-    constexpr char exportName[] =
-        "?GetAppProperty@SharedUtils@@YA?AUIInspectable@Foundation@Windows@winrt@@AEBUhstring@5@@Z";
-    auto function = reinterpret_cast<GetAppPropertyFn>(GetProcAddress(utils, exportName));
-    if (!function) return nullptr;
+GetAppPropertyFn GetAppPropertyFunction() {
+    static GetAppPropertyFn function = [] {
+        HMODULE utils = GetModuleHandleW(L"AMP.Utils.dll");
+        if (!utils) return GetAppPropertyFn{};
+        constexpr char exportName[] =
+            "?GetAppProperty@SharedUtils@@YA?AUIInspectable@Foundation@Windows@winrt@@AEBUhstring@5@@Z";
+        return reinterpret_cast<GetAppPropertyFn>(GetProcAddress(utils, exportName));
+    }();
+    return function;
+}
+
+Xaml::Window GetXamlWindowProperty(std::wstring_view propertyName) {
+    const auto function = GetAppPropertyFunction();
+    if (!function || propertyName.empty()) return nullptr;
     try {
-        return function(hstring(L"MainWindow")).try_as<Xaml::Window>();
+        return function(hstring(propertyName)).try_as<Xaml::Window>();
     } catch (const hresult_error& error) {
-        Log(L"GetAppProperty(MainWindow) failed hr=0x" +
+        Log(L"GetAppProperty(" + std::wstring(propertyName) + L") failed hr=0x" +
             [&] { std::wostringstream text; text << std::hex << error.code().value; return text.str(); }());
         return nullptr;
+    } catch (...) {
+        return nullptr;
     }
+}
+
+Xaml::Window GetMainXamlWindow() {
+    return GetXamlWindowProperty(L"MainWindow");
+}
+
+void AppendUniqueWindow(std::vector<std::pair<std::wstring, Xaml::Window>>& windows,
+                        std::wstring_view propertyName) {
+    auto window = GetXamlWindowProperty(propertyName);
+    if (!window) return;
+    const auto identity = reinterpret_cast<std::uintptr_t>(get_abi(window));
+    if (!identity) return;
+    if (std::none_of(windows.begin(), windows.end(), [identity](const auto& existing) {
+            return reinterpret_cast<std::uintptr_t>(get_abi(existing.second)) == identity;
+        })) {
+        windows.emplace_back(propertyName, window);
+    }
+}
+
+std::vector<std::pair<std::wstring, Xaml::Window>> GetTransportXamlWindows() {
+    std::vector<std::pair<std::wstring, Xaml::Window>> windows;
+    AppendUniqueWindow(windows, L"MainWindow");
+    AppendUniqueWindow(windows, L"MiniPlayerWindow");
+    return windows;
 }
 
 Xaml::DependencyObject FindByClass(const Xaml::DependencyObject& node,
@@ -322,6 +425,122 @@ Xaml::DependencyObject FindByAutomationId(const Xaml::DependencyObject& node,
             if (found) return found;
         }
     } catch (...) {
+    }
+    return nullptr;
+}
+
+void AppendUniqueNode(std::vector<Xaml::DependencyObject>& nodes,
+                      const Xaml::DependencyObject& node) {
+    if (!node) return;
+    const auto identity = reinterpret_cast<std::uintptr_t>(get_abi(node));
+    if (!identity) return;
+    if (std::none_of(nodes.begin(), nodes.end(), [identity](const auto& existing) {
+            return reinterpret_cast<std::uintptr_t>(get_abi(existing)) == identity;
+        })) {
+        nodes.push_back(node);
+    }
+}
+
+void CollectByName(const Xaml::DependencyObject& node, std::wstring_view name,
+                   std::vector<Xaml::DependencyObject>& matches) {
+    if (!node) return;
+    try {
+        if (auto element = node.try_as<Xaml::FrameworkElement>(); element && element.Name() == name) {
+            AppendUniqueNode(matches, node);
+        }
+        const int count = Media::VisualTreeHelper::GetChildrenCount(node);
+        for (int index = 0; index < count; ++index) {
+            CollectByName(Media::VisualTreeHelper::GetChild(node, index), name, matches);
+        }
+    } catch (...) {
+    }
+}
+
+void CollectByAutomationId(const Xaml::DependencyObject& node,
+                           std::wstring_view automationId,
+                           std::vector<Xaml::DependencyObject>& matches) {
+    if (!node) return;
+    try {
+        if (Automation::AutomationProperties::GetAutomationId(node) == automationId) {
+            AppendUniqueNode(matches, node);
+        }
+        const int count = Media::VisualTreeHelper::GetChildrenCount(node);
+        for (int index = 0; index < count; ++index) {
+            CollectByAutomationId(Media::VisualTreeHelper::GetChild(node, index),
+                                  automationId, matches);
+        }
+    } catch (...) {
+    }
+}
+
+void CollectSliders(const Xaml::DependencyObject& node,
+                    std::vector<Xaml::DependencyObject>& matches) {
+    if (!node) return;
+    try {
+        if (node.try_as<Controls::Slider>()) AppendUniqueNode(matches, node);
+        const int count = Media::VisualTreeHelper::GetChildrenCount(node);
+        for (int index = 0; index < count; ++index) {
+            CollectSliders(Media::VisualTreeHelper::GetChild(node, index), matches);
+        }
+    } catch (...) {
+    }
+}
+
+bool RememberObserver(std::vector<ObserverRef>& observers,
+                      const Xaml::DependencyObject& node) {
+    if (!node) return false;
+    const auto identity = reinterpret_cast<std::uintptr_t>(get_abi(node));
+    if (!identity) return false;
+    bool alreadyObserved = false;
+    auto write = observers.begin();
+    for (auto read = observers.begin(); read != observers.end(); ++read) {
+        auto live = read->get();
+        if (!live) continue;
+        if (reinterpret_cast<std::uintptr_t>(get_abi(live)) == identity) alreadyObserved = true;
+        if (write != read) *write = *read;
+        ++write;
+    }
+    observers.erase(write, observers.end());
+    if (alreadyObserved) return false;
+    observers.push_back(winrt::make_weak(node));
+    return true;
+}
+
+bool RememberTransportWindow(const Xaml::Window& window) {
+    if (!window) return false;
+    const auto identity = reinterpret_cast<std::uintptr_t>(get_abi(window));
+    if (!identity) return false;
+    bool alreadyObserved = false;
+    auto write = g_transportWindowObservers.begin();
+    for (auto read = g_transportWindowObservers.begin();
+         read != g_transportWindowObservers.end(); ++read) {
+        auto live = read->get();
+        if (!live) continue;
+        if (reinterpret_cast<std::uintptr_t>(get_abi(live)) == identity) {
+            alreadyObserved = true;
+        }
+        if (write != read) *write = *read;
+        ++write;
+    }
+    g_transportWindowObservers.erase(write, g_transportWindowObservers.end());
+    if (alreadyObserved) return false;
+    g_transportWindowObservers.push_back(winrt::make_weak(window));
+    return true;
+}
+
+std::uintptr_t DependencyObjectIdentity(const Xaml::DependencyObject& node) {
+    return node ? reinterpret_cast<std::uintptr_t>(get_abi(node)) : 0;
+}
+
+Controls::Slider ResolveOwningSlider(const Xaml::DependencyObject& node) {
+    auto current = node;
+    for (unsigned depth = 0; current && depth < 16; ++depth) {
+        if (auto slider = current.try_as<Controls::Slider>()) return slider;
+        try {
+            current = Media::VisualTreeHelper::GetParent(current);
+        } catch (...) {
+            break;
+        }
     }
     return nullptr;
 }
@@ -582,35 +801,68 @@ void ScheduleStatusRefresh() {
     }
 }
 
+void ScheduleTransportObserverAttach() {
+    auto dispatcher = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+    if (!dispatcher) {
+        AttachTransportObservers();
+        return;
+    }
+    bool expected = false;
+    if (!g_transportAttachScheduled.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+    if (!dispatcher.TryEnqueue([] {
+            g_transportAttachScheduled.store(false, std::memory_order_release);
+            AttachTransportObservers();
+        })) {
+        g_transportAttachScheduled.store(false, std::memory_order_release);
+    }
+}
+
+void AttachTransportWindowLifecycle(const Xaml::Window& window) {
+    if (!window || !RememberTransportWindow(window)) return;
+    window.Activated([](auto&&, auto&&) { ScheduleTransportObserverAttach(); });
+    window.VisibilityChanged([](auto&&, auto&&) { ScheduleTransportObserverAttach(); });
+    window.Closed([](auto&&, auto&&) {
+        CommitSeekGesture(0, L"window-closed");
+        ScheduleTransportObserverAttach();
+    });
+}
+
+void AttachTransportPopupLifecycle(const Primitives::Popup& popup) {
+    if (!popup || !RememberObserver(g_transportPopupObservers, popup)) return;
+    popup.Opened([](auto&&, auto&&) { ScheduleTransportObserverAttach(); });
+    popup.Closed([](auto&&, auto&&) {
+        CommitSeekGesture(0, L"popup-closed");
+        ScheduleTransportObserverAttach();
+    });
+}
+
 void AttachTransportObservers() {
     try {
-        auto window = GetMainXamlWindow();
-        if (!window) return;
-        auto content = window.Content().try_as<Xaml::DependencyObject>();
-        if (!content) return;
+        const auto windows = GetTransportXamlWindows();
+        for (const auto& [windowProperty, window] : windows) {
+            auto content = window.Content().try_as<Xaml::DependencyObject>();
+            if (!content) continue;
+            if (!get_abi(window)) continue;
+            AttachTransportWindowLifecycle(window);
 
-        // Track rows are ListViewItem controls. Apple begins direct playback on
-        // the second press of the normal double-click gesture, but that path
-        // does not traverse the Previous/Next buttons. Observe the routed
-        // pointer at the window content root so the second press can publish a
-        // synchronous skip fence before Apple disposes the currently playing
-        // local converter. A single selection click is deliberately ignored.
-        if (auto pointerRoot = content.try_as<Xaml::UIElement>()) {
-            const auto identity = reinterpret_cast<std::uintptr_t>(get_abi(pointerRoot));
-            if (identity != g_trackListPointerRootIdentity) {
-                g_trackListPointerRootIdentity = identity;
+            // Preserve the original MainWindow direct-selection behavior while
+            // broadening discovery to every live transport presentation.
+            if (auto pointerRoot = content.try_as<Xaml::UIElement>();
+                pointerRoot && RememberObserver(g_trackListPointerRootObservers, pointerRoot)) {
                 pointerRoot.AddHandler(
                     Xaml::UIElement::PointerPressedEvent(),
                     box_value(Input::PointerEventHandler(
                         [](auto&&, Input::PointerRoutedEventArgs const& args) {
+                            ScheduleTransportObserverAttach();
                             auto current = args.OriginalSource().try_as<Xaml::DependencyObject>();
                             for (unsigned depth = 0; current && depth < 16; ++depth) {
                                 if (auto row = current.try_as<Controls::ListViewItem>()) {
-                                    const auto rowIdentity =
-                                        reinterpret_cast<std::uintptr_t>(get_abi(row));
+                                    const auto rowIdentity = DependencyObjectIdentity(row);
                                     const auto now = GetTickCount64();
-                                    const bool secondPress =
-                                        rowIdentity != 0 &&
+                                    const bool secondPress = rowIdentity != 0 &&
                                         rowIdentity == g_lastTrackRowPressIdentity &&
                                         now >= g_lastTrackRowPressTick &&
                                         now - g_lastTrackRowPressTick <= 650;
@@ -619,105 +871,157 @@ void AttachTransportObservers() {
                                         g_lastTrackRowPressIdentity = 0;
                                         g_lastTrackRowPressEpoch = 0;
                                         g_lastTrackRowPressTick = 0;
-                                        if (epoch != 0) {
-                                            QueueTransport(L"skip", epoch);
-                                            Log(L"transport direct-track double-press fence epoch=" +
-                                                std::to_wstring(epoch));
-                                        } else {
-                                            Log(L"transport direct-track double-press ignored; no armed owner");
-                                        }
+                                        if (epoch != 0) QueueTransport(L"skip", epoch);
                                     } else {
                                         g_lastTrackRowPressIdentity = rowIdentity;
                                         g_lastTrackRowPressTick = now;
                                         g_lastTrackRowPressEpoch = 0;
-                                        const auto status = StatusSnapshot();
-                                        if (status.state == RuntimeState::Active) {
+                                        if (StatusSnapshot().state == RuntimeState::Active) {
                                             const auto epoch =
                                                 g_transportEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
                                             g_lastTrackRowPressEpoch = epoch;
                                             QueueTransport(L"selection_arm", epoch);
-                                            Log(L"transport direct-track selection arm epoch=" +
-                                                std::to_wstring(epoch));
                                         }
                                     }
                                     break;
                                 }
-                                current = Media::VisualTreeHelper::GetParent(current);
+                                try {
+                                    current = Media::VisualTreeHelper::GetParent(current);
+                                } catch (...) {
+                                    break;
+                                }
                             }
                         })),
                     true);
-                Log(L"transport observer attached control=TrackListPointerRoot");
+                pointerRoot.AddHandler(
+                    Xaml::UIElement::TappedEvent(),
+                    box_value(Input::TappedEventHandler([](auto&&, auto&&) {
+                        ScheduleTransportObserverAttach();
+                    })), true);
+                pointerRoot.AddHandler(
+                    Xaml::UIElement::DoubleTappedEvent(),
+                    box_value(Input::DoubleTappedEventHandler([](auto&&, auto&&) {
+                        ScheduleTransportObserverAttach();
+                    })), true);
             }
-        }
 
-        auto buttonNode = FindByName(content, L"TransportControl_PlayPauseStop");
-        if (!buttonNode) {
-            buttonNode = FindByAutomationId(content, L"TransportControl_PlayPauseStop");
-        }
-        if (auto button = buttonNode.try_as<Controls::Button>()) {
-            const auto identity = reinterpret_cast<std::uintptr_t>(get_abi(button));
-            if (identity != g_transportButtonIdentity) {
-                g_transportButtonIdentity = identity;
-                button.Click([](auto&&, auto&&) {
-                    QueueTransport(L"play_pause");
-                });
-                Log(L"transport observer attached control=PlayPauseStop");
-            }
-        }
-
-        auto attachSkipObserver = [&](std::wstring_view automationId,
-                                      std::uintptr_t& rememberedIdentity) {
-            auto node = FindByName(content, automationId);
-            if (!node) node = FindByAutomationId(content, automationId);
-            if (auto button = node.try_as<Controls::Button>()) {
-                const auto identity = reinterpret_cast<std::uintptr_t>(get_abi(button));
-                if (identity != rememberedIdentity) {
-                    rememberedIdentity = identity;
-                    button.AddHandler(
-                        Xaml::UIElement::PointerPressedEvent(),
-                        box_value(Input::PointerEventHandler([](auto&&, auto&&) {
-                            QueueSkipIntent(true);
-                        })),
-                        true);
-                    button.Click([](auto&&, auto&&) {
-                        QueueSkipIntent(false);
-                    });
-                    Log(L"transport observer attached control=" + std::wstring(automationId));
+            std::vector<Xaml::DependencyObject> playPauseNodes;
+            CollectByName(content, L"TransportControl_PlayPauseStop", playPauseNodes);
+            CollectByAutomationId(content, L"TransportControl_PlayPauseStop", playPauseNodes);
+            for (const auto& node : playPauseNodes) {
+                if (auto button = node.try_as<Primitives::ButtonBase>();
+                    button && RememberObserver(g_transportButtonObservers, button)) {
+                    button.Click([](auto&&, auto&&) { QueueTransport(L"play_pause"); });
                 }
             }
-        };
-        attachSkipObserver(L"TransportControl_SkipBack", g_skipBackIdentity);
-        attachSkipObserver(L"TransportControl_SkipForward", g_skipForwardIdentity);
 
-        if (auto scrubber = FindByName(content, L"LCDScrubber").try_as<Controls::Slider>()) {
-            const auto identity = reinterpret_cast<std::uintptr_t>(get_abi(scrubber));
-            if (identity != g_scrubberIdentity) {
-                g_scrubberIdentity = identity;
-                scrubber.AddHandler(
-                    Xaml::UIElement::PointerPressedEvent(),
-                    box_value(Input::PointerEventHandler([](auto&&, auto&&) {
-                        BeginSeekGesture();
-                    })),
-                    true);
-                scrubber.AddHandler(
-                    Xaml::UIElement::PointerReleasedEvent(),
-                    box_value(Input::PointerEventHandler([](auto&&, auto&&) {
-                        CommitSeekGesture();
-                    })),
-                    true);
-                Log(L"transport observer attached control=LCDScrubber");
+            auto attachSkipObservers = [&](std::wstring_view automationId,
+                                           std::vector<ObserverRef>& observers) {
+                std::vector<Xaml::DependencyObject> nodes;
+                CollectByName(content, automationId, nodes);
+                CollectByAutomationId(content, automationId, nodes);
+                for (const auto& node : nodes) {
+                    if (auto button = node.try_as<Primitives::ButtonBase>();
+                        button && RememberObserver(observers, button)) {
+                        button.AddHandler(
+                            Xaml::UIElement::PointerPressedEvent(),
+                            box_value(Input::PointerEventHandler([](auto&&, auto&&) {
+                                QueueSkipIntent(true);
+                            })), true);
+                        button.Click([](auto&&, auto&&) { QueueSkipIntent(false); });
+                    }
+                }
+            };
+            attachSkipObservers(L"TransportControl_SkipBack", g_skipBackObservers);
+            attachSkipObservers(L"TransportControl_SkipForward", g_skipForwardObservers);
+
+            std::vector<Xaml::DependencyObject> scrubberNodes;
+            CollectByName(content, L"LCDScrubber", scrubberNodes);
+            CollectByAutomationId(content, L"LCDScrubber", scrubberNodes);
+            CollectByAutomationId(content, L"Scrubber", scrubberNodes);
+            try {
+                const auto popups = Media::VisualTreeHelper::GetOpenPopups(window);
+                for (const auto& popup : popups) {
+                    AttachTransportPopupLifecycle(popup);
+                    auto child = popup.Child().try_as<Xaml::DependencyObject>();
+                    if (!child) continue;
+                    CollectByName(child, L"LCDScrubber", scrubberNodes);
+                    CollectByAutomationId(child, L"LCDScrubber", scrubberNodes);
+                    CollectByAutomationId(child, L"Scrubber", scrubberNodes);
+                }
+            } catch (...) {
             }
-            if (auto thumb = FindByClass(scrubber, L"Thumb").try_as<Primitives::Thumb>()) {
-                const auto thumbIdentity = reinterpret_cast<std::uintptr_t>(get_abi(thumb));
-                if (thumbIdentity != g_scrubberThumbIdentity) {
-                    g_scrubberThumbIdentity = thumbIdentity;
-                    thumb.DragStarted([](auto&&, auto&&) {
-                        BeginSeekGesture();
+            if (windowProperty == L"MiniPlayerWindow" && scrubberNodes.empty()) {
+                std::vector<Xaml::DependencyObject> sliders;
+                CollectSliders(content, sliders);
+                if (sliders.size() == 1) AppendUniqueNode(scrubberNodes, sliders.front());
+            }
+
+            for (const auto& node : scrubberNodes) {
+                auto scrubber = node.try_as<Controls::Slider>();
+                if (!scrubber) continue;
+                const auto scrubberIdentity = DependencyObjectIdentity(scrubber);
+                if (!scrubberIdentity) continue;
+                if (RememberObserver(g_scrubberObservers, scrubber)) {
+                    scrubber.AddHandler(
+                        Xaml::UIElement::PointerPressedEvent(),
+                        box_value(Input::PointerEventHandler(
+                            [scrubberIdentity](auto&&, auto&&) {
+                                BeginSeekGesture(scrubberIdentity);
+                            })), true);
+                    scrubber.AddHandler(
+                        Xaml::UIElement::PointerReleasedEvent(),
+                        box_value(Input::PointerEventHandler(
+                            [scrubberIdentity](auto&&, auto&&) {
+                                CommitSeekGesture(scrubberIdentity, L"pointer-released");
+                            })), true);
+                    scrubber.AddHandler(
+                        Xaml::UIElement::PointerCanceledEvent(),
+                        box_value(Input::PointerEventHandler(
+                            [scrubberIdentity](auto&&, auto&&) {
+                                CommitSeekGesture(scrubberIdentity, L"pointer-canceled");
+                            })), true);
+                    scrubber.AddHandler(
+                        Xaml::UIElement::PointerCaptureLostEvent(),
+                        box_value(Input::PointerEventHandler(
+                            [scrubberIdentity](auto&&, auto&&) {
+                                CommitSeekGesture(scrubberIdentity, L"capture-lost");
+                            })), true);
+                    scrubber.Unloaded([scrubberIdentity](auto&&, auto&&) {
+                        CommitSeekGesture(scrubberIdentity, L"scrubber-unloaded");
+                        ScheduleTransportObserverAttach();
                     });
-                    thumb.DragCompleted([](auto&&, auto&&) {
-                        CommitSeekGesture();
+                }
+
+                if (auto thumb = FindByClass(scrubber, L"Thumb").try_as<Primitives::Thumb>();
+                    thumb && RememberObserver(g_scrubberThumbObservers, thumb)) {
+                    auto weakThumb = winrt::make_weak(thumb);
+                    thumb.DragStarted([weakThumb](auto&&, auto&&) {
+                        if (auto live = weakThumb.get()) {
+                            if (auto owner = ResolveOwningSlider(live)) {
+                                BeginSeekGesture(DependencyObjectIdentity(owner));
+                            }
+                        }
                     });
-                    Log(L"transport observer attached control=LCDScrubberThumb");
+                    thumb.DragCompleted([weakThumb](auto&&, auto&&) {
+                        if (auto live = weakThumb.get()) {
+                            if (auto owner = ResolveOwningSlider(live)) {
+                                CommitSeekGesture(DependencyObjectIdentity(owner), L"drag-completed");
+                            }
+                        }
+                    });
+                    thumb.Unloaded([weakThumb](auto&&, auto&&) {
+                        if (auto live = weakThumb.get()) {
+                            if (auto owner = ResolveOwningSlider(live)) {
+                                CommitSeekGesture(DependencyObjectIdentity(owner), L"thumb-unloaded");
+                            } else {
+                                CommitSeekGesture(0, L"thumb-unloaded-detached");
+                            }
+                        } else {
+                            CommitSeekGesture(0, L"thumb-destroyed");
+                        }
+                        ScheduleTransportObserverAttach();
+                    });
                 }
             }
         }
@@ -1075,7 +1379,8 @@ void AttachOrRefreshToggle() {
 }
 
 LRESULT CALLBACK UiThreadHook(int code, WPARAM wParam, LPARAM lParam) {
-    HHOOK hook = g_uiHook.exchange(nullptr);
+    HHOOK hook = g_uiHook.exchange(nullptr, std::memory_order_acq_rel);
+    g_uiHookThreadId.store(0, std::memory_order_release);
     if (hook) UnhookWindowsHookEx(hook);
     if (code >= 0) {
         AttachTransportObservers();
@@ -1253,17 +1558,24 @@ DWORD WINAPI BootstrapThread(void*) {
     Log(L"UI adapter loaded");
     if (HANDLE pipeThread = CreateThread(nullptr, 0, PipeThread, nullptr, 0, nullptr)) CloseHandle(pipeThread);
 
+    g_windowLifecycleHook = SetWinEventHook(
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, nullptr, WindowLifecycleEvent,
+        GetCurrentProcessId(), 0, WINEVENT_OUTOFCONTEXT);
+    Log(L"UI window lifecycle WinEvent hook=" +
+        std::to_wstring(reinterpret_cast<std::uintptr_t>(g_windowLifecycleHook)));
+
     for (;;) {
-        if (!g_mainWindow || !IsWindow(g_mainWindow)) g_mainWindow = FindMainWindow();
-        if (g_mainWindow && !g_uiHook.load()) {
-            const DWORD threadId = GetWindowThreadProcessId(g_mainWindow, nullptr);
-            HHOOK hook = SetWindowsHookExW(WH_GETMESSAGE, UiThreadHook, g_module, threadId);
-            if (hook) {
-                g_uiHook.store(hook);
-                PostMessageW(g_mainWindow, WM_NULL, 0, 0);
+        const DWORD wait = MsgWaitForMultipleObjects(
+            0, nullptr, FALSE, 5000, QS_ALLINPUT);
+        if (wait == WAIT_OBJECT_0) {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
             }
         }
-        Sleep(750);
+        if (!g_mainWindow || !IsWindow(g_mainWindow)) g_mainWindow = FindMainWindow();
+        if (g_mainWindow) (void)ArmUiThreadRefresh(g_mainWindow);
     }
 }
 
