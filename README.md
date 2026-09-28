@@ -8,6 +8,8 @@
 
 [中文](README.zh-CN.md)
 
+[Website](https://amexclusive.tgwgroup.ltd/en/) · [Documentation](https://amexclusive.tgwgroup.ltd/en/docs/)
+
 ## Description
 
 AMExclusive (AME) is an open-source project designed specifically for Apple Music on Windows. It adds WASAPI exclusive audio output and forces Apple Music to use the highest available audio quality, with the goal of turning Apple Music into a more capable Hi-Fi player that can achieve bit-perfect output on supported hardware and configurations.
@@ -49,11 +51,29 @@ With a separate DAC and amplifier, keep the Apple Music app volume, Windows outp
 
 ## Build and Install
 
-To build from source, install Visual Studio 2022 or newer MSVC Build Tools, a Windows 11 SDK, CMake 3.24 or newer, PowerShell, and Apple Music for Windows.
+### Build with GitHub Actions
+
+1. Open [Actions → Build Setup](https://github.com/AntiOblivionis/AMExclusive/actions/workflows/build-setup.yml). To build your own changes, fork the repository and enable Actions in your fork first.
+2. Select **Run workflow**, choose the branch, and run it.
+3. When the run succeeds, download **AMExclusive-Setup-x64** from **Artifacts** and unzip it to obtain `AMExclusive-Setup.exe`.
+
+The workflow runs only when manually triggered. It builds Windows x64 Release and checks the embedded installer payload; it does not publish a GitHub Release. No Apple Music installation is needed on the runner: it downloads pinned Microsoft Windows App SDK / WinUI metadata packages from NuGet and verifies `Microsoft.UI.Xaml.winmd` against a pinned SHA-256 before building. Apple Music is still required on the PC where you install AMExclusive. Artifacts are retained for 14 days; downloading them requires signing in to GitHub.
+
+### Build locally
+
+To build from source, install Visual Studio 2022 or newer MSVC Build Tools, a Windows 11 SDK, CMake 3.24 or newer, and PowerShell. By default, the build script reads the required WinUI metadata from the locally installed Apple Music package:
 
 ```powershell
 cd mod
 .\scripts\Build-Mod.ps1 -Configuration Release
+```
+
+Apple Music does not need to be installed on the build machine if you provide standalone metadata instead:
+
+```powershell
+cd mod
+.\scripts\Get-WinUIMetadata.ps1 -OutputDirectory .\build\winui-metadata
+.\scripts\Build-Mod.ps1 -Configuration Release -WinUIMetadataDirectory .\build\winui-metadata
 ```
 
 The installer will be generated at:

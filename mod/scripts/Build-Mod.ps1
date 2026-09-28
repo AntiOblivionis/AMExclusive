@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release')][string]$Configuration = 'Release',
-    [string]$BuildDirectory = 'build'
+    [string]$BuildDirectory = 'build',
+    [string]$WinUIMetadataDirectory
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,9 +37,18 @@ if (-not $clPath) {
 if (-not $cmakePath) { throw 'cmake.exe was not found in PATH or the selected Visual Studio Build Tools instance.' }
 if (-not $clPath) { throw 'An x64 MSVC compiler could not be activated through Visual Studio DevShell.' }
 
-$package = Get-AppxPackage -Name AppleInc.AppleMusicWin -ErrorAction Stop
+if ($WinUIMetadataDirectory) {
+    $metadataDirectory = (Resolve-Path -LiteralPath $WinUIMetadataDirectory).Path
+} else {
+    $package = Get-AppxPackage -Name AppleInc.AppleMusicWin -ErrorAction Stop
+    if (-not $package) { throw 'Apple Music is not installed; supply -WinUIMetadataDirectory to build with standalone WinUI metadata.' }
+    $metadataDirectory = $package.InstallLocation
+}
+if (-not (Test-Path -LiteralPath (Join-Path $metadataDirectory 'Microsoft.UI.Xaml.winmd') -PathType Leaf)) {
+    throw "Microsoft.UI.Xaml.winmd was not found in: $metadataDirectory"
+}
 
-& $cmakePath -S $root -B $build -A x64 "-DAPPLE_MUSIC_PACKAGE_DIR=$($package.InstallLocation)"
+& $cmakePath -S $root -B $build -A x64 "-DAPPLE_MUSIC_PACKAGE_DIR=$metadataDirectory"
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed: $LASTEXITCODE" }
 
 & $cmakePath --build $build --config $Configuration --parallel

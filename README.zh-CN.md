@@ -8,6 +8,8 @@
 
 [English](README.md)
 
+[官网](https://amexclusive.tgwgroup.ltd/zh/) · [使用文档](https://amexclusive.tgwgroup.ltd/zh/docs/)
+
 ## 描述
 
 AMExclusive（AME）是一个专为 Windows 版 Apple Music 设计的开源项目，旨在为 Apple Music 提供 WASAPI 独占音频输出以及强制最高音频规格输出的能力，并以此将 Apple Music 优化为一款在受支持硬件与配置下可实现 bit-perfect 输出的“专业”Hi-Fi 音乐播放器。
@@ -49,11 +51,29 @@ AMExclusive（AME）是一个专为 Windows 版 Apple Music 设计的开源项�
 
 ## 编译与安装
 
-从源码编译需要 Visual Studio 2022 或更新版本的 MSVC Build Tools、Windows 11 SDK、CMake 3.24 或更新版本、PowerShell，以及本机已安装 Windows 版 Apple Music。
+### 使用 GitHub Actions 编译
+
+1. 打开 [Actions → Build Setup](https://github.com/AntiOblivionis/AMExclusive/actions/workflows/build-setup.yml)。编译自己的修改时，先 Fork 仓库，并在自己的仓库中启用 Actions。
+2. 点击 **Run workflow**，选择分支并运行。
+3. 成功后，在该次运行的 **Artifacts** 中下载 **AMExclusive-Setup-x64**，解压得到 `AMExclusive-Setup.exe`。
+
+工作流仅手动触发，编译 Windows x64 Release 并检查安装器内嵌文件，不自动发布 Release。构建机不需要安装 Apple Music：工作流会从 NuGet 下载固定版本的 Microsoft Windows App SDK / WinUI 元数据包，并在编译前使用固定 SHA-256 校验 `Microsoft.UI.Xaml.winmd`。安装 AMExclusive 的电脑仍需安装 Apple Music。构建产物保留 14 天，下载需登录 GitHub。
+
+### 本地编译
+
+从源码编译需要 Visual Studio 2022 或更新版本的 MSVC Build Tools、Windows 11 SDK、CMake 3.24 或更新版本和 PowerShell。默认情况下，构建脚本会从本机安装的 Windows 版 Apple Music 中读取所需 WinUI 元数据：
 
 ```powershell
 cd mod
 .\scripts\Build-Mod.ps1 -Configuration Release
+```
+
+构建机没有安装 Apple Music 时，也可以先准备独立元数据目录再编译：
+
+```powershell
+cd mod
+.\scripts\Get-WinUIMetadata.ps1 -OutputDirectory .\build\winui-metadata
+.\scripts\Build-Mod.ps1 -Configuration Release -WinUIMetadataDirectory .\build\winui-metadata
 ```
 
 安装器输出位置：

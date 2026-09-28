@@ -1,0 +1,38 @@
+name: Build Setup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 Release
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download verified WinUI metadata
+        run: ./mod/scripts/Get-WinUIMetadata.ps1 -OutputDirectory "$env:RUNNER_TEMP/ame-winui"
+
+      - name: Build self-contained Setup
+        run: ./mod/scripts/Build-Mod.ps1 -Configuration Release -BuildDirectory "$env:RUNNER_TEMP/ame-build" -WinUIMetadataDirectory "$env:RUNNER_TEMP/ame-winui"
+
+      - name: Verify embedded installer payload
+        run: |
+          & "$env:RUNNER_TEMP/ame-build/dist/AMExclusive-Setup.exe" --extract-test
+          if ($LASTEXITCODE -ne 0) { throw "Setup extraction check failed: $LASTEXITCODE" }
+
+      - name: Upload Setup
+        uses: actions/upload-artifact@v4
+        with:
+          name: AMExclusive-Setup-x64
+          path: ${{ runner.temp }}/ame-build/dist/AMExclusive-Setup.exe
+          if-no-files-found: error
+          retention-days: 14
