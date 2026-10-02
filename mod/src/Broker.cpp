@@ -50,6 +50,20 @@ bool WriteHardwareBufferMs(std::uint32_t milliseconds) {
     return ReadHardwareBufferMs() == milliseconds;
 }
 
+bool ReadAllowResampling() {
+    return GetPrivateProfileIntW(L"mod", L"allow_resampling", 0, BrokerIniPath().c_str()) == 1;
+}
+
+bool WriteAllowResampling(bool enabled) {
+    const auto path = BrokerIniPath();
+    if (!WritePrivateProfileStringW(L"mod", L"allow_resampling",
+                                    enabled ? L"1" : L"0", path.c_str())) {
+        return false;
+    }
+    (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+    return ReadAllowResampling() == enabled;
+}
+
 using namespace ammod::ipc;
 
 struct Client {
@@ -193,6 +207,10 @@ void ShowErrorDialogAsync(ErrorCategory error, HRESULT result,
             reason = chinese ? L"DAC 不支持当前音源格式。"
                              : L"The DAC does not support the current source format.";
             break;
+        case ErrorCategory::ExclusiveFormatUnavailable:
+            reason = chinese ? L"尝试重采样后，仍未找到设备支持的 WASAPI 独占输出格式。"
+                             : L"No supported WASAPI exclusive output format was found, even with resampling.";
+            break;
         case ErrorCategory::FormatUnsupported:
             reason = chinese ? L"声卡驱动拒绝了当前独占格式。"
                              : L"The audio driver rejected the current exclusive format.";
@@ -260,7 +278,8 @@ void ShowErrorDialogAsync(ErrorCategory error, HRESULT result,
         const wchar_t* title = L"AMExclusive";
         const wchar_t* mainInstruction =
             (error == ErrorCategory::UnsupportedLocalInt32 ||
-             error == ErrorCategory::BitPerfectFormatUnavailable)
+             error == ErrorCategory::BitPerfectFormatUnavailable ||
+             error == ErrorCategory::ExclusiveFormatUnavailable)
             ? (chinese ? L"无法播放" : L"Unable to play")
             : (chinese ? L"独占输出失败" : L"Exclusive output failed");
         const wchar_t* button = chinese ? L"确定" : L"OK";
@@ -675,10 +694,24 @@ void HandleMessage(const Message& incoming, HANDLE source) {
                         std::to_wstring(GetLastError()));
                 }
             }
+        } else if (incoming.type == MessageType::SetAllowResampling &&
+                   (incoming.role == Role::Ui || incoming.role == Role::Controller)) {
+            if (incoming.allowResampling <= 1) {
+                if (WriteAllowResampling(incoming.allowResampling != 0)) {
+                    g_status.generation++;
+                    g_status.allowResampling = incoming.allowResampling;
+                    Log(L"allow resampling persisted enabled=" +
+                        std::to_wstring(g_status.allowResampling));
+                } else {
+                    Log(L"allow resampling persistence failed error=" +
+                        std::to_wstring(GetLastError()));
+                }
+            }
         } else if (incoming.type == MessageType::StatusChanged) {
             const auto generation = std::max(g_status.generation + 1, incoming.generation);
             const auto persistedIntent = g_status.enabledIntent;
             const auto persistedHardwareBufferMs = g_status.hardwareBufferMs;
+            const auto persistedAllowResampling = g_status.allowResampling;
             g_status = incoming;
             g_status.type = MessageType::StatusChanged;
             g_status.role = Role::Broker;
@@ -690,6 +723,7 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             if (incoming.role == Role::Agent) {
                 g_status.enabledIntent = persistedIntent;
                 g_status.hardwareBufferMs = persistedHardwareBufferMs;
+                g_status.allowResampling = persistedAllowResampling;
                 if (persistedIntent && incoming.state == RuntimeState::Off) {
                     g_status.state = RuntimeState::WaitingForStream;
                 }
@@ -698,11 +732,13 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             const auto generation = std::max(g_status.generation + 1, incoming.generation);
             const auto persistedIntent = g_status.enabledIntent;
             const auto persistedHardwareBufferMs = g_status.hardwareBufferMs;
+            const auto persistedAllowResampling = g_status.allowResampling;
             g_status = incoming;
             g_status.type = MessageType::StatusChanged;
             g_status.role = Role::Broker;
             g_status.generation = generation;
             g_status.hardwareBufferMs = persistedHardwareBufferMs;
+            g_status.allowResampling = persistedAllowResampling;
             if (persistedIntent) {
                 // Retire the failed attempt, not the user's AME preference.
                 // The Agent receives this status and arms a fresh generation
@@ -817,10 +853,12 @@ int wmain() {
         static_cast<DWORD>(std::size(savedMode)), BrokerIniPath().c_str());
     g_status.enabledIntent = _wcsicmp(savedMode, L"exclusive") == 0 ? 1 : 0;
     g_status.hardwareBufferMs = ReadHardwareBufferMs();
+    g_status.allowResampling = ReadAllowResampling() ? 1 : 0;
     g_status.state = g_status.enabledIntent ? RuntimeState::WaitingForStream : RuntimeState::Off;
     Log(L"companion started pid=" + std::to_wstring(GetCurrentProcessId()) +
         L" persistedIntent=" + std::to_wstring(g_status.enabledIntent) +
-        L" hardwareBufferMs=" + std::to_wstring(g_status.hardwareBufferMs));
+        L" hardwareBufferMs=" + std::to_wstring(g_status.hardwareBufferMs) +
+        L" allowResampling=" + std::to_wstring(g_status.allowResampling));
     const auto pipeName = PipeName();
     PipeSecurity security;
     if (pipeName.empty() || !security.IsValid()) {

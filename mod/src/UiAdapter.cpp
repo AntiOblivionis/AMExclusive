@@ -29,6 +29,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -63,6 +64,11 @@ std::atomic<int> g_requestedHardwareBufferMs{-1};
 std::atomic<ULONGLONG> g_hardwareBufferAckDeadlineTick{};
 std::atomic<bool> g_hardwareBufferInputDirty{};
 std::atomic<bool> g_hardwareBufferTextUpdating{};
+std::atomic<int> g_pendingAllowResampling{-1};
+std::atomic<int> g_requestedAllowResampling{-1};
+std::atomic<ULONGLONG> g_resamplingAckDeadlineTick{};
+std::atomic<bool> g_suppressResamplingToggle{};
+std::atomic<int> g_programmaticResamplingValue{-1};
 std::atomic<std::uint64_t> g_lastLoggedGeneration{UINT64_MAX};
 std::atomic<HHOOK> g_uiHook{};
 std::atomic<DWORD> g_uiHookThreadId{};
@@ -87,6 +93,8 @@ HWINEVENTHOOK g_windowLifecycleHook{};
 HWND g_mainWindow{};
 winrt::weak_ref<Controls::ToggleSwitch> g_toggle;
 winrt::weak_ref<Controls::TextBox> g_hardwareBufferBox;
+winrt::weak_ref<Controls::ToggleSwitch> g_resamplingToggle;
+winrt::weak_ref<Controls::Border> g_outputFormatCard;
 Microsoft::UI::Dispatching::DispatcherQueue g_dispatcher{nullptr};
 Microsoft::UI::Dispatching::DispatcherQueueTimer g_statusRefreshTimer{nullptr};
 
@@ -191,6 +199,10 @@ std::wstring ErrorText(ErrorCategory category) {
         return Localized(
             L"当前 DAC 不支持此音源所需的任何 bit-perfect 位深组合；已停止当前播放并清空音频加载",
             L"The DAC supports none of the bit-perfect depth combinations required by this source; playback was stopped and the audio load was cleared");
+    case ErrorCategory::ExclusiveFormatUnavailable:
+        return Localized(
+            L"尝试重采样后，仍未找到设备支持的 WASAPI 独占输出格式；已停止当前播放",
+            L"No supported WASAPI exclusive output format was found, even with resampling; playback was stopped");
     case ErrorCategory::FormatUnsupported:
         return Localized(
             L"Apple 当前共享渲染格式无法直接用于独占输出；这不代表设备不支持独占",
@@ -247,6 +259,12 @@ bool SendHardwareBuffer(std::uint32_t milliseconds) {
     g_pendingHardwareBufferMs.store(static_cast<int>(milliseconds));
     g_hardwareBufferAckDeadlineTick.store(0);
     return true;
+}
+
+void SendAllowResampling(bool enabled) {
+    g_requestedAllowResampling.store(enabled ? 1 : 0);
+    g_pendingAllowResampling.store(enabled ? 1 : 0);
+    g_resamplingAckDeadlineTick.store(0);
 }
 
 bool TrySendConnectedMessage(const Message& message) {
@@ -619,12 +637,13 @@ Controls::Border FindRenderedCardBorder(const Controls::ToggleSwitch& toggle,
     return best;
 }
 
-Controls::TextBlock FindStatusText(const Controls::ToggleSwitch& toggle) {
+Controls::TextBlock FindStatusText(const Controls::ToggleSwitch& toggle,
+                                  std::wstring_view name = L"AMExclusiveModeStatus") {
     if (!toggle) return nullptr;
     try {
         auto current = Media::VisualTreeHelper::GetParent(toggle);
         while (current) {
-            if (auto found = FindByName(current, L"AMExclusiveModeStatus")
+            if (auto found = FindByName(current, name)
                                  .try_as<Controls::TextBlock>()) {
                 return found;
             }
@@ -702,6 +721,46 @@ void ApplyStatus(const Controls::ToggleSwitch& toggle) {
     g_suppressToggle.store(false);
 }
 
+void ApplyOutputFormatStatus(const Controls::Border& card) {
+    const auto status = StatusSnapshot();
+    const bool visible = status.state == RuntimeState::Active && status.format[0];
+    std::wstring presentation;
+    if (visible) {
+        presentation = status.format;
+        presentation += std::wstring_view(status.detail) == L"resampled"
+            ? Localized(L" · 已重采样", L" · Resampled") : L" · bit-perfect";
+    }
+    // Read the logical children so the text also updates while the card is collapsed.
+    if (auto labels = card.Child().try_as<Controls::StackPanel>()) {
+        for (auto child : labels.Children()) {
+            if (auto text = child.try_as<Controls::TextBlock>();
+                text && text.Name() == L"AMExclusiveOutputFormat") {
+                text.Text(presentation);
+                break;
+            }
+        }
+    }
+    card.Visibility(visible ? Xaml::Visibility::Visible : Xaml::Visibility::Collapsed);
+}
+
+void ApplyResamplingStatus(const Controls::ToggleSwitch& toggle) {
+    if (!toggle) return;
+    const int requested = g_requestedAllowResampling.load();
+    const bool enabled = requested >= 0 ? requested != 0 : StatusSnapshot().allowResampling != 0;
+    g_suppressResamplingToggle.store(true);
+    if (toggle.IsOn() != enabled) {
+        g_programmaticResamplingValue.store(enabled ? 1 : 0);
+        toggle.IsOn(enabled);
+    }
+    if (auto statusText = FindStatusText(toggle, L"AMExclusiveResamplingStatus")) {
+        const auto text = requested >= 0
+            ? Localized(L"正在保存…", L"Saving…") : std::wstring{};
+        statusText.Text(text);
+        statusText.Visibility(text.empty() ? Xaml::Visibility::Collapsed : Xaml::Visibility::Visible);
+    }
+    g_suppressResamplingToggle.store(false);
+}
+
 void ApplyHardwareBufferStatus(const Controls::TextBox& input) {
     if (!input) return;
     const bool empty = input.Text().empty();
@@ -762,13 +821,19 @@ void RememberToggle(const Controls::ToggleSwitch& toggle) {
         g_statusRefreshTimer.Tick([](auto&&, auto&&) {
             winrt::weak_ref<Controls::ToggleSwitch> target;
             winrt::weak_ref<Controls::TextBox> hardwareBuffer;
+            winrt::weak_ref<Controls::ToggleSwitch> resampling;
+            winrt::weak_ref<Controls::Border> outputFormat;
             {
                 std::lock_guard targetLock(g_uiTargetMutex);
                 target = g_toggle;
                 hardwareBuffer = g_hardwareBufferBox;
+                resampling = g_resamplingToggle;
+                outputFormat = g_outputFormatCard;
             }
             if (auto control = target.get()) ApplyStatus(control);
             if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
+            if (auto control = resampling.get()) ApplyResamplingStatus(control);
+            if (auto card = outputFormat.get()) ApplyOutputFormatStatus(card);
         });
         g_statusRefreshTimer.Start();
         Log(L"UI status refresh timer started intervalMs=250");
@@ -783,20 +848,36 @@ void RememberHardwareBufferBox(const Controls::TextBox& input) {
     if (!g_dispatcher) g_dispatcher = current ? current : input.DispatcherQueue();
 }
 
+void RememberResamplingToggle(const Controls::ToggleSwitch& toggle) {
+    std::lock_guard lock(g_uiTargetMutex);
+    g_resamplingToggle = make_weak(toggle);
+}
+
+void RememberOutputFormatCard(const Controls::Border& card) {
+    std::lock_guard lock(g_uiTargetMutex);
+    g_outputFormatCard = make_weak(card);
+}
+
 void ScheduleStatusRefresh() {
     winrt::weak_ref<Controls::ToggleSwitch> toggle;
     winrt::weak_ref<Controls::TextBox> hardwareBuffer;
+    winrt::weak_ref<Controls::ToggleSwitch> resampling;
+    winrt::weak_ref<Controls::Border> outputFormat;
     Microsoft::UI::Dispatching::DispatcherQueue dispatcher{nullptr};
     {
         std::lock_guard lock(g_uiTargetMutex);
         toggle = g_toggle;
         hardwareBuffer = g_hardwareBufferBox;
+        resampling = g_resamplingToggle;
+        outputFormat = g_outputFormatCard;
         dispatcher = g_dispatcher;
     }
     if (dispatcher) {
-        dispatcher.TryEnqueue([toggle, hardwareBuffer] {
+        dispatcher.TryEnqueue([toggle, hardwareBuffer, resampling, outputFormat] {
             if (auto control = toggle.get()) ApplyStatus(control);
             if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
+            if (auto control = resampling.get()) ApplyResamplingStatus(control);
+            if (auto card = outputFormat.get()) ApplyOutputFormatStatus(card);
         });
     }
 }
@@ -1035,6 +1116,108 @@ void AttachTransportObservers() {
     }
 }
 
+Controls::Border CreateSettingsCard(const Controls::Border& appearance,
+                                    const wchar_t* name, const Xaml::UIElement& content) {
+    Controls::Border card;
+    card.Name(name);
+    card.Child(content);
+    card.Background(appearance.Background());
+    card.BorderBrush(appearance.BorderBrush());
+    card.BorderThickness(appearance.BorderThickness());
+    card.CornerRadius(appearance.CornerRadius());
+    card.Padding(appearance.Padding());
+    card.Margin(appearance.Margin());
+    card.HorizontalAlignment(appearance.HorizontalAlignment());
+    card.VerticalAlignment(appearance.VerticalAlignment());
+    card.MinHeight(appearance.MinHeight());
+    card.MaxWidth(appearance.MaxWidth());
+    return card;
+}
+
+std::pair<Controls::Border, Controls::ToggleSwitch> CreateResamplingCard(
+    const Controls::Border& card, const Controls::ToggleSwitch& toggle,
+    const std::vector<Controls::TextBlock>& nativeText) {
+    Controls::TextBlock resamplingTitle;
+    resamplingTitle.Text(Localized(
+        L"设备不支持原规格时允许重采样", L"Allow resampling for unsupported source formats"));
+    resamplingTitle.TextWrapping(Xaml::TextWrapping::Wrap);
+    Controls::TextBlock resamplingDescription;
+    resamplingDescription.Text(Localized(
+        L"优先整数倍率降采样，仍使用 WASAPI 独占输出；下次打开歌曲时生效。默认关闭，关闭时保持严格 bit-perfect 格式要求。",
+        L"Prefer integer-ratio downsampling while keeping WASAPI exclusive output. Applies when the next song opens. Off by default to require a bit-perfect format."));
+    resamplingDescription.TextWrapping(Xaml::TextWrapping::Wrap);
+    Controls::TextBlock resamplingStatus;
+    resamplingStatus.Name(L"AMExclusiveResamplingStatus");
+    resamplingStatus.TextWrapping(Xaml::TextWrapping::Wrap);
+    resamplingStatus.Visibility(Xaml::Visibility::Collapsed);
+    if (!nativeText.empty()) resamplingTitle.Style(nativeText[0].Style());
+    if (nativeText.size() > 1) resamplingDescription.Style(nativeText[1].Style());
+    if (nativeText.size() > 1) resamplingStatus.Style(nativeText[1].Style());
+
+    Controls::StackPanel resamplingLabels;
+    resamplingLabels.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    resamplingLabels.Margin(Xaml::Thickness{0, 0, 16, 0});
+    resamplingLabels.Children().Append(resamplingTitle);
+    resamplingLabels.Children().Append(resamplingDescription);
+    resamplingLabels.Children().Append(resamplingStatus);
+    Controls::ToggleSwitch resamplingToggle;
+    resamplingToggle.Name(L"AMExclusiveResamplingToggle");
+    resamplingToggle.Header(nullptr);
+    resamplingToggle.OnContent(nullptr);
+    resamplingToggle.OffContent(nullptr);
+    resamplingToggle.Style(toggle.Style());
+    resamplingToggle.Margin(toggle.Margin());
+    resamplingToggle.Padding(toggle.Padding());
+    resamplingToggle.MinWidth(toggle.MinWidth());
+    resamplingToggle.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    Automation::AutomationProperties::SetName(resamplingToggle, resamplingTitle.Text());
+    Automation::AutomationProperties::SetHelpText(resamplingToggle, resamplingDescription.Text());
+    resamplingToggle.Toggled([](auto&& sender, auto&&) {
+        const int marker = g_programmaticResamplingValue.exchange(-1);
+        if (g_suppressResamplingToggle.load()) return;
+        const bool enabled = sender.template as<Controls::ToggleSwitch>().IsOn();
+        if (marker == (enabled ? 1 : 0)) return;
+        const int requested = g_requestedAllowResampling.load();
+        const bool current = requested >= 0 ? requested != 0 : StatusSnapshot().allowResampling != 0;
+        if (enabled == current) return;
+        SendAllowResampling(enabled);
+        Log(L"resampling setting queued enabled=" + std::to_wstring(enabled));
+    });
+
+    Controls::ColumnDefinition resamplingLabelColumn;
+    resamplingLabelColumn.Width(Xaml::GridLength{1.0, Xaml::GridUnitType::Star});
+    Controls::ColumnDefinition resamplingToggleColumn;
+    resamplingToggleColumn.Width(Xaml::GridLength{1.0, Xaml::GridUnitType::Auto});
+    Controls::Grid resamplingContent;
+    resamplingContent.ColumnDefinitions().Append(resamplingLabelColumn);
+    resamplingContent.ColumnDefinitions().Append(resamplingToggleColumn);
+    resamplingContent.Children().Append(resamplingLabels);
+    Controls::Grid::SetColumn(resamplingToggle, 1);
+    resamplingContent.Children().Append(resamplingToggle);
+    auto resamplingCard = CreateSettingsCard(card, L"AMExclusiveResamplingCard", resamplingContent);
+    return {resamplingCard, resamplingToggle};
+}
+
+Controls::Border CreateOutputFormatCard(
+    const Controls::Border& card, const std::vector<Controls::TextBlock>& nativeText) {
+    Controls::TextBlock formatTitle;
+    formatTitle.Text(Localized(L"音频规格", L"Audio format"));
+    formatTitle.TextWrapping(Xaml::TextWrapping::Wrap);
+    Controls::TextBlock formatText;
+    formatText.Name(L"AMExclusiveOutputFormat");
+    formatText.TextWrapping(Xaml::TextWrapping::Wrap);
+    if (!nativeText.empty()) formatTitle.Style(nativeText[0].Style());
+    if (nativeText.size() > 1) formatText.Style(nativeText[1].Style());
+
+    Controls::StackPanel formatLabels;
+    formatLabels.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    formatLabels.Children().Append(formatTitle);
+    formatLabels.Children().Append(formatText);
+    auto formatCard = CreateSettingsCard(card, L"AMExclusiveOutputFormatCard", formatLabels);
+    ApplyOutputFormatStatus(formatCard);
+    return formatCard;
+}
+
 void AttachOrRefreshToggle() {
     try {
         auto window = GetMainXamlWindow();
@@ -1053,6 +1236,16 @@ void AttachOrRefreshToggle() {
                                  .try_as<Controls::TextBox>()) {
                 RememberHardwareBufferBox(input);
                 ApplyHardwareBufferStatus(input);
+            }
+            if (auto resampling = FindByName(page, L"AMExclusiveResamplingToggle")
+                                      .try_as<Controls::ToggleSwitch>()) {
+                RememberResamplingToggle(resampling);
+                ApplyResamplingStatus(resampling);
+            }
+            if (auto formatCard = FindByName(page, L"AMExclusiveOutputFormatCard")
+                                      .try_as<Controls::Border>()) {
+                RememberOutputFormatCard(formatCard);
+                ApplyOutputFormatStatus(formatCard);
             }
             return;
         }
@@ -1362,13 +1555,22 @@ void AttachOrRefreshToggle() {
         bufferCard.MinHeight(card.MinHeight());
         bufferCard.MaxWidth(card.MaxWidth());
         target.Children().Append(bufferCard);
+        auto [resamplingCard, resamplingToggle] = CreateResamplingCard(card, toggle, nativeText);
+        target.Children().Append(resamplingCard);
+        auto formatCard = CreateOutputFormatCard(card, nativeText);
+        target.Children().Append(formatCard);
 
         RememberToggle(toggle);
         RememberHardwareBufferBox(bufferInput);
+        RememberResamplingToggle(resamplingToggle);
+        RememberOutputFormatCard(formatCard);
         ApplyStatus(toggle);
         ApplyHardwareBufferStatus(bufferInput);
+        ApplyResamplingStatus(resamplingToggle);
         Log(L"Exclusive mode settings card attached to PlaybackSettingsPage");
         Log(L"Hardware buffer settings card attached to PlaybackSettingsPage");
+        Log(L"Resampling settings card attached to PlaybackSettingsPage");
+        Log(L"Audio format settings card attached to PlaybackSettingsPage");
     } catch (const hresult_error& error) {
         std::wostringstream text;
         text << L"UI attach failed hr=0x" << std::hex << error.code().value << L" " << error.message().c_str();
@@ -1443,6 +1645,10 @@ DWORD WINAPI PipeThread(void*) {
             g_pendingHardwareBufferMs.store(requested);
             g_hardwareBufferAckDeadlineTick.store(0);
         }
+        if (const int requested = g_requestedAllowResampling.load(); requested >= 0) {
+            g_pendingAllowResampling.store(requested);
+            g_resamplingAckDeadlineTick.store(0);
+        }
         Message incoming{};
         for (;;) {
             Message transport{};
@@ -1500,6 +1706,22 @@ DWORD WINAPI PipeThread(void*) {
                 }
                 g_hardwareBufferAckDeadlineTick.store(GetTickCount64() + 1000);
             }
+            const int pendingAllowResampling = g_pendingAllowResampling.exchange(-1);
+            if (pendingAllowResampling >= 0) {
+                auto message = NewMessage(MessageType::SetAllowResampling, Role::Ui);
+                message.uiPid = GetCurrentProcessId();
+                message.allowResampling = pendingAllowResampling ? 1 : 0;
+                bool written{};
+                {
+                    std::lock_guard writeLock(g_pipeWriteMutex);
+                    written = WriteMessage(pipe, message);
+                }
+                if (!written) {
+                    g_pendingAllowResampling.store(pendingAllowResampling);
+                    break;
+                }
+                g_resamplingAckDeadlineTick.store(GetTickCount64() + 1000);
+            }
             if (!ReadMessageTimeout(pipe, incoming, 100)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
                     const int requested = g_requestedHardwareBufferMs.load();
@@ -1510,6 +1732,16 @@ DWORD WINAPI PipeThread(void*) {
                             g_hardwareBufferAckDeadlineTick.store(0);
                             Log(L"hardware buffer confirmation timed out; retry queued milliseconds=" +
                                 std::to_wstring(requested));
+                        }
+                    }
+                    const int resamplingRequested = g_requestedAllowResampling.load();
+                    const auto resamplingDeadline = g_resamplingAckDeadlineTick.load();
+                    if (resamplingRequested >= 0 && resamplingDeadline != 0 &&
+                        GetTickCount64() >= resamplingDeadline) {
+                        int empty = -1;
+                        if (g_pendingAllowResampling.compare_exchange_strong(empty, resamplingRequested)) {
+                            g_resamplingAckDeadlineTick.store(0);
+                            Log(L"resampling confirmation timed out; retry queued");
                         }
                     }
                     continue;
@@ -1529,6 +1761,13 @@ DWORD WINAPI PipeThread(void*) {
                     g_hardwareBufferInputDirty.store(false);
                     Log(L"hardware buffer confirmed milliseconds=" +
                         std::to_wstring(requested));
+                }
+                const int resamplingRequested = g_requestedAllowResampling.load();
+                if (resamplingRequested >= 0 && incoming.allowResampling == resamplingRequested) {
+                    g_requestedAllowResampling.store(-1);
+                    g_resamplingAckDeadlineTick.store(0);
+                    Log(L"resampling setting confirmed enabled=" +
+                        std::to_wstring(resamplingRequested));
                 }
                 ScheduleStatusRefresh();
             } else if (incoming.type == MessageType::Goodbye) {

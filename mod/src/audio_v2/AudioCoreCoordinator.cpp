@@ -44,15 +44,16 @@ HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) n
     }
 
     config_ = config;
+    sourceFormat_ = config.sink.format;
     config_.sink.sourceReadyEvent = sourceReadyEvent_;
     token_ = *token;
     nextSequence_ = 0;
-    verifier_.Reset(config_.sink.format, config_.mediaGeneration);
+    verifier_.Reset(sourceFormat_, config_.mediaGeneration);
     BitPerfectVerifier* verifier =
         config_.verifyBitPerfect &&
         config_.mappingPolicy == PcmMappingPolicy::ExactSourceInteger
             ? &verifier_ : nullptr;
-    source_.emplace(*queue_, config_.sink.format, config_.mediaGeneration,
+    source_.emplace(*queue_, sourceFormat_, config_.mediaGeneration,
                     verifier, config_.mappingPolicy);
     capturedFrames_.store(0, std::memory_order_release);
     droppedFrames_.store(0, std::memory_order_release);
@@ -73,6 +74,7 @@ void AudioCoreCoordinator::Disable() noexcept {
     if (sourceReadyEvent_) SetEvent(sourceReadyEvent_);
     sink_.Stop();
     sink_.Close();
+    resampledSource_.Reset();
     source_.reset();
     if (queue_) queue_->Clear();
     queue_.reset();
@@ -107,7 +109,7 @@ bool AudioCoreCoordinator::PushP0Interleaved(std::uint64_t firstFrame,
         droppedFrames_.fetch_add(frames, std::memory_order_relaxed);
         return false;
     }
-    const bool pushed = queue_->TryPush(config_.sink.format, config_.mediaGeneration,
+    const bool pushed = queue_->TryPush(sourceFormat_, config_.mediaGeneration,
                                         nextSequence_, firstFrame, interleaved, frames,
                                         discontinuity, endOfStream);
     return PushResult(pushed, frames);
@@ -123,7 +125,7 @@ bool AudioCoreCoordinator::PushP0Planar(std::uint64_t firstFrame,
         droppedFrames_.fetch_add(frames, std::memory_order_relaxed);
         return false;
     }
-    const bool pushed = queue_->TryPushPlanar(config_.sink.format, config_.mediaGeneration,
+    const bool pushed = queue_->TryPushPlanar(sourceFormat_, config_.mediaGeneration,
                                               nextSequence_, firstFrame, left, right, frames,
                                               discontinuity, endOfStream);
     return PushResult(pushed, frames);
@@ -133,8 +135,14 @@ HRESULT AudioCoreCoordinator::OpenEndpoint() noexcept {
     if (!queue_ || !source_ || !gate_.CanOpenEndpoint(token_)) return E_UNEXPECTED;
     if (queue_->Size() == 0) return E_PENDING;
 
-    const HRESULT hr = sink_.Open(config_.sink);
+    HRESULT hr = sink_.Open(config_.sink);
+    if (SUCCEEDED(hr) && IsResampling()) {
+        hr = resampledSource_.Configure(*source_, sourceFormat_, sink_.Format(),
+                                         sink_.BufferFrames());
+    }
     if (FAILED(hr)) {
+        sink_.Close();
+        resampledSource_.Reset();
         outputGate_.Reset();
         gate_.Fail(token_);
         return hr;
@@ -153,7 +161,7 @@ HRESULT AudioCoreCoordinator::Start() noexcept {
         gate_.Phase() != AudioCoreGatePhase::Prebuffered) {
         return E_UNEXPECTED;
     }
-    const HRESULT hr = sink_.Start(*source_);
+    const HRESULT hr = sink_.Start(ActiveSource());
     if (FAILED(hr)) {
         outputGate_.Reset();
         sink_.Close();
@@ -180,7 +188,13 @@ HRESULT AudioCoreCoordinator::ResumeEndpoint() noexcept {
     if (!source_ || gate_.Phase() != AudioCoreGatePhase::Active) return E_UNEXPECTED;
     if (sink_.State() == WasapiSinkState::Running) return S_OK;
     if (sink_.State() != WasapiSinkState::Open) return E_UNEXPECTED;
-    return sink_.Start(*source_);
+    return sink_.Start(ActiveSource());
+}
+
+IIntegerPcmSource& AudioCoreCoordinator::ActiveSource() noexcept {
+    return IsResampling()
+        ? static_cast<IIntegerPcmSource&>(resampledSource_)
+        : static_cast<IIntegerPcmSource&>(*source_);
 }
 
 bool AudioCoreCoordinator::ShouldSuppressNative() const noexcept {

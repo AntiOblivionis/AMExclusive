@@ -54,6 +54,7 @@ add_library(am_exclusive_hook SHARED
   src/audio_v2/AudioCoreCoordinator.cpp
   src/audio_v2/AudioCoreRuntime.cpp
   src/audio_v2/NativeRenderGateProxy.cpp
+  src/audio_v2/ResampledPcmSource.cpp
   src/audio_v2/WasapiExclusiveSink.cpp)
 target_include_directories(am_exclusive_hook PRIVATE
   src "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/rigtorp-SPSCQueue/include")

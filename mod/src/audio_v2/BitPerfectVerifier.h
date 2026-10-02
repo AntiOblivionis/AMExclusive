@@ -12,11 +12,12 @@ struct BitPerfectVerifierStats final {
     std::uint64_t mappingFailures{};
 };
 
-// Compares the integer samples submitted by the sink with the exact mapping
-// of the same P0 block. It intentionally consumes no side queue: the source
-// block remains present while QueuedPcmSource maps it, so partial device
-// buffers and block splits can be checked without an allocation or a hash
-// collision assumption.
+// Compares canonical source PCM with the exact mapping of the same P0 block,
+// before any optional resampling. Passing this check validates source mapping;
+// it does not make resampled endpoint output bit-perfect. It intentionally
+// consumes no side queue: the source block remains present while QueuedPcmSource
+// maps it, so partial reads and block splits can be checked without an
+// allocation or a hash collision assumption.
 class BitPerfectVerifier final {
 public:
     BitPerfectVerifier() noexcept = default;

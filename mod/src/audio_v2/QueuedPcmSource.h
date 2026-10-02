@@ -2,9 +2,9 @@
 
 #include "BitPerfectVerifier.h"
 #include "ExactSampleMapper.h"
+#include "IntegerPcmSource.h"
 #include "LocalFloatIntegerizer.h"
 #include "PcmQueue.h"
-#include "WasapiExclusiveSink.h"
 
 #include <cstdint>
 
@@ -57,6 +57,28 @@ public:
 
     HRESULT Fill(std::int32_t* destination, std::uint32_t capacityFrames,
                  std::uint32_t& writtenFrames, bool& endOfStream) noexcept override {
+        return FillInternal(destination, capacityFrames, writtenFrames, endOfStream, false);
+    }
+
+    // The SRC consumes one queue block at a time so it can finish a filter
+    // segment before a repeat/seek marker, without joining unrelated history.
+    // A successful short read here is intentional and is not the endpoint
+    // IIntegerPcmSource::Fill contract. With stopAtDiscontinuity, S_FALSE means
+    // a boundary was found and left unconsumed. Check and read share one front
+    // observation so a concurrently arriving marker cannot bypass the reset.
+    HRESULT ReadForResampling(std::int32_t* destination, std::uint32_t capacityFrames,
+                              std::uint32_t& writtenFrames, bool& endOfStream,
+                              bool stopAtDiscontinuity) noexcept {
+        return FillInternal(destination, capacityFrames, writtenFrames, endOfStream,
+                            true, stopAtDiscontinuity);
+    }
+
+    const QueuedPcmSourceStats& Stats() const noexcept { return stats_; }
+
+private:
+    HRESULT FillInternal(std::int32_t* destination, std::uint32_t capacityFrames,
+                         std::uint32_t& writtenFrames, bool& endOfStream,
+                         bool singleBlock, bool stopAtDiscontinuity = false) noexcept {
         writtenFrames = 0;
         endOfStream = false;
         if (!destination || capacityFrames == 0) return E_INVALIDARG;
@@ -82,6 +104,9 @@ public:
             }
             if (!ValidateBlock(*block)) {
                 return E_FAIL;
+            }
+            if (stopAtDiscontinuity && blockOffsetFrames_ == 0 && block->discontinuity) {
+                return S_FALSE;
             }
 
             const std::uint32_t available = block->frames - blockOffsetFrames_;
@@ -146,6 +171,7 @@ public:
                 endOfStream = true;
                 return S_OK;
             }
+            if (singleBlock) break;
         }
         // If a producer seal landed exactly on a complete device period, the
         // loop exits at capacity before observing an empty queue. Mark that
@@ -158,9 +184,6 @@ public:
         return S_OK;
     }
 
-    const QueuedPcmSourceStats& Stats() const noexcept { return stats_; }
-
-private:
     bool ValidateBlock(const PcmBlock& block) const noexcept {
         if (block.frames == 0 || block.frames > kMaxBlockFrames ||
             block.format != format_ || block.mediaGeneration != mediaGeneration_ ||
