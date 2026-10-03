@@ -183,6 +183,11 @@ void AudioCoreRuntime::SetHardwareBufferMilliseconds(std::uint32_t milliseconds)
     hardwareBufferMs_.store(milliseconds, std::memory_order_release);
 }
 
+void AudioCoreRuntime::SetAllowResampling(bool enabled) noexcept {
+    // Applied when the next generation is bound; never replace a live stream.
+    allowResampling_.store(enabled, std::memory_order_release);
+}
+
 void AudioCoreRuntime::OnTransportPlayPause() noexcept {
     if (!UiEnabled()) return;
     std::lock_guard lock(controlMutex_);
@@ -458,10 +463,10 @@ bool AudioCoreRuntime::BeginEndOfStreamDrainLocked(void* converter,
         return false;
     }
     if (requireShortTail) {
-        const auto available = coordinator_.AvailableFrames();
+        const auto pendingSourceFrames = coordinator_.PendingSourceFrames();
         const auto period = requiredPrebufferFrames_ != 0
             ? requiredPrebufferFrames_ : PeriodFrames(graphRate_);
-        if (period == 0 || available == 0 || available > period) return false;
+        if (period == 0 || !coordinator_.HasPendingAudio() || pendingSourceFrames > period) return false;
     }
     if (!coordinator_.SealEndOfStream()) return false;
     endOfStreamDrainPending_ = true;
@@ -523,10 +528,10 @@ bool AudioCoreRuntime::OnLocalEndOfStream(void* converter) noexcept {
     // period boundary, there is no terminal buffer left to carry an EOS bit.
     // Sealing an empty queue would set endOfStreamDrainPending_ forever because
     // the sink correctly refuses to acquire another (pure-silence) period.
-    // Let the normal converter-dispose retirement close this generation and
-    // make room for the successor instead. Only a non-empty queued remainder
-    // needs the terminal drain/padding path.
-    if (coordinator_.AvailableFrames() == 0) return false;
+    // Let normal converter-dispose retirement close an empty native generation.
+    // A resampler can retain filter/staged data after the queue becomes empty
+    // and still needs the producer seal to submit its terminal buffer.
+    if (!coordinator_.HasPendingAudio()) return false;
     const bool sealed = BeginEndOfStreamDrainLocked(converter, false);
     if (sealed) Wake();
     return sealed;
@@ -814,7 +819,7 @@ void* AudioCoreRuntime::OnNativeClientStopped(void* client, HRESULT) noexcept {
                 std::memory_order_acquire)) {
             streamingProducerDrainPending_ = false;
             streamingProducerDrainConverter_ = nullptr;
-            if (coordinator_.AvailableFrames() == 0) {
+            if (!coordinator_.HasPendingAudio()) {
                 RetireCaptureLocked(true);
                 Wake();
                 return nullptr;
@@ -877,7 +882,7 @@ bool AudioCoreRuntime::OnStreamingProducerEndOfStream(void* converter) noexcept 
         streamingProducerDrainPending_ = false;
         streamingProducerDrainConverter_ = nullptr;
         streamingEofCandidateConverter_.store(nullptr, std::memory_order_release);
-        if (coordinator_.AvailableFrames() == 0) {
+        if (!coordinator_.HasPendingAudio()) {
             RetireCaptureLocked(true);
             Wake();
             return true;
@@ -1252,6 +1257,7 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     if (!BuildFormat(snapshot, format)) return;
     AudioCoreCoordinatorConfig config{};
     config.sink.format = format;
+    config.sink.allowResampling = allowResampling_.load(std::memory_order_acquire);
     const bool localFloat32 = snapshot.registration.encodedFormat == kAppleLinearPcm &&
         (snapshot.registration.appleFormatFlags & kAppleFormatFlagIsFloat) != 0 &&
         snapshot.registration.sourceBitDepth == 32;

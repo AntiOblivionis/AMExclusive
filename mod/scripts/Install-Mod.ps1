@@ -120,6 +120,7 @@ Write-ProgressMilestone 32 'stop_runtime'
 
 $preservedMode = $null
 $preservedPeriod100ns = $null
+$preservedAllowResampling = $null
 foreach ($existingIni in @(
     (Join-Path $install 'am-exclusive.ini')
 )) {
@@ -127,6 +128,9 @@ foreach ($existingIni in @(
     foreach ($line in [IO.File]::ReadAllLines($existingIni)) {
         if ($line -match '^\s*mode\s*=\s*(probe|exclusive)\s*$') {
             $preservedMode = $Matches[1].ToLowerInvariant()
+        }
+        if ($line -match '^\s*allow_resampling\s*=\s*([01])\s*$') {
+            $preservedAllowResampling = [int]$Matches[1]
         }
         if ($line -match '^\s*period_100ns\s*=\s*(\d+)\s*$') {
             [uint64]$candidatePeriod = 0
@@ -136,7 +140,8 @@ foreach ($existingIni in @(
             }
         }
     }
-    if ($preservedMode -and $preservedPeriod100ns) { break }
+    if ($preservedMode -and $preservedPeriod100ns -and
+        $null -ne $preservedAllowResampling) { break }
 }
 
 if (Test-Path -LiteralPath $install -PathType Container) {
@@ -172,6 +177,14 @@ if ($preservedPeriod100ns) {
     $iniText = [IO.File]::ReadAllText($iniPath)
     $iniText = [Text.RegularExpressions.Regex]::Replace(
         $iniText, '(?m)^\s*period_100ns\s*=.*$', "period_100ns=$preservedPeriod100ns")
+    $utf8NoBom = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
+}
+if ($null -ne $preservedAllowResampling) {
+    $iniPath = Join-Path $install 'am-exclusive.ini'
+    $iniText = [IO.File]::ReadAllText($iniPath)
+    $iniText = [Text.RegularExpressions.Regex]::Replace(
+        $iniText, '(?m)^\s*allow_resampling\s*=.*$', "allow_resampling=$preservedAllowResampling")
     $utf8NoBom = New-Object Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
 }

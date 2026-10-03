@@ -1,5 +1,6 @@
 #include "WasapiExclusiveSink.h"
 #include "NativeRenderGateProxy.h"
+#include "ResamplingPolicy.h"
 #include "../AudioErrors.h"
 
 #include <avrt.h>
@@ -135,56 +136,68 @@ HRESULT WasapiExclusiveSink::InitializeClient() noexcept {
     const auto attempts = std::max<std::uint32_t>(1u, config_.alignmentRetries + 1u);
     const auto candidateCount = config_.formatCandidateCount == 0
         ? 1u : config_.formatCandidateCount;
+    const auto sourceFormat = config_.format;
+    const auto rates = SelectOutputSampleRates(sourceFormat.sampleRate,
+                                               config_.allowResampling);
+    // periodFrames belongs to the source format. Preserve its duration across
+    // output rates; alignment retries below use the negotiated endpoint rate.
+    const auto requested = config_.periodFrames
+        ? PeriodForFrames(config_.periodFrames, sourceFormat.sampleRate)
+        : kDefaultPeriod;
     bool initialized = false;
-    for (std::uint32_t candidateIndex = 0;
-         candidateIndex < candidateCount && !initialized; ++candidateIndex) {
-        if (candidateIndex != 0) {
-            const HRESULT activate = ActivateClient();
-            if (FAILED(activate)) return finish(activate);
-        }
-        config_.format = config_.formatCandidateCount == 0
-            ? config_.format : config_.formatCandidates[candidateIndex];
-        if (!MakeWasapiFormat(config_.format, waveFormat_)) return finish(E_INVALIDARG);
-
-        const auto requested = config_.periodFrames
-            ? PeriodForFrames(config_.periodFrames, config_.format.sampleRate)
-            : kDefaultPeriod;
-        REFERENCE_TIME period = requested;
-        bool unsupported = false;
-        for (std::uint32_t attempt = 0; attempt < attempts; ++attempt) {
-            HRESULT hr = client_->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
-                                                     &waveFormat_.Format, nullptr);
-            if (hr == S_FALSE) hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
-            if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
-                unsupported = true;
-                break;
+    for (std::size_t rateIndex = 0; rateIndex < rates.count && !initialized; ++rateIndex) {
+        for (std::uint32_t candidateIndex = 0;
+             candidateIndex < candidateCount && !initialized; ++candidateIndex) {
+            if (rateIndex != 0 || candidateIndex != 0) {
+                const HRESULT activate = ActivateClient();
+                if (FAILED(activate)) return finish(activate);
             }
-            if (FAILED(hr)) return finish(hr);
+            config_.format = config_.formatCandidateCount == 0
+                ? sourceFormat : config_.formatCandidates[candidateIndex];
+            config_.format.sampleRate = rates.values[rateIndex];
+            if (!MakeWasapiFormat(config_.format, waveFormat_)) return finish(E_INVALIDARG);
 
-            hr = client_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
-                period, period, &waveFormat_.Format, nullptr);
-            if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
-                unsupported = true;
-                break;
-            }
-            if (hr != AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+            REFERENCE_TIME period = requested;
+            bool unsupported = false;
+            for (std::uint32_t attempt = 0; attempt < attempts; ++attempt) {
+                HRESULT hr = client_->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                                         &waveFormat_.Format, nullptr);
+                if (hr == S_FALSE) hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
+                if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
+                    unsupported = true;
+                    break;
+                }
                 if (FAILED(hr)) return finish(hr);
-                initialized = true;
-                break;
-            }
 
-            UINT32 alignedFrames{};
-            hr = client_->GetBufferSize(&alignedFrames);
-            if (FAILED(hr) || alignedFrames == 0) return finish(FAILED(hr) ? hr : E_FAIL);
-            period = PeriodForFrames(alignedFrames, config_.format.sampleRate);
-            if (attempt + 1u >= attempts) return finish(AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED);
-            hr = ActivateClient();
-            if (FAILED(hr)) return finish(hr);
+                hr = client_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
+                    period, period, &waveFormat_.Format, nullptr);
+                if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
+                    unsupported = true;
+                    break;
+                }
+                if (hr != AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+                    if (FAILED(hr)) return finish(hr);
+                    initialized = true;
+                    break;
+                }
+
+                UINT32 alignedFrames{};
+                hr = client_->GetBufferSize(&alignedFrames);
+                if (FAILED(hr) || alignedFrames == 0) return finish(FAILED(hr) ? hr : E_FAIL);
+                period = PeriodForFrames(alignedFrames, config_.format.sampleRate);
+                if (attempt + 1u >= attempts) return finish(AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED);
+                hr = ActivateClient();
+                if (FAILED(hr)) return finish(hr);
+            }
+            if (unsupported) continue;
         }
-        if (unsupported) continue;
     }
-    if (!initialized) return finish(ammod::audio::kBitPerfectFormatUnavailable);
+    if (!initialized) {
+        return finish(config_.allowResampling
+            ? ammod::audio::kExclusiveFormatUnavailable
+            : ammod::audio::kBitPerfectFormatUnavailable);
+    }
 
     HRESULT hr = client_->GetBufferSize(&bufferFrames_);
     if (FAILED(hr) || bufferFrames_ == 0) return finish(FAILED(hr) ? hr : E_FAIL);
@@ -265,13 +278,15 @@ HRESULT WasapiExclusiveSink::Start(IIntegerPcmSource& source) noexcept {
 
 HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
     if (!source_) return E_UNEXPECTED;
-    if (!source_->CanProvide(bufferFrames_)) {
+    HRESULT prepared = source_->Prepare(bufferFrames_);
+    if (prepared == kAudioSourceWouldBlock) {
         // Publish the waiting state before the second availability check. A
         // producer that races the first check will either be observed here or
         // see waitingForSource_ and signal sourceReadyEvent_, so no wakeup is
         // lost while healthy playback avoids producer-cadence event traffic.
         waitingForSource_.store(true, std::memory_order_release);
-        if (!source_->CanProvide(bufferFrames_)) {
+        prepared = source_->Prepare(bufferFrames_);
+        if (prepared == kAudioSourceWouldBlock) {
             sourceWaits_.fetch_add(1, std::memory_order_relaxed);
             if (client_) {
                 const HRESULT stop = client_->Stop();
@@ -284,6 +299,10 @@ HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
             return kAudioSourceWouldBlock;
         }
         waitingForSource_.store(false, std::memory_order_release);
+    }
+    if (FAILED(prepared)) {
+        RecordError(prepared);
+        return prepared;
     }
     BYTE* data = nullptr;
     HRESULT hr = render_->GetBuffer(bufferFrames_, &data);
@@ -305,7 +324,7 @@ HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
         }
     }
     DWORD flags = 0;
-    // CanProvide() is checked before GetBuffer, and the queue is single
+    // Prepare() is checked before GetBuffer, and the queue is single
     // consumer. A second would-block here therefore indicates a broken source
     // contract rather than a network wait; let the normal fail-closed branch
     // retire the generation instead of fabricating a partial buffer.
@@ -358,8 +377,8 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
     // The event/MMCSS/full-buffer loop is intentionally kept at the same
     // boundary as the pinned Microsoft sample/WASAPIRenderer.cpp:467-528 and
     // mpv/audio/out/ao_wasapi.c:87-145. Unlike those general players, this
-    // source has already-mapped integer PCM and never calls a converter,
-    // mixer, resampler or shared-mode fallback.
+    // source provides integer PCM, optionally staged by an application-owned
+    // resampler before GetBuffer. There is no shared-mode fallback.
     const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool uninitialize = apartment == S_OK || apartment == S_FALSE;
     HRESULT threadFailure = S_OK;
@@ -387,7 +406,7 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
                 // Wait for the producer's P0 notification, or poll when a
                 // caller did not provide a notification handle.
                 if (!sourceSignal) continue;
-                if (!source_ || !source_->CanProvide(bufferFrames_)) continue;
+                if (!source_) continue;
 
                 // Fill the stopped client before restarting it. This preserves
                 // the exact source stream across a network wait and avoids a

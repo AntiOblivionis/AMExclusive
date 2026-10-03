@@ -103,6 +103,7 @@ public:
     void Stop() noexcept;
     void SetUiEnabled(bool enabled) noexcept;
     void SetHardwareBufferMilliseconds(std::uint32_t milliseconds) noexcept;
+    void SetAllowResampling(bool enabled) noexcept;
     bool UiEnabled() const noexcept { return uiEnabled_.load(std::memory_order_acquire); }
 
     // UI transport intents are control-plane only. They gate when the exact
@@ -227,6 +228,7 @@ private:
     std::atomic<bool> uiEnabled_{};
     std::atomic<bool> workerStop_{};
     std::atomic<std::uint32_t> hardwareBufferMs_{20};
+    std::atomic<bool> allowResampling_{};
     HANDLE wakeEvent_{};
     HANDLE workerThread_{};
 

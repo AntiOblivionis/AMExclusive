@@ -30,7 +30,7 @@ public:
     bool BindActive(void* converter,
                     const PcmFormat& format,
                     std::uint64_t mediaGeneration) noexcept {
-        if (!converter || format != coordinator_.Format() ||
+        if (!converter || format != coordinator_.SourceFormat() ||
             mediaGeneration != coordinator_.MediaGeneration() ||
             coordinator_.Phase() != AudioCoreGatePhase::Capturing) {
             return false;

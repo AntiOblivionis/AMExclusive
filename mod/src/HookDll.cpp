@@ -690,7 +690,7 @@ private:
             }
 
             const auto buffered = g_audioCoreRuntime.Coordinator().BufferedFrames();
-            const auto format = g_audioCoreRuntime.Coordinator().Format();
+            const auto format = g_audioCoreRuntime.Coordinator().SourceFormat();
             const auto target = std::max<std::size_t>(
                 format.sampleRate / 2u, 4096u);
             if (buffered >= target) continue;
@@ -1709,7 +1709,8 @@ void SendAgentEvent(ammod::ipc::MessageType type, ammod::ipc::RuntimeState state
                     bool enabled, const std::wstring& endpoint = {},
                     const WAVEFORMATEX* format = nullptr, HRESULT hr = S_OK,
                     ammod::ipc::ErrorCategory category = ammod::ipc::ErrorCategory::None,
-                    const std::wstring& detail = {}) {
+                    const std::wstring& detail = {},
+                    const std::wstring& displayFormat = {}) {
     using namespace ammod::ipc;
     if (!g_ipcConnected.load()) return;
     auto message = NewMessage(type, Role::Agent);
@@ -1719,7 +1720,7 @@ void SendAgentEvent(ammod::ipc::MessageType type, ammod::ipc::RuntimeState state
     message.hresult = hr;
     message.error = category;
     CopyText(message.endpointId, endpoint);
-    CopyText(message.format, FormatText(format));
+    CopyText(message.format, displayFormat.empty() ? FormatText(format) : displayFormat);
     CopyText(message.detail, detail);
     std::lock_guard lock(g_outboundMutex);
     g_outbound.push_back(message);
@@ -1740,7 +1741,7 @@ void AudioCoreRuntimeEventCallback(void* context,
     if (!runtime) return;
     switch (event) {
     case ammod::audio_v2::AudioCoreRuntimeEvent::Bound: {
-        const auto& format = runtime->Coordinator().Format();
+        const auto& format = runtime->Coordinator().OutputFormat();
         const auto sourceBits = format.sourceValidBits == 0
             ? format.validBits : format.sourceValidBits;
         Log(L"audio core v2 bound active AudioUnit/P0 converter outputFormat{rate=" +
@@ -1759,7 +1760,7 @@ void AudioCoreRuntimeEventCallback(void* context,
         break;
     }
     case ammod::audio_v2::AudioCoreRuntimeEvent::Active: {
-        const auto& format = runtime->Coordinator().Format();
+        const auto& format = runtime->Coordinator().OutputFormat();
         const auto sourceBits = format.sourceValidBits == 0
             ? format.validBits : format.sourceValidBits;
         if (!kNativeAcquisitionPassthrough) {
@@ -1775,8 +1776,22 @@ void AudioCoreRuntimeEventCallback(void* context,
             std::to_wstring(format.containerBits) + L" sourceBits=" +
             std::to_wstring(sourceBits) + L" encoding=signed-int interleaved=1}");
         Log(L"audio core v2 active qpc=" + std::to_wstring(CurrentQpc()));
+        const auto& sourceFormat = runtime->Coordinator().SourceFormat();
+        const bool resampled = runtime->Coordinator().IsResampling();
+        const auto describe = [](const ammod::audio_v2::PcmFormat& pcm) {
+            std::wostringstream text;
+            text << pcm.validBits << L"-bit / "
+                 << (static_cast<double>(pcm.sampleRate) / 1000.0) << L" kHz";
+            return text.str();
+        };
+        const auto displayFormat = resampled
+            ? describe(sourceFormat) + L" -> " + describe(format) : describe(format);
+        Log(L"audio core v2 output " + displayFormat +
+            (resampled ? L" resampled=1 bitPerfect=0" : L" resampled=0"));
         SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
-                       ammod::ipc::RuntimeState::Active, true);
+                       ammod::ipc::RuntimeState::Active, true, {}, nullptr, S_OK,
+                       ammod::ipc::ErrorCategory::None,
+                       resampled ? L"resampled" : L"native", displayFormat);
         break;
     }
     case ammod::audio_v2::AudioCoreRuntimeEvent::Faulted: {
@@ -2596,7 +2611,7 @@ AppleOSStatus __cdecl HookV2AudioConverterReset(void* converter) {
             // subsequent Dispose/rebuild path. Drain any already-captured local
             // staging remainder into ACv2 before asking the coordinator to seal;
             // otherwise a final short block can still be waiting one layer
-            // upstream and appear as AvailableFrames()==0 to the terminal gate.
+            // upstream and appear as PendingSourceFrames()==0 to the terminal gate.
             stagingBefore = V2LocalQueueAvailableFrames(localQueue);
             (void)DrainV2LocalQueue(converter, localQueue);
             stagingAfter = V2LocalQueueAvailableFrames(localQueue);
@@ -2612,7 +2627,7 @@ AppleOSStatus __cdecl HookV2AudioConverterReset(void* converter) {
                 L" stagingBefore=" + std::to_wstring(stagingBefore) +
                 L" stagingAfter=" + std::to_wstring(stagingAfter) +
                 L" acv2Available=" + std::to_wstring(
-                    g_audioCoreRuntime.Coordinator().AvailableFrames()) +
+                    g_audioCoreRuntime.Coordinator().PendingSourceFrames()) +
                 L" eosSealed=" + std::to_wstring(localEndSealed));
         }
     }
@@ -3464,6 +3479,7 @@ DWORD WINAPI PipeClientLoop(void*) {
                 const auto hardwareBufferMs = incoming.hardwareBufferMs
                     ? incoming.hardwareBufferMs : 20u;
                 g_audioCoreRuntime.SetHardwareBufferMilliseconds(hardwareBufferMs);
+                g_audioCoreRuntime.SetAllowResampling(incoming.allowResampling != 0);
                 g_ipcEnabled.store(enabled, std::memory_order_release);
                 if (!enabled) g_nativeP0Puller.DisableForUiOff();
                 g_audioCoreGate.SetUiEnabled(enabled);
@@ -3471,7 +3487,8 @@ DWORD WINAPI PipeClientLoop(void*) {
                 Log(L"broker status received enabled=" +
                     std::to_wstring(incoming.enabledIntent) + L" state=" +
                     std::to_wstring(static_cast<unsigned>(incoming.state)) +
-                    L" hardwareBufferMs=" + std::to_wstring(hardwareBufferMs));
+                    L" hardwareBufferMs=" + std::to_wstring(hardwareBufferMs) +
+                    L" allowResampling=" + std::to_wstring(incoming.allowResampling));
             } else if (incoming.type == MessageType::TransportIntent) {
                 if (wcscmp(incoming.detail, L"play_pause") == 0) {
                     g_audioCoreRuntime.OnTransportPlayPause();
