@@ -41,7 +41,7 @@ struct BitPerfectFormatTuple final {
 };
 
 struct BitPerfectFormatCandidates final {
-    std::array<BitPerfectFormatTuple, 3> values{};
+    std::array<BitPerfectFormatTuple, 6> values{};
     std::size_t count{};
 };
 
@@ -49,13 +49,18 @@ constexpr BitPerfectFormatCandidates SelectBitPerfectFormatCandidates(
     std::uint32_t sourceBitDepth, bool localFloat32 = false) noexcept {
     if (localFloat32) {
         return sourceBitDepth == 32
-            ? BitPerfectFormatCandidates{{{{32, 32}, {}, {}}}, 1}
+            ? BitPerfectFormatCandidates{{{{32, 32}}}, 1}
             : BitPerfectFormatCandidates{};
     }
     switch (sourceBitDepth) {
-    case 16: return {{{{16, 16}, {16, 24}, {16, 32}}}, 3};
-    case 24: return {{{{24, 24}, {24, 32}, {}}}, 2};
-    case 32: return {{{{32, 32}, {}, {}}}, 1};
+    // Prefer a source-width valid-bit declaration, then widen the endpoint
+    // declaration without changing source precision. Runtime preserves the
+    // original depth in every candidate's sourceValidBits; the canonical PCM32
+    // mapper/packer leaves the additional low bits zero, with no rounding.
+    case 16: return {{{{16, 16}, {16, 24}, {16, 32},
+                       {24, 24}, {24, 32}, {32, 32}}}, 6};
+    case 24: return {{{{24, 24}, {24, 32}, {32, 32}}}, 3};
+    case 32: return {{{{32, 32}}}, 1};
     default: return {};
     }
 }
@@ -68,13 +73,17 @@ constexpr bool IsUnsupportedLocalInt32(std::uint32_t formatId,
            (formatFlags & kFormatFlagIsSignedInteger) != 0;
 }
 
-static_assert(SelectBitPerfectFormatCandidates(16).count == 3);
+static_assert(SelectBitPerfectFormatCandidates(16).count == 6);
 static_assert(SelectBitPerfectFormatCandidates(16).values[0] == BitPerfectFormatTuple{16, 16});
 static_assert(SelectBitPerfectFormatCandidates(16).values[1] == BitPerfectFormatTuple{16, 24});
 static_assert(SelectBitPerfectFormatCandidates(16).values[2] == BitPerfectFormatTuple{16, 32});
-static_assert(SelectBitPerfectFormatCandidates(24).count == 2);
+static_assert(SelectBitPerfectFormatCandidates(16).values[3] == BitPerfectFormatTuple{24, 24});
+static_assert(SelectBitPerfectFormatCandidates(16).values[4] == BitPerfectFormatTuple{24, 32});
+static_assert(SelectBitPerfectFormatCandidates(16).values[5] == BitPerfectFormatTuple{32, 32});
+static_assert(SelectBitPerfectFormatCandidates(24).count == 3);
 static_assert(SelectBitPerfectFormatCandidates(24).values[0] == BitPerfectFormatTuple{24, 24});
 static_assert(SelectBitPerfectFormatCandidates(24).values[1] == BitPerfectFormatTuple{24, 32});
+static_assert(SelectBitPerfectFormatCandidates(24).values[2] == BitPerfectFormatTuple{32, 32});
 static_assert(SelectBitPerfectFormatCandidates(32, true).count == 1);
 static_assert(SelectBitPerfectFormatCandidates(32, true).values[0] == BitPerfectFormatTuple{32, 32});
 static_assert(SelectBitPerfectFormatCandidates(20).count == 0);

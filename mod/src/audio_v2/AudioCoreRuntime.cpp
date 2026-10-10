@@ -8,6 +8,10 @@
 namespace ammod::audio_v2 {
 namespace {
 
+static_assert(ammod::audio::BitPerfectFormatCandidates{}.values.size() <=
+              kMaxFormatCandidates,
+              "The sink must hold every source-depth format candidate");
+
 constexpr std::uint32_t kAlac = 0x616C6163u; // 'alac'
 constexpr std::uint32_t kQlac = 0x716C6163u; // 'qlac'
 constexpr std::uint32_t kQaac = 0x71616163u; // 'qaac'
