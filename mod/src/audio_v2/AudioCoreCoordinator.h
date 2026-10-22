@@ -5,6 +5,7 @@
 #include "BitPerfectVerifier.h"
 #include "PcmQueue.h"
 #include "QueuedPcmSource.h"
+#include "ResampledPcmSource.h"
 #include "WasapiExclusiveSink.h"
 
 #include <atomic>
@@ -68,8 +69,25 @@ public:
     bool ShouldSuppressNative() const noexcept;
     bool IsEnabled() const noexcept { return gate_.UiEnabled(); }
     AudioCoreGatePhase Phase() const noexcept { return gate_.Phase(); }
-    const PcmFormat& Format() const noexcept {
+    // Requested output until the endpoint opens, then its negotiated format.
+    const PcmFormat& OutputFormat() const noexcept {
         return sink_.State() == WasapiSinkState::Closed ? config_.sink.format : sink_.Format();
+    }
+    const PcmFormat& SourceFormat() const noexcept { return sourceFormat_; }
+    bool IsSourceMappingExact() const noexcept {
+        return config_.mappingPolicy == PcmMappingPolicy::ExactSourceInteger;
+    }
+    bool IsResampling() const noexcept {
+        return sink_.State() != WasapiSinkState::Closed &&
+               sink_.Format().sampleRate != sourceFormat_.sampleRate;
+    }
+    bool IsReducingBitDepth() const noexcept {
+        return sink_.State() != WasapiSinkState::Closed &&
+            sink_.Format().validBits < EffectiveSourceValidBits(sourceFormat_);
+    }
+    bool IsConverting() const noexcept {
+        return sink_.State() != WasapiSinkState::Closed &&
+            RequiresPcmConversion(sourceFormat_, sink_.Format());
     }
     std::uint64_t MediaGeneration() const noexcept { return config_.mediaGeneration; }
     const AudioCoreCoordinatorStats Stats() const noexcept;
@@ -80,8 +98,18 @@ public:
     std::size_t BufferedFrames() const noexcept {
         return queue_ ? queue_->QueuedFrames() : 0;
     }
-    std::size_t AvailableFrames() const noexcept {
-        return source_ ? source_->AvailableFrames() : 0;
+    std::size_t PendingSourceFrames() const noexcept {
+        // Control-plane EOS checks are in source frames and must include the
+        // resampler's lookahead and staged output, even when the queue is empty.
+        const auto queued = source_ ? source_->AvailableFrames() : 0;
+        return queued + resampledSource_.PendingSourceFrames();
+    }
+    bool HasPendingAudio() const noexcept {
+        // Conversion may be moving the last queue block into private staging
+        // when the worker observes EOS. Always let it see the producer seal;
+        // independent queue/staging snapshots cannot prove that it is empty.
+        return PendingSourceFrames() != 0 ||
+            (IsConverting() && !sink_.EndOfStreamComplete());
     }
     bool SealEndOfStream() noexcept {
         if (!queue_) return false;
@@ -90,16 +118,20 @@ public:
         return true;
     }
     bool EndOfStreamSubmitted() const noexcept { return sink_.EndOfStreamSubmitted(); }
+    bool EndOfStreamComplete() const noexcept { return sink_.EndOfStreamComplete(); }
 
 private:
     bool PushResult(bool pushed, std::uint32_t frames) noexcept;
+    IIntegerPcmSource& ActiveSource() noexcept;
 
     AudioCoreGate gate_{};
     AppleOutputGate outputGate_;
     AudioCoreCoordinatorConfig config_{};
+    PcmFormat sourceFormat_{};
     AudioCoreGateToken token_{};
     std::unique_ptr<PcmQueue> queue_;
     std::optional<QueuedPcmSource> source_;
+    ResampledPcmSource resampledSource_;
     BitPerfectVerifier verifier_{};
     WasapiExclusiveSink sink_{};
     HANDLE sourceReadyEvent_{};

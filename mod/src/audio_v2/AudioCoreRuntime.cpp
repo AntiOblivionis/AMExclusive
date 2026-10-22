@@ -187,6 +187,11 @@ void AudioCoreRuntime::SetHardwareBufferMilliseconds(std::uint32_t milliseconds)
     hardwareBufferMs_.store(milliseconds, std::memory_order_release);
 }
 
+void AudioCoreRuntime::SetAllowResampling(bool enabled) noexcept {
+    // Applied when the next generation is bound; never replace a live stream.
+    allowResampling_.store(enabled, std::memory_order_release);
+}
+
 void AudioCoreRuntime::OnTransportPlayPause() noexcept {
     if (!UiEnabled()) return;
     std::lock_guard lock(controlMutex_);
@@ -361,7 +366,13 @@ void AudioCoreRuntime::OnConverterCreated(void* converter,
     registration.appleBytesPerFrame = capturedAppleFormat.bytesPerFrame;
     registration.appleBitsPerChannel = capturedAppleFormat.bitsPerChannel;
     registration.appleChannelsPerFrame = capturedAppleFormat.channelsPerFrame;
-    registry_.Register(registration);
+    // Serialize registration/refresh with pending handoff validation. Dispose
+    // invalidates the request before a reused address can be registered again.
+    std::lock_guard lock(controlMutex_);
+    if (!UiEnabled() || !registry_.Register(registration)) return;
+    if (pendingGraphBind_.converter == converter) {
+        pendingGraphBind_.observationId = observationId;
+    }
     const auto pendingRate = pendingCompressedRate_.load(std::memory_order_acquire);
     const auto pendingChannels = pendingCompressedChannels_.load(std::memory_order_acquire);
     const auto pendingBits = pendingCompressedBits_.load(std::memory_order_acquire);
@@ -462,10 +473,10 @@ bool AudioCoreRuntime::BeginEndOfStreamDrainLocked(void* converter,
         return false;
     }
     if (requireShortTail) {
-        const auto available = coordinator_.AvailableFrames();
+        const auto pendingSourceFrames = coordinator_.PendingSourceFrames();
         const auto period = requiredPrebufferFrames_ != 0
             ? requiredPrebufferFrames_ : PeriodFrames(graphRate_);
-        if (period == 0 || available == 0 || available > period) return false;
+        if (period == 0 || !coordinator_.HasPendingAudio() || pendingSourceFrames > period) return false;
     }
     if (!coordinator_.SealEndOfStream()) return false;
     endOfStreamDrainPending_ = true;
@@ -527,10 +538,10 @@ bool AudioCoreRuntime::OnLocalEndOfStream(void* converter) noexcept {
     // period boundary, there is no terminal buffer left to carry an EOS bit.
     // Sealing an empty queue would set endOfStreamDrainPending_ forever because
     // the sink correctly refuses to acquire another (pure-silence) period.
-    // Let the normal converter-dispose retirement close this generation and
-    // make room for the successor instead. Only a non-empty queued remainder
-    // needs the terminal drain/padding path.
-    if (coordinator_.AvailableFrames() == 0) return false;
+    // Let normal converter-dispose retirement close an empty native generation.
+    // A resampler can retain filter/staged data after the queue becomes empty
+    // and still needs the producer seal to submit its terminal buffer.
+    if (!coordinator_.HasPendingAudio()) return false;
     const bool sealed = BeginEndOfStreamDrainLocked(converter, false);
     if (sealed) Wake();
     return sealed;
@@ -551,20 +562,18 @@ void AudioCoreRuntime::RequestLocalSuccessorBind(void* converter) noexcept {
 }
 
 void AudioCoreRuntime::OnConverterDisposed(void* converter) noexcept {
-    if (!UiEnabled()) return;
-    const bool wasBound = boundConverter_.load(std::memory_order_acquire) == converter;
-    registry_.Retire(converter);
-    if (!wasBound) return;
+    if (!UiEnabled() || !converter) return;
     std::lock_guard lock(controlMutex_);
+    registry_.Retire(converter);
+    // A prefetched successor can itself be disposed before becoming bound.
+    // Cancel it even in that case, before this address can be reused.
+    if (pendingGraphBind_.converter == converter) pendingGraphBind_ = {};
+    if (graphConverter_ == converter) graphConverter_ = nullptr;
     if (boundConverter_.load(std::memory_order_acquire) == converter) {
-        if (endOfStreamDrainPending_ && endOfStreamDrainConverter_ == converter) {
-            // The producer has already sealed the queue. Keep the sink and its
-            // mapped terminal tail alive until ReleaseBuffer confirms that the
-            // terminal device period reached the endpoint.
-            if (graphConverter_ == converter) graphConverter_ = nullptr;
-        } else {
-            RetireCaptureLocked(true);
-            graphConverter_ = nullptr;
+        // A sealed generation retains its mapped terminal tail until the sink
+        // reports completion (including device-clock drain for actual SRC).
+        if (!endOfStreamDrainPending_ || endOfStreamDrainConverter_ != converter) {
+            RetireCompletedCaptureLocked(converter);
         }
     }
     Wake();
@@ -615,6 +624,7 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
     }
     const bool graphIdentityChanged =
         graphUnit_ != unit || graphConverter_ != candidateConverter;
+    pendingGraphBind_ = {};
     if (graphIdentityChanged && !endOfStreamDrainPending_ &&
         !streamingProducerDrainPending_) {
         if (graphBound_) RetireCaptureLocked(true);
@@ -645,7 +655,7 @@ void AudioCoreRuntime::OnAudioUnitStarted(void* unit) noexcept {
     if (graphUnit_ == unit) {
         graphStarted_ = true;
         TryBindGraphLocked();
-    } else if (graphBound_ && graphUnit_ && unit) {
+    } else if ((graphBound_ || pendingGraphBind_.converter) && graphUnit_ && unit) {
         // Apple starts the hardware-output parent AudioUnit (for example
         // auou/7820) after initializing the child graph AudioUnit that owns
         // the P0 converter (7823). The child identity is already fixed by
@@ -662,6 +672,8 @@ void AudioCoreRuntime::OnAudioUnitStopped(void* unit) noexcept {
     if (!UiEnabled()) return;
     if (nativeGraphHandoffPending_.load(std::memory_order_acquire)) return;
     std::lock_guard lock(controlMutex_);
+    // A late Stop from an older graph must not arm a drain on the successor.
+    if (graphUnit_ != unit && graphOutputUnit_ != unit) return;
     ExtendSeekQuietPeriodLocked();
     if (graphControlPending_ || graphPaused_ || userPauseIntent_) {
         // A graph stop issued by the runtime worker is an intentional media
@@ -707,6 +719,7 @@ void AudioCoreRuntime::OnAudioUnitUninitialized(void* unit) noexcept {
     std::lock_guard lock(controlMutex_);
     ExtendSeekQuietPeriodLocked();
     if (graphUnit_ != unit) return;
+    pendingGraphBind_ = {};
     graphPaused_ = false;
     graphControlPending_ = false;
     if (!endOfStreamDrainPending_ && !streamingProducerDrainPending_) {
@@ -788,8 +801,8 @@ bool AudioCoreRuntime::BeforeNativeClientStop(void* client) noexcept {
     return streamingEofCandidateConverter_.load(std::memory_order_acquire) == converter;
 }
 
-void* AudioCoreRuntime::OnNativeClientStopped(void* client, HRESULT) noexcept {
-    if (!UiEnabled()) return nullptr;
+void* AudioCoreRuntime::OnNativeClientStopped(void* client, HRESULT result) noexcept {
+    if (!UiEnabled() || FAILED(result)) return nullptr;
     if (nativeHandoffPending_.load(std::memory_order_acquire)) return nullptr;
     std::lock_guard lock(controlMutex_);
     ExtendSeekQuietPeriodLocked();
@@ -818,8 +831,8 @@ void* AudioCoreRuntime::OnNativeClientStopped(void* client, HRESULT) noexcept {
                 std::memory_order_acquire)) {
             streamingProducerDrainPending_ = false;
             streamingProducerDrainConverter_ = nullptr;
-            if (coordinator_.AvailableFrames() == 0) {
-                RetireCaptureLocked(true);
+            if (!coordinator_.HasPendingAudio()) {
+                RetireCompletedCaptureLocked(converter);
                 Wake();
                 return nullptr;
             }
@@ -827,7 +840,7 @@ void* AudioCoreRuntime::OnNativeClientStopped(void* client, HRESULT) noexcept {
                 Wake();
                 return nullptr;
             }
-            RetireCaptureLocked(true);
+            RetireCompletedCaptureLocked(converter);
             Wake();
             return nullptr;
         }
@@ -881,8 +894,8 @@ bool AudioCoreRuntime::OnStreamingProducerEndOfStream(void* converter) noexcept 
         streamingProducerDrainPending_ = false;
         streamingProducerDrainConverter_ = nullptr;
         streamingEofCandidateConverter_.store(nullptr, std::memory_order_release);
-        if (coordinator_.AvailableFrames() == 0) {
-            RetireCaptureLocked(true);
+        if (!coordinator_.HasPendingAudio()) {
+            RetireCompletedCaptureLocked(converter);
             Wake();
             return true;
         }
@@ -896,8 +909,8 @@ bool AudioCoreRuntime::OnStreamingProducerEndOfStream(void* converter) noexcept 
     return true;
 }
 
-void AudioCoreRuntime::OnNativeClientReset(void* client, HRESULT) noexcept {
-    if (!UiEnabled()) return;
+void AudioCoreRuntime::OnNativeClientReset(void* client, HRESULT result) noexcept {
+    if (!UiEnabled() || FAILED(result)) return;
     if (nativeHandoffPending_.load(std::memory_order_acquire)) return;
     std::lock_guard lock(controlMutex_);
     if (nativeClient_.load(std::memory_order_acquire) != client) return;
@@ -1126,6 +1139,7 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
                 continue;
             }
             FinalizeEndOfStreamDrainLocked();
+            TryBindPendingGraphLocked();
             if (!graphBound_) {
                 if (void* pendingLocal =
                         pendingLocalRebindConverter_.exchange(nullptr, std::memory_order_acq_rel)) {
@@ -1207,12 +1221,6 @@ AudioCoreRuntimeStats AudioCoreRuntime::Stats() const noexcept {
 void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     if (!UiEnabled() || !graphUnit_ || graphRate_ < 8000 || graphRate_ > 768000 ||
         graphChannels_ != 2) return;
-    // A successor graph may initialize/start a few milliseconds before the
-    // previous track's final short endpoint period is released. Preserve the
-    // old queue/sink until that terminal ReleaseBuffer completes; the current
-    // graph identity is retained and rebound by FinalizeEndOfStreamDrainLocked.
-    if ((endOfStreamDrainPending_ || streamingProducerDrainPending_) && graphBound_) return;
-
     if (!graphConverter_ && graphSourceBits_ != 0) {
         registry_.FindCandidate(graphRate_, graphChannels_, graphSourceBits_,
                                 graphObservationId_, graphConverter_);
@@ -1221,6 +1229,14 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
 
     ConverterRegistrationSnapshot snapshot{};
     if (!registry_.Snapshot(graphConverter_, snapshot)) return;
+    // Remember the exact observed successor, not a general permission to retry
+    // any unbound graph. Keep the old queue/sink until its own drain completes.
+    if ((endOfStreamDrainPending_ || streamingProducerDrainPending_) && graphBound_) {
+        if (graphConverter_ != boundConverter_.load(std::memory_order_acquire)) {
+            pendingGraphBind_ = {graphUnit_, graphConverter_, snapshot.registration.observationId};
+        }
+        return;
+    }
     if (snapshot.registration.outputFormat.sampleRate != graphRate_ ||
         snapshot.registration.outputFormat.channels != graphChannels_ ||
         snapshot.registration.sourceBitDepth == 0 ||
@@ -1235,11 +1251,13 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     }
 
     if (graphBound_) RetireCaptureLocked(true);
+    pendingGraphBind_ = {};
 
     const bool localSignedInt32 = ammod::audio::IsUnsupportedLocalInt32(
         snapshot.registration.encodedFormat, snapshot.registration.appleFormatFlags,
         snapshot.registration.sourceBitDepth);
-    if (localSignedInt32) {
+    const bool allowConversion = allowResampling_.load(std::memory_order_acquire);
+    if (localSignedInt32 && !allowConversion) {
         // Reject this media item, not the user's AME intent. Keeping the runtime
         // armed guarantees that replaying the same int32 item is rejected again
         // instead of falling through to Apple's shared renderer.
@@ -1256,6 +1274,7 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     if (!BuildFormat(snapshot, format)) return;
     AudioCoreCoordinatorConfig config{};
     config.sink.format = format;
+    config.sink.allowResampling = allowConversion;
     const bool localFloat32 = snapshot.registration.encodedFormat == kAppleLinearPcm &&
         (snapshot.registration.appleFormatFlags & kAppleFormatFlagIsFloat) != 0 &&
         snapshot.registration.sourceBitDepth == 32;
@@ -1277,12 +1296,15 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     config.sink.onLifecycle = callbacks_.onSinkLifecycle;
     config.queueCapacity = kProductionQueueCapacity;
     config.mediaGeneration = generation;
-    config.mappingPolicy = localFloat32
+    // Local int32 has already passed through Apple's float32 P0 output. In
+    // compatibility mode accept that decoded stream via the bounded float
+    // mapper; never claim recovery of the original 32-bit integer lattice.
+    config.mappingPolicy = (localFloat32 || localSignedInt32)
         ? PcmMappingPolicy::LocalFloat32ToPcm32
         : decodedLossyAac
             ? PcmMappingPolicy::DecodedLossyFloat32ToPcm32
             : PcmMappingPolicy::ExactSourceInteger;
-    config.verifyBitPerfect = callbacks_.deepDiagnostics && !decodedLossyAac;
+    config.verifyBitPerfect = callbacks_.deepDiagnostics && !decodedLossyAac && !localSignedInt32;
     const HRESULT enable = coordinator_.Enable(config);
     if (FAILED(enable) || !tap_.BindActive(graphConverter_, format, generation) ||
         !registry_.Bind(graphConverter_, generation)) {
@@ -1452,7 +1474,7 @@ void AudioCoreRuntime::TryActivateLocked() noexcept {
 }
 
 void AudioCoreRuntime::FinalizeEndOfStreamDrainLocked() noexcept {
-    if (!endOfStreamDrainPending_ || !coordinator_.EndOfStreamSubmitted()) return;
+    if (!endOfStreamDrainPending_ || !coordinator_.EndOfStreamComplete()) return;
 
     const auto drainedConverter = endOfStreamDrainConverter_;
     const auto localSuccessor = pendingLocalSuccessor_;
@@ -1460,12 +1482,9 @@ void AudioCoreRuntime::FinalizeEndOfStreamDrainLocked() noexcept {
     endOfStreamDrainConverter_ = nullptr;
     pendingLocalSuccessor_ = nullptr;
 
-    // The terminal endpoint buffer has been released successfully. Only now is
-    // it safe to tear down the old generation. This covers both imported local
-    // media and the bounded final-period remainder of a naturally ending
-    // streaming track.
-    RetireCaptureLocked(true);
-    if (graphConverter_ == drainedConverter) graphConverter_ = nullptr;
+    // SRC completion requires device-clock drain evidence after terminal
+    // submission. Native-rate output retains its existing submission boundary.
+    RetireCompletedCaptureLocked(drainedConverter);
 
     if (localSuccessor) {
         ConverterRegistrationSnapshot snapshot{};
@@ -1477,15 +1496,41 @@ void AudioCoreRuntime::FinalizeEndOfStreamDrainLocked() noexcept {
             graphChannels_ = snapshot.registration.outputFormat.channels;
             graphSourceBits_ = snapshot.registration.sourceBitDepth;
             graphObservationId_ = snapshot.registration.observationId;
+            TryBindGraphLocked();
         }
     }
-    // A streaming successor can initialize/start while the old terminal period
-    // is still draining. OnAudioUnitInitialized retained that graph identity;
-    // bind it now that the old sink has been closed.
-    TryBindGraphLocked();
+    TryBindPendingGraphLocked();
+}
+
+void AudioCoreRuntime::RetireCompletedCaptureLocked(void* converter) noexcept {
+    const auto successor = pendingGraphBind_;
+    RetireCaptureLocked(true);
+    if (graphConverter_ == converter) graphConverter_ = nullptr;
+    // Only natural completion/producer disposal may carry a blocked successor
+    // across retirement. Skip, seek, rejection and UI Off use plain retirement.
+    if (successor.converter && successor.converter != converter &&
+        successor.unit == graphUnit_ && successor.converter == graphConverter_) {
+        pendingGraphBind_ = successor;
+    }
+}
+
+void AudioCoreRuntime::TryBindPendingGraphLocked() noexcept {
+    if (graphBound_ || !pendingGraphBind_.converter) return;
+    const auto successor = pendingGraphBind_;
+    pendingGraphBind_ = {};
+    ConverterRegistrationSnapshot snapshot{};
+    if (UiEnabled() && successor.unit == graphUnit_ &&
+        successor.converter == graphConverter_ &&
+        registry_.Snapshot(successor.converter, snapshot) &&
+        snapshot.registration.observationId == successor.observationId) {
+        // One attempt only. Missing precision is retried by its existing
+        // observation callback; a rejected item must not fault every tick.
+        TryBindGraphLocked();
+    }
 }
 
 void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph) noexcept {
+    pendingGraphBind_ = {};
     graphPaused_ = false;
     graphControlPending_ = false;
     streamingProducerDrainPending_ = false;

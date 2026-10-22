@@ -103,6 +103,7 @@ public:
     void Stop() noexcept;
     void SetUiEnabled(bool enabled) noexcept;
     void SetHardwareBufferMilliseconds(std::uint32_t milliseconds) noexcept;
+    void SetAllowResampling(bool enabled) noexcept;
     bool UiEnabled() const noexcept { return uiEnabled_.load(std::memory_order_acquire); }
 
     // UI transport intents are control-plane only. They gate when the exact
@@ -217,6 +218,8 @@ private:
     void ExtendSeekQuietPeriodLocked() noexcept;
     bool BeginEndOfStreamDrainLocked(void* converter, bool requireShortTail) noexcept;
     void FinalizeEndOfStreamDrainLocked() noexcept;
+    void RetireCompletedCaptureLocked(void* converter) noexcept;
+    void TryBindPendingGraphLocked() noexcept;
     void RetireCaptureLocked(bool keepGraph) noexcept;
     bool BuildFormat(const ConverterRegistrationSnapshot& snapshot,
                      PcmFormat& output) const noexcept;
@@ -227,6 +230,7 @@ private:
     std::atomic<bool> uiEnabled_{};
     std::atomic<bool> workerStop_{};
     std::atomic<std::uint32_t> hardwareBufferMs_{20};
+    std::atomic<bool> allowResampling_{};
     HANDLE wakeEvent_{};
     HANDLE workerThread_{};
 
@@ -257,6 +261,14 @@ private:
     bool nativeInitialized_{};
     bool nativeStarted_{};
     bool graphBound_{};
+    // Earned only when a distinct, observed successor is blocked by an old
+    // producer/endpoint drain. Consumed once after natural retirement; ordinary
+    // cancellation must never turn an unbound old graph into a retry request.
+    struct PendingGraphBind final {
+        void* unit{};
+        void* converter{};
+        std::uint64_t observationId{};
+    } pendingGraphBind_{};
     // Streaming native Stop is not decoder EOF. Hold the current generation
     // across AudioUnit Stop/Uninitialize while HookDll synchronously flushes
     // the still-live P0 converter to producedPackets==0.

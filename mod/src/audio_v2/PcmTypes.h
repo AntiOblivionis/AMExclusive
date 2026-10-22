@@ -32,6 +32,8 @@ struct PcmFormat final {
     // narrower than that declaration when the endpoint has no matching
     // packed/valid-bit tuple (for example, 16-bit source in a 24-valid-in-32
     // endpoint container).
+    // An explicitly converted endpoint may instead be narrower than the source;
+    // only IsValidEndpointFormat with reduction enabled admits that case.
     std::uint16_t validBits{};
     std::uint16_t containerBits{};
     PcmEncoding encoding{PcmEncoding::SignedInteger};
@@ -124,6 +126,28 @@ constexpr bool IsValidFormat(const PcmFormat& format) noexcept {
            EffectiveSourceValidBits(format) <= format.validBits;
 }
 
+// Only an explicitly enabled conversion may use a narrower endpoint. Keep the
+// source/queue contract above strict and retain the original source precision.
+constexpr bool IsValidEndpointFormat(const PcmFormat& format,
+                                     bool allowConversion) noexcept {
+    auto layout = format;
+    if (format.encoding == PcmEncoding::IeeeFloat) {
+        if (!allowConversion || format.validBits != 32 || format.containerBits != 32) return false;
+        layout.encoding = PcmEncoding::SignedInteger;
+    }
+    layout.sourceValidBits = format.validBits;
+    return IsValidFormat(layout) &&
+        IsSupportedSourceDepth(EffectiveSourceValidBits(format)) &&
+        (allowConversion || EffectiveSourceValidBits(format) <= format.validBits);
+}
+
+constexpr bool RequiresPcmConversion(const PcmFormat& input,
+                                     const PcmFormat& output) noexcept {
+    return output.sampleRate != input.sampleRate ||
+        output.encoding != input.encoding ||
+        output.validBits < EffectiveSourceValidBits(input);
+}
+
 inline bool PackCanonicalPcm32(const std::int32_t* source,
                                BYTE* destination,
                                std::size_t sampleCount,
@@ -153,8 +177,9 @@ inline bool PackCanonicalPcm32(const std::int32_t* source,
     return false;
 }
 
-inline bool MakeWasapiFormat(const PcmFormat& source, WAVEFORMATEXTENSIBLE& output) noexcept {
-    if (!IsValidFormat(source)) return false;
+inline bool MakeWasapiFormat(const PcmFormat& source, WAVEFORMATEXTENSIBLE& output,
+                             bool allowConversion = false) noexcept {
+    if (!IsValidEndpointFormat(source, allowConversion)) return false;
     output = {};
     output.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
     output.Format.nChannels = source.channels;
@@ -166,7 +191,21 @@ inline bool MakeWasapiFormat(const PcmFormat& source, WAVEFORMATEXTENSIBLE& outp
     output.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
     output.Samples.wValidBitsPerSample = source.validBits;
     output.dwChannelMask = kStereoChannelMask;
-    output.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+    output.SubFormat = source.encoding == PcmEncoding::IeeeFloat
+        ? KSDATAFORMAT_SUBTYPE_IEEE_FLOAT : KSDATAFORMAT_SUBTYPE_PCM;
+    return true;
+}
+
+inline bool PackEndpointPcm32(const std::int32_t* source, BYTE* destination,
+                             std::size_t sampleCount, const PcmFormat& format) noexcept {
+    if (format.encoding == PcmEncoding::SignedInteger)
+        return PackCanonicalPcm32(source, destination, sampleCount, format.containerBits);
+    if (format.encoding != PcmEncoding::IeeeFloat || format.containerBits != 32 ||
+        format.validBits != 32 || ((!source || !destination) && sampleCount != 0)) return false;
+    for (std::size_t i = 0; i < sampleCount; ++i) {
+        const float sample = static_cast<float>(source[i]) * 0x1.0p-31f;
+        std::memcpy(destination + i * sizeof(float), &sample, sizeof(sample));
+    }
     return true;
 }
 

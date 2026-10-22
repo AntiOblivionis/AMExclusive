@@ -14,6 +14,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "SoftwareRenderBuffer.h"
 
 namespace ammod::audio_v2 {
 
@@ -77,9 +78,11 @@ class NativeRenderGateProxy final : public IAudioRenderClient {
 public:
     NativeRenderGateProxy(IAudioRenderClient* inner, NativeAudioCallbacks callbacks,
                           void* clientIdentity, UINT32 bytesPerFrame,
-                          std::shared_ptr<NativeRenderGateState> state) noexcept
+                          std::shared_ptr<NativeRenderGateState> state,
+                          std::shared_ptr<SoftwareRenderBuffer> softwareBuffer = {}) noexcept
         : inner_(inner), callbacks_(callbacks), clientIdentity_(clientIdentity),
-          bytesPerFrame_(bytesPerFrame), state_(std::move(state)) {
+          bytesPerFrame_(bytesPerFrame), state_(std::move(state)),
+          softwareBuffer_(std::move(softwareBuffer)) {
         if (state_) state_->Add(this);
     }
 
@@ -108,11 +111,8 @@ public:
 
     HRESULT STDMETHODCALLTYPE GetBuffer(UINT32 frames, BYTE** data) override {
         if (data) *data = nullptr;
-        // Preserve Apple's actual GetBuffer call and HRESULT.  Returning a
-        // synthetic S_OK with a private shadow buffer changes the native
-        // scheduler's ownership/padding state and was observed to collapse
-        // the render cadence to roughly one call every two seconds.  The
-        // native client must see the same success/failure as Apple sees.
+        // Real clients retain WASAPI ownership. Software clients reserve the
+        // same shared ledger used by padding and clock queries.
         HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
         bool shadow = false;
         {
@@ -120,24 +120,27 @@ public:
             shadow = shadowMode_ || handoffPending_;
             if (shadow) {
                 const auto bytesPerFrame = std::max<UINT32>(1u, bytesPerFrame_);
-                const bool fits = frames != 0 &&
-                    frames <= shadowBuffer_.size() / bytesPerFrame;
+                const bool fits = frames <= shadowBuffer_.size() / bytesPerFrame;
                 if (!data) {
                     result = E_POINTER;
+                } else if (shadowAcquired_ || nativeBufferInFlight_) {
+                    result = AUDCLNT_E_OUT_OF_ORDER;
                 } else if (!fits) {
-                    result = AUDCLNT_E_BUFFER_SIZE_ERROR;
+                    result = AUDCLNT_E_BUFFER_TOO_LARGE;
                 } else {
-                    std::memset(shadowBuffer_.data(), 0,
-                                static_cast<std::size_t>(frames) * bytesPerFrame);
-                    *data = shadowBuffer_.data();
-                    acquiredData_ = *data;
-                    acquiredFrames_ = frames;
-                    shadowAcquired_ = true;
-                    result = S_OK;
+                    result = softwareBuffer_ ? softwareBuffer_->Acquire(this, frames) : S_OK;
+                    if (SUCCEEDED(result) && frames) {
+                        std::memset(shadowBuffer_.data(), 0,
+                                    static_cast<std::size_t>(frames) * bytesPerFrame);
+                        *data = shadowBuffer_.data();
+                        acquiredData_ = *data;
+                        acquiredFrames_ = frames;
+                        shadowAcquired_ = true;
+                    }
                 }
             } else if (inner_) {
                 result = inner_->GetBuffer(frames, data);
-                if (SUCCEEDED(result) && data && *data) {
+                if (SUCCEEDED(result) && frames != 0 && data && *data) {
                     acquiredData_ = *data;
                     acquiredFrames_ = frames;
                     nativeBufferInFlight_ = true;
@@ -158,12 +161,13 @@ public:
         HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
         {
             std::lock_guard lock(innerMutex_);
-            shadow = shadowMode_;
+            shadow = shadowAcquired_ || (shadowMode_ && !nativeBufferInFlight_);
             if (shadow) {
-                result = shadowAcquired_ && acquiredFrames_ == frames
-                    ? S_OK : AUDCLNT_E_BUFFER_ERROR;
+                result = softwareBuffer_ ? softwareBuffer_->Commit(this, frames, flags)
+                    : (frames == 0 || (shadowAcquired_ && frames <= acquiredFrames_)
+                        ? S_OK : AUDCLNT_E_OUT_OF_ORDER);
             } else if (inner_) {
-                if (suppress && acquiredData_ && acquiredFrames_ == frames &&
+                if (suppress && acquiredData_ && frames <= acquiredFrames_ &&
                     bytesPerFrame_ != 0) {
                     // Keep the real native ownership/padding transition, but prevent
                     // the native stream from leaking samples after the exclusive
@@ -172,19 +176,23 @@ public:
                     std::memset(acquiredData_, 0, byteCount);
                 }
                 result = inner_->ReleaseBuffer(frames, effectiveFlags);
-                if (nativeBufferInFlight_ && acquiredFrames_ == frames) {
+                if (SUCCEEDED(result) && nativeBufferInFlight_) {
                     nativeBufferInFlight_ = false;
                     drainCv_.notify_all();
                 }
+            }
+            // Failed releases retain the reservation so the caller can retry
+            // or cancel. Clear under the same lock that handoff waits on.
+            if (SUCCEEDED(result)) {
+                acquiredData_ = nullptr;
+                acquiredFrames_ = 0;
+                shadowAcquired_ = false;
             }
         }
         if (callbacks_.onReleaseBuffer) {
             callbacks_.onReleaseBuffer(callbacks_.context, clientIdentity_, frames,
                                        result, shadow);
         }
-        acquiredData_ = nullptr;
-        acquiredFrames_ = 0;
-        shadowAcquired_ = false;
         return result;
     }
 
@@ -199,6 +207,7 @@ public:
 private:
     ~NativeRenderGateProxy() {
         if (state_) state_->Remove(this);
+        if (softwareBuffer_) softwareBuffer_->Abandon(this);
         std::lock_guard lock(innerMutex_);
         if (inner_) inner_->Release();
     }
@@ -217,6 +226,7 @@ private:
     bool nativeBufferInFlight_{};
     std::array<BYTE, 256u * 1024u> shadowBuffer_{};
     std::shared_ptr<NativeRenderGateState> state_;
+    std::shared_ptr<SoftwareRenderBuffer> softwareBuffer_;
     std::atomic<ULONG> references_{1};
 };
 
@@ -294,10 +304,11 @@ private:
     void TraceService(REFIID iid, HRESULT result) noexcept;
     IAudioClient2* Inner2() const noexcept;
     static DWORD WINAPI PumpThreadThunk(void* context) noexcept;
-    void StartPumpThread() noexcept;
+    HRESULT StartPumpThread() noexcept;
     void StopPumpThread() noexcept;
 
     mutable std::mutex innerMutex_;
+    std::mutex controlMutex_;
     IAudioClient* inner_{};
     NativeAudioCallbacks callbacks_{};
     std::wstring endpoint_;
@@ -311,12 +322,15 @@ private:
     UINT32 pumpBufferFrames_{};
     bool pumpMode_{};
     bool pumpStarted_{};
+    bool pumpEventDriven_{};
+    std::shared_ptr<SoftwareRenderBuffer> softwareBuffer_;
     IAudioClock* pumpClock_{};
     IAudioStreamVolume* pumpVolume_{};
     IAudioSessionControl2* pumpSession_{};
     std::atomic<HANDLE> pumpEvent_{};
     HANDLE pumpStopEvent_{};
     HANDLE pumpThread_{};
+    HANDLE pumpTimer_{};
     std::atomic<ULONG> references_{1};
 };
 

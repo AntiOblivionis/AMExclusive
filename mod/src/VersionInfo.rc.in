@@ -1,0 +1,42 @@
+#include <windows.h>
+#pragma code_page(65001)
+
+1 VERSIONINFO
+ FILEVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+ PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE @AM_FILE_TYPE@
+ FILESUBTYPE 0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "AMExclusive\0"
+      VALUE "FileDescription", "@AM_FILE_DESCRIPTION@\0"
+      VALUE "FileVersion", "@PROJECT_VERSION@.0\0"
+      VALUE "InternalName", "@AM_INTERNAL_NAME@\0"
+      VALUE "OriginalFilename", "@AM_FILE_NAME@\0"
+      VALUE "ProductName", "AMExclusive\0"
+      VALUE "ProductVersion", "@PROJECT_VERSION@.0\0"
+      VALUE "LegalCopyright", "Copyright (c) AMExclusive contributors. MIT License.\0"
+    END
+    BLOCK "080404B0"
+    BEGIN
+      VALUE "CompanyName", "AMExclusive\0"
+      VALUE "FileDescription", "@AM_FILE_DESCRIPTION_ZH@\0"
+      VALUE "FileVersion", "@PROJECT_VERSION@.0\0"
+      VALUE "InternalName", "@AM_INTERNAL_NAME@\0"
+      VALUE "OriginalFilename", "@AM_FILE_NAME@\0"
+      VALUE "ProductName", "AMExclusive\0"
+      VALUE "ProductVersion", "@PROJECT_VERSION@.0\0"
+      VALUE "LegalCopyright", "版权所有 (c) AMExclusive 贡献者。MIT 许可证。\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200, 0x0804, 1200
+  END
+END

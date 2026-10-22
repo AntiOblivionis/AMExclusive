@@ -1,10 +1,18 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$NoRestart,
-    [switch]$EmitProgress
+    [switch]$EmitProgress,
+    [ValidateSet('auto', 'zh-CN', 'en-US')][string]$Language = 'auto'
 )
 
 $ErrorActionPreference = 'Stop'
+$script:ameChinese = $Language -eq 'zh-CN' -or ($Language -eq 'auto' -and
+    [Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName -eq 'zh')
+function Get-InstallerText([string]$Chinese, [string]$English) {
+    if ($script:ameChinese) { return $Chinese }
+    return $English
+}
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 
 function Write-ProgressMilestone([int]$Percent, [string]$Message) {
     if ($EmitProgress) {
@@ -21,7 +29,7 @@ $install = [IO.Path]::GetFullPath((Join-Path $env:PUBLIC 'AMExclusive'))
 $expected = [IO.Path]::GetFullPath((Join-Path $env:PUBLIC 'AMExclusive'))
 if ($install -ne $expected -or -not $install.StartsWith([IO.Path]::GetFullPath($env:PUBLIC),
                                                         [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Refusing unsafe uninstall path: $install"
+    throw (Get-InstallerText "拒绝使用不安全的卸载路径：$install" "Refusing unsafe uninstall path: $install")
 }
 
 function Stop-AppleMusicRuntime {
@@ -65,12 +73,17 @@ if ($wasRunning -and -not $NoRestart -and $aumid) {
 }
 Write-ProgressMilestone 95 'restart_apple_music'
 
-[pscustomobject]@{
+$result = [pscustomobject]@{
     Uninstalled = $true
     ScheduledTaskRemoved = -not [bool](Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)
     LoginAutostartRemoved = -not [bool](Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name AMExclusive -ErrorAction SilentlyContinue)
     AppsEntryRemoved = -not (Test-Path -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AMExclusive')
     DirectoryRemoved = -not (Test-Path -LiteralPath $install)
-    RestartedAppleMusic = $restarted
+    AppleMusicRestartRequested = $restarted
 }
+if (-not $result.ScheduledTaskRemoved -or -not $result.LoginAutostartRemoved -or
+    -not $result.AppsEntryRemoved -or -not $result.DirectoryRemoved) {
+    throw (Get-InstallerText '卸载验证失败：仍有注册项或文件残留。' 'Uninstall verification failed: registration or files remain.')
+}
+$result
 Write-ProgressMilestone 100 'complete'

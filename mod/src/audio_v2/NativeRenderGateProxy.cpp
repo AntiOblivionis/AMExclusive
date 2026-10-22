@@ -72,9 +72,9 @@ bool IsUsableSharedFormat(const WAVEFORMATEX* format) noexcept {
 
 class PumpAudioClock final : public IAudioClock {
 public:
-    explicit PumpAudioClock(UINT32 sampleRate) noexcept : sampleRate_(sampleRate) {
+    explicit PumpAudioClock(std::shared_ptr<SoftwareRenderBuffer> buffer) noexcept
+        : buffer_(std::move(buffer)) {
         QueryPerformanceFrequency(&frequency_);
-        QueryPerformanceCounter(&origin_);
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
@@ -98,32 +98,23 @@ public:
 
     HRESULT STDMETHODCALLTYPE GetFrequency(UINT64* frequency) override {
         if (!frequency) return E_POINTER;
-        *frequency = sampleRate_;
-        return sampleRate_ != 0 ? S_OK : AUDCLNT_E_NOT_INITIALIZED;
+        *frequency = buffer_->Rate();
+        return *frequency != 0 ? S_OK : AUDCLNT_E_NOT_INITIALIZED;
     }
 
     HRESULT STDMETHODCALLTYPE GetPosition(UINT64* position, UINT64* qpcPosition) override {
         if (!position) return E_POINTER;
+        *position = buffer_->Position();
+        if (!qpcPosition) return S_OK;
         LARGE_INTEGER now{};
         if (!QueryPerformanceCounter(&now) || frequency_.QuadPart <= 0) {
-            *position = 0;
-            if (qpcPosition) *qpcPosition = 0;
-            return S_OK;
+            *qpcPosition = 0;
+            return E_FAIL;
         }
-        const auto elapsed = std::max<LONGLONG>(0, now.QuadPart - origin_.QuadPart);
-        if (sampleRate_ == 0) {
-            *position = 0;
-            if (qpcPosition) *qpcPosition = 0;
-            return AUDCLNT_E_NOT_INITIALIZED;
-        }
-        *position = static_cast<UINT64>(
-            (static_cast<unsigned long long>(elapsed) * sampleRate_) /
-            static_cast<unsigned long long>(frequency_.QuadPart));
-        if (qpcPosition) {
-            *qpcPosition = static_cast<UINT64>(
-                (static_cast<unsigned long long>(now.QuadPart) * 10000000ULL) /
-                static_cast<unsigned long long>(frequency_.QuadPart));
-        }
+        const auto ticks = static_cast<UINT64>(now.QuadPart);
+        const auto frequency = static_cast<UINT64>(frequency_.QuadPart);
+        *qpcPosition = (ticks / frequency) * 10000000ULL +
+            ((ticks % frequency) * 10000000ULL) / frequency;
         return S_OK;
     }
 
@@ -139,9 +130,8 @@ public:
 private:
     ~PumpAudioClock() = default;
 
-    UINT32 sampleRate_{};
+    std::shared_ptr<SoftwareRenderBuffer> buffer_;
     LARGE_INTEGER frequency_{};
-    LARGE_INTEGER origin_{};
     std::atomic<ULONG> references_{1};
 };
 
@@ -342,12 +332,8 @@ void NativeRenderGateState::EnableShadowAll() noexcept {
 
 void NativeRenderGateProxy::DetachInner() noexcept {
     std::unique_lock lock(innerMutex_);
-    if (!inner_) {
-        acquiredData_ = nullptr;
-        acquiredFrames_ = 0;
-        shadowAcquired_ = false;
-        return;
-    }
+    // Handoff must leave an outstanding software transaction intact.
+    if (!inner_) return;
     // The handoff callback can run on a control thread while Apple's render
     // thread is between GetBuffer and ReleaseBuffer. Divert new calls to the
     // private shadow surface, wait for the one real endpoint packet to return,
@@ -356,15 +342,9 @@ void NativeRenderGateProxy::DetachInner() noexcept {
     // AMPLibraryAgent fast-fail with STATUS_STACK_BUFFER_OVERRUN.
     handoffPending_ = true;
     drainCv_.wait(lock, [this] { return !nativeBufferInFlight_; });
-    if (acquiredData_ && acquiredFrames_ != 0) {
-        // The native render thread can be between GetBuffer and ReleaseBuffer
-        // while the handoff is requested. Close that outstanding packet before
-        // dropping the service reference so the endpoint has no live owner.
-        (void)inner_->ReleaseBuffer(acquiredFrames_, AUDCLNT_BUFFERFLAGS_SILENT);
-    }
-    acquiredData_ = nullptr;
-    acquiredFrames_ = 0;
-    shadowAcquired_ = false;
+    // The real packet was returned by its owner before this wait completed.
+    // A new shadow packet may already be reserved; it is not an inner packet
+    // and must not be released to WASAPI or forgotten during the cutover.
     inner_->Release();
     inner_ = nullptr;
     shadowMode_ = true;
@@ -375,9 +355,6 @@ void NativeRenderGateProxy::EnableShadowMode() noexcept {
     std::lock_guard lock(innerMutex_);
     shadowMode_ = true;
     handoffPending_ = false;
-    shadowAcquired_ = false;
-    acquiredData_ = nullptr;
-    acquiredFrames_ = 0;
 }
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::QueryInterface(REFIID iid, void** object) {
@@ -408,8 +385,11 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Initialize(
     REFERENCE_TIME periodicity, const WAVEFORMATEX* format, LPCGUID sessionGuid) {
     HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
     {
+        std::lock_guard control(controlMutex_);
         std::lock_guard lock(innerMutex_);
-        if (shareMode == AUDCLNT_SHAREMODE_SHARED) {
+        if (pumpMode_) {
+            result = AUDCLNT_E_ALREADY_INITIALIZED;
+        } else if (shareMode == AUDCLNT_SHAREMODE_SHARED) {
             // Shared mode is a pure AME software terminal. The caller's shared
             // engine format is scheduler metadata, not source identity and not
             // the physical Windows endpoint contract. Accept any structurally
@@ -417,22 +397,23 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Initialize(
             if (!IsUsableSharedFormat(format)) {
                 result = AUDCLNT_E_UNSUPPORTED_FORMAT;
             } else {
-                pumpMode_ = true;
-                if (pumpClock_) {
-                    pumpClock_->Release();
-                    pumpClock_ = nullptr;
+                try {
+                    softwareBuffer_ = std::make_shared<SoftwareRenderBuffer>(
+                        format->nSamplesPerSec, SoftwareBufferFrames(format->nSamplesPerSec));
+                } catch (...) {
+                    return E_OUTOFMEMORY;
                 }
+                pumpMode_ = true;
                 pumpSampleRate_ = format->nSamplesPerSec;
                 pumpQuantumFrames_ = SoftwareQuantumFrames(pumpSampleRate_);
                 pumpBufferFrames_ = SoftwareBufferFrames(pumpSampleRate_);
+                pumpEventDriven_ = (flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) != 0;
                 blockAlign_.store(format->nBlockAlign, std::memory_order_release);
                 result = S_OK;
             }
         } else if (inner_) {
             result = inner_->Initialize(shareMode, flags, duration, periodicity,
                                         format, sessionGuid);
-        } else if (pumpMode_) {
-            result = S_OK;
         }
     }
     if (SUCCEEDED(result) && format) {
@@ -488,12 +469,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetCurrentPadding(UINT32* fram
         if (pumpMode_) {
             if (!frames) result = E_POINTER;
             else {
-                // Expose one fixed virtual-engine quantum as free space after
-                // Start. This contract is intentionally independent of the
-                // physical endpoint's Windows shared-mode format.
-                *frames = pumpStarted_ && pumpBufferFrames_ > pumpQuantumFrames_
-                    ? pumpBufferFrames_ - pumpQuantumFrames_
-                    : 0u;
+                *frames = softwareBuffer_->Padding();
                 result = pumpBufferFrames_ != 0 && pumpQuantumFrames_ != 0
                     ? S_OK : AUDCLNT_E_NOT_INITIALIZED;
             }
@@ -553,14 +529,24 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetDevicePeriod(
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Start() {
     HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
     {
-        std::lock_guard lock(innerMutex_);
-        if (pumpMode_) {
-            pumpStarted_ = true;
-            result = S_OK;
+        std::lock_guard control(controlMutex_);
+        {
+            std::lock_guard lock(innerMutex_);
+            if (pumpMode_) {
+                result = softwareBuffer_->Start();
+                pumpStarted_ = SUCCEEDED(result) || pumpStarted_;
+            }
+            else if (inner_) result = inner_->Start();
         }
-        else if (inner_) result = inner_->Start();
+        if (SUCCEEDED(result)) {
+            result = StartPumpThread();
+            if (FAILED(result)) {
+                std::lock_guard lock(innerMutex_);
+                softwareBuffer_->Stop();
+                pumpStarted_ = false;
+            }
+        }
     }
-    if (SUCCEEDED(result)) StartPumpThread();
     if (callbacks_.onStart) callbacks_.onStart(callbacks_.context, this, result);
     return result;
 }
@@ -577,14 +563,18 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Stop() {
 
     HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
     {
-        std::lock_guard lock(innerMutex_);
-        if (pumpMode_) {
-            pumpStarted_ = false;
-            result = S_OK;
+        std::lock_guard control(controlMutex_);
+        {
+            std::lock_guard lock(innerMutex_);
+            if (pumpMode_) {
+                softwareBuffer_->Stop();
+                pumpStarted_ = false;
+                result = S_OK;
+            }
+            else if (inner_) result = inner_->Stop();
         }
-        else if (inner_) result = inner_->Stop();
+        if (pumpMode_) StopPumpThread();
     }
-    if (pumpMode_) StopPumpThread();
     if (callbacks_.onStop) callbacks_.onStop(callbacks_.context, this, result);
     Trace(L"Stop", result);
     return result;
@@ -593,10 +583,10 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Stop() {
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Reset() {
     HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
     {
+        std::lock_guard control(controlMutex_);
         std::lock_guard lock(innerMutex_);
         if (pumpMode_) {
-            pumpStarted_ = false;
-            result = S_OK;
+            result = softwareBuffer_->Reset();
         }
         else if (inner_) result = inner_->Reset();
     }
@@ -644,7 +634,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetService(REFIID iid, void** 
             softwareRender = true;
         } else if (pumpMode_ && iid == __uuidof(IAudioClock)) {
             if (!pumpClock_ && pumpSampleRate_ != 0) {
-                pumpClock_ = new (std::nothrow) PumpAudioClock(pumpSampleRate_);
+                pumpClock_ = new (std::nothrow) PumpAudioClock(softwareBuffer_);
             }
             if (pumpClock_) {
                 pumpClock_->AddRef();
@@ -692,7 +682,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetService(REFIID iid, void** 
     }
     if (softwareRender) {
         auto* proxy = new (std::nothrow) NativeRenderGateProxy(
-            nullptr, callbacks_, this, blockAlign_.load(std::memory_order_acquire), renderState_);
+            nullptr, callbacks_, this, blockAlign_.load(std::memory_order_acquire), renderState_, softwareBuffer_);
         if (!proxy) {
             TraceService(iid, E_OUTOFMEMORY);
             Trace(serviceName, E_OUTOFMEMORY);
@@ -820,6 +810,7 @@ void NativeAudioClientProxy::TraceService(REFIID iid, HRESULT result) noexcept {
 }
 
 NativeAudioClientProxy::~NativeAudioClientProxy() {
+    if (softwareBuffer_) softwareBuffer_->Stop();
     StopPumpThread();
     IAudioClient* inner{};
     {
@@ -854,15 +845,7 @@ DWORD WINAPI NativeAudioClientProxy::PumpThreadThunk(void* context) noexcept {
     if (!mmcss) mmcss = AvSetMmThreadCharacteristicsW(L"Audio", &mmcssIndex);
     if (mmcss) (void)AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_CRITICAL);
 
-    HANDLE timer = CreateWaitableTimerExW(
-        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-        TIMER_MODIFY_STATE | SYNCHRONIZE);
-    if (!timer) timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
-    if (!timer) {
-        WaitForSingleObject(stop, INFINITE);
-        if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
-        return 0;
-    }
+    const HANDLE timer = self->pumpTimer_;
 
     const HANDLE waitHandles[] = {stop, timer};
     for (;;) {
@@ -878,27 +861,42 @@ DWORD WINAPI NativeAudioClientProxy::PumpThreadThunk(void* context) noexcept {
             ARRAYSIZE(waitHandles), waitHandles, FALSE, INFINITE);
         if (waitResult == WAIT_OBJECT_0) break;
         if (waitResult != WAIT_OBJECT_0 + 1) break;
+        self->softwareBuffer_->Tick();
         const auto eventHandle = self->pumpEvent_.load(std::memory_order_acquire);
         if (eventHandle) SetEvent(eventHandle);
     }
 
     CancelWaitableTimer(timer);
-    CloseHandle(timer);
     if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
     return 0;
 }
 
-void NativeAudioClientProxy::StartPumpThread() noexcept {
+HRESULT NativeAudioClientProxy::StartPumpThread() noexcept {
     std::lock_guard lock(innerMutex_);
-    if (!pumpMode_ || pumpThread_ || !pumpEvent_.load(std::memory_order_acquire)) return;
+    if (!pumpMode_ || pumpThread_) return S_OK;
+    if (pumpEventDriven_ && !pumpEvent_.load(std::memory_order_acquire)) return AUDCLNT_E_EVENTHANDLE_NOT_SET;
     pumpStopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!pumpStopEvent_) return;
+    if (!pumpStopEvent_) return HRESULT_FROM_WIN32(GetLastError());
+    pumpTimer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                      TIMER_MODIFY_STATE | SYNCHRONIZE);
+    if (!pumpTimer_) pumpTimer_ = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+    if (!pumpTimer_) {
+        const auto error = HRESULT_FROM_WIN32(GetLastError());
+        CloseHandle(pumpStopEvent_);
+        pumpStopEvent_ = nullptr;
+        return error;
+    }
     pumpThread_ = CreateThread(nullptr, 0, &NativeAudioClientProxy::PumpThreadThunk,
                                this, 0, nullptr);
     if (!pumpThread_) {
+        const auto error = HRESULT_FROM_WIN32(GetLastError());
+        CloseHandle(pumpTimer_);
+        pumpTimer_ = nullptr;
         CloseHandle(pumpStopEvent_);
         pumpStopEvent_ = nullptr;
+        return error;
     }
+    return S_OK;
 }
 
 void NativeAudioClientProxy::StopPumpThread() noexcept {
@@ -918,6 +916,7 @@ void NativeAudioClientProxy::StopPumpThread() noexcept {
     }
     if (thread) CloseHandle(thread);
     if (stop) CloseHandle(stop);
+    if (pumpTimer_) { CloseHandle(pumpTimer_); pumpTimer_ = nullptr; }
 }
 
 HRESULT NativeAudioClientProxy::PrepareForExclusiveHandoff() noexcept {

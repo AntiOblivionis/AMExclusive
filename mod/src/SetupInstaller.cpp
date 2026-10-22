@@ -48,6 +48,9 @@ struct ProcessResult {
     DWORD exitCode = 1;
     std::string output;
     bool started = false;
+    bool completed = false;
+
+    bool Succeeded() const noexcept { return started && completed && exitCode == 0; }
 };
 
 void ConfigureConsole() {
@@ -408,6 +411,9 @@ std::wstring StatusText(Operation operation, std::string_view token) {
     if (token == "restart_apple_music") {
         return Localized(L"正在按原状态重新启动 Apple Music", L"Restoring the previous Apple Music running state");
     }
+    if (token == "verify_result") {
+        return Localized(L"正在核验安装文件与注册信息", L"Verifying installed files and registrations");
+    }
     if (token == "complete") {
         return operation == Operation::Install
                    ? Localized(L"安装/升级完成", L"Installation/upgrade complete")
@@ -430,7 +436,8 @@ void RenderProgress(Operation operation, int percent, std::string_view token) {
 
 bool TryParseProgress(const std::string& line,
                       Operation operation,
-                      bool& parsed) {
+                      bool& parsed,
+                      bool& completed) {
     constexpr std::string_view prefix = "AMMOD_PROGRESS|";
     if (!line.starts_with(prefix)) {
         parsed = false;
@@ -446,12 +453,19 @@ bool TryParseProgress(const std::string& line,
     }
     int percent = 0;
     try {
-        percent = std::stoi(line.substr(percentStart, separator - percentStart));
+        const auto number = line.substr(percentStart, separator - percentStart);
+        if (number.find_first_not_of("0123456789") != std::string::npos) throw 0;
+        percent = std::stoi(number);
+        if (percent < 0 || percent > 100) throw 0;
     } catch (...) {
         parsed = true;
         return false;
     }
-    RenderProgress(operation, percent, line.substr(separator + 1));
+    const auto token = line.substr(separator + 1);
+    // Do not show success before the script has both verified the operation
+    // and exited successfully. A progress line alone is not a completion.
+    if (percent == 100 && token == "complete") completed = true;
+    else RenderProgress(operation, std::min(percent, 99), token == "complete" ? "verify_result" : token);
     parsed = true;
     return true;
 }
@@ -459,7 +473,8 @@ bool TryParseProgress(const std::string& line,
 void ConsumeOutput(const std::string& chunk,
                    Operation operation,
                    std::string& pending,
-                   std::string& nonProtocolOutput) {
+                   std::string& nonProtocolOutput,
+                   bool& completed) {
     pending += chunk;
     while (true) {
         const size_t newline = pending.find('\n');
@@ -472,7 +487,7 @@ void ConsumeOutput(const std::string& chunk,
             line.pop_back();
         }
         bool parsed = false;
-        if (!TryParseProgress(line, operation, parsed) || !parsed) {
+        if (!TryParseProgress(line, operation, parsed, completed) || !parsed) {
             nonProtocolOutput += line;
             nonProtocolOutput += '\n';
         }
@@ -494,7 +509,13 @@ ProcessResult RunPowerShell(Operation operation, const fs::path& directory) {
             error);
         return result;
     }
-    SetHandleInformation(readHandle, HANDLE_FLAG_INHERIT, 0);
+    if (!SetHandleInformation(readHandle, HANDLE_FLAG_INHERIT, 0)) {
+        result.output = EncodeUtf8(Localized(L"无法配置 PowerShell 输出管道。",
+                                             L"Unable to configure PowerShell output pipe."));
+        CloseHandle(readHandle);
+        CloseHandle(writeHandle);
+        return result;
+    }
 
     const fs::path script = directory /
         (operation == Operation::Install ? L"Install-Mod.ps1" : L"Uninstall-Mod.ps1");
@@ -505,6 +526,7 @@ ProcessResult RunPowerShell(Operation operation, const fs::path& directory) {
         command += L" -SourceDirectory " + QuoteArgument(directory.wstring());
     }
     command += L" -EmitProgress";
+    command += UseChineseUi() ? L" -Language zh-CN" : L" -Language en-US";
     std::vector<wchar_t> commandLine(command.begin(), command.end());
     commandLine.push_back(L'\0');
 
@@ -535,25 +557,39 @@ ProcessResult RunPowerShell(Operation operation, const fs::path& directory) {
     result.started = true;
 
     std::string pending;
+    bool outputOk = true;
     char buffer[4096];
     while (true) {
         DWORD bytesRead = 0;
         const BOOL read = ReadFile(readHandle, buffer, sizeof(buffer), &bytesRead, nullptr);
         if (!read || bytesRead == 0) {
+            if (!read && GetLastError() != ERROR_BROKEN_PIPE) outputOk = false;
             break;
         }
-        ConsumeOutput(std::string(buffer, bytesRead), operation, pending, result.output);
+        ConsumeOutput(std::string(buffer, bytesRead), operation, pending, result.output, result.completed);
     }
     CloseHandle(readHandle);
     if (!pending.empty()) {
         bool parsed = false;
-        if (!TryParseProgress(pending, operation, parsed) || !parsed) {
+        if (!pending.empty() && pending.back() == '\r') pending.pop_back();
+        if (!TryParseProgress(pending, operation, parsed, result.completed) || !parsed) {
             result.output += pending;
         }
     }
 
-    WaitForSingleObject(processInfo.hProcess, INFINITE);
-    GetExitCodeProcess(processInfo.hProcess, &result.exitCode);
+    const auto waited = WaitForSingleObject(processInfo.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    if (waited == WAIT_OBJECT_0 && GetExitCodeProcess(processInfo.hProcess, &exitCode) && outputOk) {
+        result.exitCode = exitCode;
+    } else {
+        result.output += EncodeUtf8(Localized(L"\n无法确认 PowerShell 进程已正常结束。\n",
+                                              L"\nUnable to verify PowerShell process completion.\n"));
+    }
+    if (!result.completed) {
+        result.output += EncodeUtf8(Localized(L"\n脚本未报告操作已通过验证并完成。\n",
+                                              L"\nScript did not report verified completion.\n"));
+        if (result.exitCode == 0) result.exitCode = ERROR_INVALID_DATA;
+    }
     CloseHandle(processInfo.hThread);
     CloseHandle(processInfo.hProcess);
     return result;
@@ -623,7 +659,7 @@ int RunOperation(Operation operation) {
     RenderProgress(operation, 10, "launch_script");
     const ProcessResult result = RunPowerShell(operation, directory);
     RemoveTempDirectory(directory);
-    if (result.exitCode == 0) {
+    if (result.Succeeded()) {
         RenderProgress(operation, 100, "complete");
         std::wcout << L"\n"
                    << (operation == Operation::Install

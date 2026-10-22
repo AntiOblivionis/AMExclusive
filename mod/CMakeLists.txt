@@ -54,6 +54,7 @@ add_library(am_exclusive_hook SHARED
   src/audio_v2/AudioCoreCoordinator.cpp
   src/audio_v2/AudioCoreRuntime.cpp
   src/audio_v2/NativeRenderGateProxy.cpp
+  src/audio_v2/ResampledPcmSource.cpp
   src/audio_v2/WasapiExclusiveSink.cpp)
 target_include_directories(am_exclusive_hook PRIVATE
   src "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/rigtorp-SPSCQueue/include")
@@ -150,3 +151,21 @@ install(TARGETS
   RUNTIME DESTINATION .
   LIBRARY DESTINATION .)
 install(FILES config/am-exclusive.ini DESTINATION .)
+
+# Use the declared project version for every PE, including the self-contained
+# installer. VERSIONINFO identifies the files; it is not a digital signature.
+function(am_add_version_info target filename description description_zh filetype)
+  set(AM_INTERNAL_NAME "${target}")
+  set(AM_FILE_NAME "${filename}")
+  set(AM_FILE_DESCRIPTION "${description}")
+  set(AM_FILE_DESCRIPTION_ZH "${description_zh}")
+  set(AM_FILE_TYPE "${filetype}")
+  set(resource "${CMAKE_CURRENT_BINARY_DIR}/generated/version/${target}.rc")
+  configure_file(src/VersionInfo.rc.in "${resource}" @ONLY)
+  target_sources(${target} PRIVATE "${resource}")
+endfunction()
+am_add_version_info(am_exclusive_hook "am-exclusive-hook.dll" "AMExclusive audio hook" "AMExclusive 音频模块" VFT_DLL)
+am_add_version_info(am_exclusive_ui "am-exclusive-ui.dll" "AMExclusive user interface" "AMExclusive 用户界面" VFT_DLL)
+am_add_version_info(am_exclusive_media_control "am_exclusive_media_control.exe" "AMExclusive media session control" "AMExclusive 媒体会话控制" VFT_APP)
+am_add_version_info(am_exclusive_broker "am-exclusive-broker.exe" "AMExclusive Apple Music companion" "AMExclusive Apple Music 伴生程序" VFT_APP)
+am_add_version_info(am_exclusive_setup "AMExclusive-Setup.exe" "AMExclusive installer" "AMExclusive 安装程序" VFT_APP)

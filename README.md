@@ -33,6 +33,12 @@ This project has only been validated with the development and test versions list
 3. **Bit-perfect output**  
    Preserves the source sample format through the supported playback path and submits integer PCM directly to WASAPI, allowing bit-perfect playback when the source, device, and supported output format match.
 
+4. **Optional sample-rate and bit-depth conversion for device compatibility**
+
+   The optional compatibility switch first tries lossless output at the original rate, then permits up/downsampling, bit-depth conversion and float32 output while retaining WASAPI exclusive output and the existing quality lock. For example, both 44.1 kHz/24-bit and 96 kHz/24-bit sources can use a 48 kHz/16-bit-only endpoint. Each output format must pass the driver's exclusive support check and initialization; shared-mode output is never a fallback. The probe includes common integer containers, float32, alternate WAVEFORMATEX/EXTENSIBLE declarations and the device's mix rate as a candidate only.
+
+   Among rates at or above 44.1 kHz (or the source rate if lower), source precision is preferred, then float32/24-bit, then 16-bit. Within each precision group, try the original rate, the nearest higher rates, then descending lower rates. Lower-bandwidth outputs are the last resort. Upsampling uses a band-limited interpolation filter to suppress spectral images; downsampling suppresses aliasing. Depth reduction uses TPDF dither and saturating rounding. Compatibility mode also accepts local int32 audio through Apple's decoded float32 stream without claiming original int32 bit-perfect recovery. Converted output is labelled explicitly. With the switch off, the existing lossless format policy and PCM path are unchanged.
+
 ## Recommended Settings
 
 In Apple Music, open **Settings > Playback** and use the following settings:
@@ -45,6 +51,7 @@ In Apple Music, open **Settings > Playback** and use the following settings:
 - Turn **Dolby Atmos** off.
 - Turn **Exclusive Mode** on.
 - Enter an integer from `1` through `100` milliseconds in **Hardware buffer** field and select **Apply**. The setting is used when exclusive output opens for the next song. The default is `20` ms; try a higher value if encountering playback problems.
+- Enable **Allow compatible format conversion for unsupported formats** if your device cannot play the original format. The setting applies when the next song opens.
 - Turn **Spatial sound** off.
 
 With a separate DAC and amplifier, keep the Apple Music app volume, Windows output volume, and DAC output volume at maximum, and adjust listening volume only on the amplifier. With an integrated DAC/amp, keep the Apple Music app volume and Windows output volume at maximum, and adjust listening volume using the DAC/amp hardware control. Before applying these settings for the first time, lower the amplifier or DAC/amp hardware volume to avoid an unexpectedly high sound level.
