@@ -111,6 +111,7 @@ private:
     void RecordError(HRESULT error) noexcept;
     void NotifyLifecycle(WasapiSinkLifecycleEvent event, HRESULT result) noexcept;
     void ReleaseInterfaces() noexcept;
+    void ReleaseComInitialization() noexcept;
 
     WasapiSinkConfig config_{};
     WAVEFORMATEXTENSIBLE waveFormat_{};
@@ -127,6 +128,8 @@ private:
     std::uint64_t drainWaitStartedTick_{};
     bool drainPositionValid_{};
     bool pausedWithBuffer_{};
+    // Bounded wait for the Running render loop; see Open().
+    DWORD renderWatchdogMs_{1000};
 
     HANDLE shutdownEvent_{};
     HANDLE audioEvent_{};
@@ -138,7 +141,10 @@ private:
     std::atomic<bool> endOfStreamComplete_{};
     IIntegerPcmSource* source_{};
     std::uint32_t bufferFrames_{};
+    // COM initialization is per thread. Open() records the thread that owes
+    // the matching CoUninitialize so Close() never balances it on another one.
     bool comInitialized_{};
+    DWORD comThreadId_{};
 
     std::atomic<WasapiSinkState> state_{WasapiSinkState::Closed};
     std::atomic<std::uint64_t> submittedFrames_{};

@@ -364,6 +364,18 @@ bool PromoteV2LocalQueue(void* converter);
 // false restores the historical clone/Mod-owned Fill handoff below.
 constexpr bool kNativeAcquisitionPassthrough = true;
 
+// Threads that may be inside MinHook (hook installation). DLL_PROCESS_DETACH
+// restores the patched prologues only when none is active: MinHook's spin
+// lock would otherwise wait forever for a thread that ExitProcess has already
+// terminated inside a MinHook call.
+std::atomic<int> g_hookInstallersActive{};
+struct HookInstallerScope final {
+    HookInstallerScope() noexcept { g_hookInstallersActive.fetch_add(1, std::memory_order_acq_rel); }
+    ~HookInstallerScope() { g_hookInstallersActive.fetch_sub(1, std::memory_order_acq_rel); }
+    HookInstallerScope(const HookInstallerScope&) = delete;
+    HookInstallerScope& operator=(const HookInstallerScope&) = delete;
+};
+
 // The native graph owns the decoder, but it does not own the only legal way
 // to pull it. Once a native Fill call has exposed Apple's real input callback
 // and user-data pair, this worker can repeat the exact
@@ -1234,6 +1246,7 @@ std::wstring DeviceId(IMMDevice* device) {
 
 template<typename Fn>
 bool HookAddress(void* target, void* detour, Fn& original, const wchar_t* label) {
+    HookInstallerScope installer;
     std::lock_guard lock(g_hookMutex);
     if (original) return true;
     void* trampoline{};
@@ -1559,7 +1572,14 @@ bool InstallQualityLockHooks() {
         g_figAlternateAllowableMediaSubtypeFilterCreate;
     if (!metadataReady) return false;
 
-    const bool highestLossless = ammod::quality::Install(coreMedia, coreFoundation, Log);
+    bool highestLossless = false;
+    {
+        // Only the MinHook calls themselves count as "installer active"; the
+        // retry loops around this function sleep most of the time and must
+        // not keep the process-exit unhook gate closed.
+        HookInstallerScope installer;
+        highestLossless = ammod::quality::Install(coreMedia, coreFoundation, Log);
+    }
     if (!highestLossless) {
         Log(L"Highest ALAC quality filter unavailable; quality hooks remain disabled");
         return false;
@@ -1597,6 +1617,13 @@ DWORD WINAPI QualityLockHookLoop(void*) {
     // UI/Broker intent belongs only to the removed audio-core path.
     while (!InstallQualityLockHooks()) {
         ammod::quality::SetEnabled(false);
+        if (ammod::quality::Unavailable()) {
+            // The loaded CoreMedia image is not the verified build; the raw-RVA
+            // quality hook must never be written into it. Leave the policy off
+            // for the life of this process instead of retrying forever.
+            Log(L"Quality lock permanently disabled for this process: unverified CoreMedia build");
+            return 0;
+        }
         Sleep(250);
     }
     ammod::quality::SetEnabled(true);
@@ -3409,6 +3436,7 @@ bool InstallAudioCoreV2Hooks() {
 }
 
 DWORD WINAPI AudioCoreV2HookLoop(void*) {
+    // HookAddress carries its own HookInstallerScope around each MinHook call.
     while (!InstallAudioCoreV2Hooks()) Sleep(250);
     return 0;
 }
@@ -3462,6 +3490,10 @@ DWORD WINAPI PipeClientLoop(void*) {
             if (!WriteMessage(pipe, hello)) g_ipcConnected.store(false);
         }
         Log(L"broker IPC connected");
+        // See UiAdapter: broker status broadcasts are not ordered across
+        // threads; drop anything older than the latest generation seen on this
+        // connection.
+        std::uint64_t lastStatusGeneration = 0;
 
         Message incoming{};
         while (g_ipcConnected.load()) {
@@ -3486,6 +3518,13 @@ DWORD WINAPI PipeClientLoop(void*) {
                 break;
             }
             if (incoming.type == MessageType::StatusChanged) {
+                if (incoming.generation < lastStatusGeneration) {
+                    Log(L"ignored stale broker status generation=" +
+                        std::to_wstring(incoming.generation) + L" latest=" +
+                        std::to_wstring(lastStatusGeneration));
+                    continue;
+                }
+                lastStatusGeneration = incoming.generation;
                 const bool enabled = incoming.enabledIntent != 0;
                 const auto hardwareBufferMs = incoming.hardwareBufferMs
                     ? incoming.hardwareBufferMs : 20u;
@@ -3545,6 +3584,7 @@ DWORD WINAPI PipeClientLoop(void*) {
 }
 
 DWORD WINAPI InitializeHooks(void*) {
+    HookInstallerScope installer;
     wchar_t modulePath[MAX_PATH]{};
     GetModuleFileNameW(g_module, modulePath, static_cast<DWORD>(std::size(modulePath)));
     const auto directory = std::filesystem::path(modulePath).parent_path();
@@ -3602,11 +3642,24 @@ DWORD WINAPI InitializeHooks(void*) {
 
 } // namespace
 
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_module = instance;
         DisableThreadLibraryCalls(instance);
         if (HANDLE thread = CreateThread(nullptr, 0, InitializeHooks, nullptr, 0, nullptr)) CloseHandle(thread);
+    } else if (reason == DLL_PROCESS_DETACH) {
+        // The detours must not outlive this image's globals. This runs before
+        // the CRT destroys them (static /MT runs _cexit on detach): restore
+        // every patched prologue so a late AudioConverter/CoreMedia call from
+        // Apple's own teardown lands in Apple code, not in a detour that logs
+        // through a destroyed mutex. At process exit (reserved != nullptr) the
+        // other threads are already gone, so nothing is executing a detour and
+        // the runtime must not wait for a worker or a mutex that will never be
+        // released.
+        if (reserved) g_audioCoreRuntime.AbandonForProcessExit();
+        if (g_hookInstallersActive.load(std::memory_order_acquire) == 0) {
+            (void)MH_DisableHook(MH_ALL_HOOKS);
+        }
     }
     return TRUE;
 }

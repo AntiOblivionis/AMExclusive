@@ -35,14 +35,19 @@ bool IsCandidateEncodedFormat(std::uint32_t formatId) noexcept {
 } // namespace
 
 AudioCoreRuntime::AudioCoreRuntime() noexcept
-    : tap_(coordinator_) {}
+    : tap_(coordinator_) {
+    try {
+        pendingEvents_.reserve(64);
+    } catch (...) {
+    }
+}
 
 AudioCoreRuntime::~AudioCoreRuntime() {
     Stop();
 }
 
 bool AudioCoreRuntime::Start(const AudioCoreRuntimeCallbacks& callbacks) noexcept {
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     if (running_.load(std::memory_order_acquire)) return true;
     callbacks_ = callbacks;
     rawFillCalls_.store(0, std::memory_order_release);
@@ -100,7 +105,14 @@ bool AudioCoreRuntime::Start(const AudioCoreRuntimeCallbacks& callbacks) noexcep
     return true;
 }
 
+void AudioCoreRuntime::AbandonForProcessExit() noexcept {
+    abandoned_.store(true, std::memory_order_release);
+    workerStop_.store(true, std::memory_order_release);
+    uiEnabled_.store(false, std::memory_order_release);
+}
+
 void AudioCoreRuntime::Stop() noexcept {
+    if (abandoned_.load(std::memory_order_acquire)) return;
     workerStop_.store(true, std::memory_order_release);
     if (wakeEvent_) SetEvent(wakeEvent_);
     if (workerThread_) {
@@ -108,18 +120,22 @@ void AudioCoreRuntime::Stop() noexcept {
         CloseHandle(workerThread_);
         workerThread_ = nullptr;
     }
-    std::lock_guard lock(controlMutex_);
-    uiEnabled_.store(false, std::memory_order_release);
-    RetireCaptureLocked(false);
-    registry_.RetireAll();
-    nativeClient_.store(nullptr, std::memory_order_release);
-    nativeHandoffPending_.store(false, std::memory_order_release);
-    nativeGraphHandoffPending_.store(false, std::memory_order_release);
-    if (wakeEvent_) {
-        CloseHandle(wakeEvent_);
-        wakeEvent_ = nullptr;
+    {
+        ControlScope lock(*this);
+        uiEnabled_.store(false, std::memory_order_release);
+        RetireCaptureLocked(false);
+        registry_.RetireAll();
+        nativeClient_.store(nullptr, std::memory_order_release);
+        nativeHandoffPending_.store(false, std::memory_order_release);
+        nativeGraphHandoffPending_.store(false, std::memory_order_release);
+        if (wakeEvent_) {
+            CloseHandle(wakeEvent_);
+            wakeEvent_ = nullptr;
+        }
+        running_.store(false, std::memory_order_release);
     }
-    running_.store(false, std::memory_order_release);
+    // The worker is gone; deliver whatever it did not get to.
+    FlushPendingEvents();
 }
 
 void AudioCoreRuntime::SetUiEnabled(bool enabled) noexcept {
@@ -132,7 +148,7 @@ void AudioCoreRuntime::SetUiEnabled(bool enabled) noexcept {
     // The UI boundary invalidates capture before the coordinator clears its
     // queue. The short wait is on the control/pipe thread; the Apple callback
     // itself never waits for this path.
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     // The Agent receives an initial broker snapshot after connecting.  That
     // snapshot can already be Off while the runtime is still at its default
     // state.  Do not emit a synthetic Disabled event for that no-op path:
@@ -194,7 +210,7 @@ void AudioCoreRuntime::SetAllowResampling(bool enabled) noexcept {
 
 void AudioCoreRuntime::OnTransportPlayPause() noexcept {
     if (!UiEnabled()) return;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     if (coordinator_.Phase() == AudioCoreGatePhase::Active &&
         coordinator_.SinkState() == WasapiSinkState::Running) {
         userPauseIntent_ = true;
@@ -233,7 +249,7 @@ void AudioCoreRuntime::OnTransportSkip(std::uint64_t epoch) noexcept {
     if (directSelection) {
         directSelectionSkipEpoch_.store(epoch, std::memory_order_release);
     }
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     if (transportSkip) {
         const auto armedGeneration =
             transportSkipArmGeneration_.load(std::memory_order_acquire);
@@ -275,7 +291,7 @@ void AudioCoreRuntime::OnTransportSkip(std::uint64_t epoch) noexcept {
 void AudioCoreRuntime::OnTransportSeekBegin(std::uint64_t epoch) noexcept {
     if (!UiEnabled() || epoch == 0) return;
     streamingEofCandidateConverter_.store(nullptr, std::memory_order_release);
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     if (epoch < latestSeekEpoch_) return;
     latestSeekEpoch_ = epoch;
     seekFence_ = true;
@@ -290,7 +306,7 @@ void AudioCoreRuntime::OnTransportSeekBegin(std::uint64_t epoch) noexcept {
 
 void AudioCoreRuntime::OnTransportSeekCommit(std::uint64_t epoch) noexcept {
     if (!UiEnabled() || epoch == 0) return;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     if (epoch != latestSeekEpoch_) return;
     // Drop any transient generation accumulated during the drag, then require
     // a genuinely quiet control-plane window before endpoint activation. Any
@@ -368,7 +384,7 @@ void AudioCoreRuntime::OnConverterCreated(void* converter,
     registration.appleChannelsPerFrame = capturedAppleFormat.channelsPerFrame;
     // Serialize registration/refresh with pending handoff validation. Dispose
     // invalidates the request before a reused address can be registered again.
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     if (!UiEnabled() || !registry_.Register(registration)) return;
     if (pendingGraphBind_.converter == converter) {
         pendingGraphBind_.observationId = observationId;
@@ -422,7 +438,7 @@ void AudioCoreRuntime::OnConverterSourcePrecision(void* converter,
     } else {
         matchedConverter = converter;
     }
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     if (!graphConverter_ && graphUnit_ && graphRate_ == sampleRate &&
         graphChannels_ == channels) {
         void* candidate = matchedConverter;
@@ -440,7 +456,7 @@ void AudioCoreRuntime::OnConverterSourcePrecision(void* converter,
 void AudioCoreRuntime::OnConverterReset(void* converter, bool forceTimelineRetire) noexcept {
     if (!UiEnabled()) return;
     registry_.Reset(converter);
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     const bool bound = boundConverter_.load(std::memory_order_acquire) == converter;
     if (forceTimelineRetire) {
         // Ordinary local-file seeking has a version-locked Reset fingerprint.
@@ -517,7 +533,7 @@ bool AudioCoreRuntime::OnLocalEndOfStream(void* converter) noexcept {
         }
     }
 
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     if (selectionArmLive &&
         directSelectionSkipEpoch_.load(std::memory_order_acquire) == armedEpoch) {
         return false;
@@ -549,7 +565,7 @@ bool AudioCoreRuntime::OnLocalEndOfStream(void* converter) noexcept {
 
 void AudioCoreRuntime::SetPendingLocalSuccessor(void* converter) noexcept {
     if (!UiEnabled() || !converter) return;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     pendingLocalSuccessor_ = converter;
     Wake();
 }
@@ -563,7 +579,7 @@ void AudioCoreRuntime::RequestLocalSuccessorBind(void* converter) noexcept {
 
 void AudioCoreRuntime::OnConverterDisposed(void* converter) noexcept {
     if (!UiEnabled() || !converter) return;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     registry_.Retire(converter);
     // A prefetched successor can itself be disposed before becoming bound.
     // Cancel it even in that case, before this address can be reused.
@@ -571,7 +587,7 @@ void AudioCoreRuntime::OnConverterDisposed(void* converter) noexcept {
     if (graphConverter_ == converter) graphConverter_ = nullptr;
     if (boundConverter_.load(std::memory_order_acquire) == converter) {
         // A sealed generation retains its mapped terminal tail until the sink
-        // reports completion (including device-clock drain for actual SRC).
+        // reports completion (the device-clock drain applies to every output format).
         if (!endOfStreamDrainPending_ || endOfStreamDrainConverter_ != converter) {
             RetireCompletedCaptureLocked(converter);
         }
@@ -581,7 +597,7 @@ void AudioCoreRuntime::OnConverterDisposed(void* converter) noexcept {
 
 bool AudioCoreRuntime::TryBindLocalSuccessor(void* converter) noexcept {
     if (!UiEnabled() || !converter) return false;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     ConverterRegistrationSnapshot snapshot{};
     if (!registry_.Snapshot(converter, snapshot) ||
         snapshot.registration.encodedFormat != kAppleLinearPcm ||
@@ -606,7 +622,7 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
                                                std::uint32_t sourceBitDepth,
                                                std::uint64_t observationId) noexcept {
     if (!UiEnabled() || !unit) return;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     ExtendSeekQuietPeriodLocked();
     if (!candidateConverter && sampleRate != 0 && channels != 0 && sourceBitDepth != 0) {
         // AudioUnitInitialize commonly runs on a render/control thread
@@ -647,7 +663,7 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
 
 void AudioCoreRuntime::OnAudioUnitStarted(void* unit) noexcept {
     if (!UiEnabled()) return;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     ExtendSeekQuietPeriodLocked();
     graphPaused_ = false;
     graphControlPending_ = false;
@@ -671,7 +687,7 @@ void AudioCoreRuntime::OnAudioUnitStarted(void* unit) noexcept {
 void AudioCoreRuntime::OnAudioUnitStopped(void* unit) noexcept {
     if (!UiEnabled()) return;
     if (nativeGraphHandoffPending_.load(std::memory_order_acquire)) return;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     // A late Stop from an older graph must not arm a drain on the successor.
     if (graphUnit_ != unit && graphOutputUnit_ != unit) return;
     ExtendSeekQuietPeriodLocked();
@@ -716,7 +732,7 @@ void AudioCoreRuntime::OnAudioUnitStopped(void* unit) noexcept {
 
 void AudioCoreRuntime::OnAudioUnitUninitialized(void* unit) noexcept {
     if (!UiEnabled()) return;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     ExtendSeekQuietPeriodLocked();
     if (graphUnit_ != unit) return;
     pendingGraphBind_ = {};
@@ -740,7 +756,7 @@ void AudioCoreRuntime::OnNativeClientInitialized(void* client, const wchar_t* en
                                                   AUDCLNT_SHAREMODE, DWORD,
                                                   const WAVEFORMATEX*, HRESULT result) noexcept {
     if (!UiEnabled() || FAILED(result) || !client) return;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     ExtendSeekQuietPeriodLocked();
     nativeClient_.store(client, std::memory_order_release);
     nativeInitialized_ = true;
@@ -751,7 +767,7 @@ void AudioCoreRuntime::OnNativeClientInitialized(void* client, const wchar_t* en
 
 void AudioCoreRuntime::OnNativeClientStarted(void* client, HRESULT result) noexcept {
     if (!UiEnabled() || FAILED(result) || !client) return;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     ExtendSeekQuietPeriodLocked();
     nativeClient_.store(client, std::memory_order_release);
     nativeInitialized_ = true;
@@ -767,7 +783,7 @@ bool AudioCoreRuntime::BeforeNativeClientStop(void* client) noexcept {
 
     void* converter{};
     {
-        std::lock_guard lock(controlMutex_);
+        ControlScope lock(*this);
         if (nativeClient_.load(std::memory_order_acquire) != client) return false;
         if (graphControlPending_ || graphPaused_ || userPauseIntent_ || seekFence_ ||
             endOfStreamDrainPending_ || coordinator_.Phase() != AudioCoreGatePhase::Active) {
@@ -804,7 +820,7 @@ bool AudioCoreRuntime::BeforeNativeClientStop(void* client) noexcept {
 void* AudioCoreRuntime::OnNativeClientStopped(void* client, HRESULT result) noexcept {
     if (!UiEnabled() || FAILED(result)) return nullptr;
     if (nativeHandoffPending_.load(std::memory_order_acquire)) return nullptr;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     ExtendSeekQuietPeriodLocked();
     if (nativeClient_.load(std::memory_order_acquire) != client) return nullptr;
     nativeStarted_ = false;
@@ -867,7 +883,7 @@ void* AudioCoreRuntime::OnNativeClientStopped(void* client, HRESULT result) noex
 
 bool AudioCoreRuntime::OnStreamingProducerEndOfStream(void* converter) noexcept {
     if (!UiEnabled() || !converter) return false;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     if (endOfStreamDrainPending_ && endOfStreamDrainConverter_ == converter) {
         streamingProducerDrainPending_ = false;
         streamingProducerDrainConverter_ = nullptr;
@@ -912,7 +928,7 @@ bool AudioCoreRuntime::OnStreamingProducerEndOfStream(void* converter) noexcept 
 void AudioCoreRuntime::OnNativeClientReset(void* client, HRESULT result) noexcept {
     if (!UiEnabled() || FAILED(result)) return;
     if (nativeHandoffPending_.load(std::memory_order_acquire)) return;
-    std::lock_guard lock(controlMutex_);
+    ControlScope lock(*this);
     if (nativeClient_.load(std::memory_order_acquire) != client) return;
     ExtendSeekQuietPeriodLocked();
     Wake();
@@ -1112,12 +1128,14 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
     while (!workerStop_.load(std::memory_order_acquire)) {
         if (wakeEvent_) WaitForSingleObject(wakeEvent_, 50);
         if (workerStop_.load(std::memory_order_acquire)) break;
+        // The only event dispatcher while the worker runs (see Emit).
+        FlushPendingEvents();
         if (!UiEnabled()) {
             // Keep the classifier observable in the control group without
             // activating any v2 graph, queue, sink or native-output gate.
             // The lock also keeps the Stats() snapshot consistent with the
             // control-thread retirement path.
-            std::lock_guard lock(controlMutex_);
+            ControlScope lock(*this);
             if (UiEnabled()) continue;
             const auto now = GetTickCount64();
             if (nextDiagnosticTelemetryTick_ == 0 || now >= nextDiagnosticTelemetryTick_) {
@@ -1127,7 +1145,7 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
             continue;
         }
         {
-            std::lock_guard lock(controlMutex_);
+            ControlScope lock(*this);
             nextDiagnosticTelemetryTick_ = 0;
             if (graphBound_ && coordinator_.SinkState() == WasapiSinkState::Faulted) {
                 HRESULT sinkError = coordinator_.Sink().Stats().lastError;
@@ -1178,12 +1196,84 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
     return 0;
 }
 
-void AudioCoreRuntime::Wake() noexcept {
+void AudioCoreRuntime::Wake() const noexcept {
     if (wakeEvent_) SetEvent(wakeEvent_);
 }
 
+void AudioCoreRuntime::WakeIfEventsPending() const noexcept {
+    bool pending = overflowFaulted_.load(std::memory_order_acquire);
+    if (!pending) {
+        std::lock_guard lock(pendingEventMutex_);
+        pending = !pendingEvents_.empty();
+    }
+    if (pending) Wake();
+}
+
 void AudioCoreRuntime::Emit(AudioCoreRuntimeEvent event, HRESULT result) noexcept {
-    if (callbacks_.onEvent) callbacks_.onEvent(callbacks_.context, event, result);
+    if (!callbacks_.onEvent) return;
+    try {
+        std::lock_guard lock(pendingEventMutex_);
+        pendingEvents_.push_back({event, result});
+    } catch (...) {
+        // Allocation failure (the vector is kept reserved by the flush, so
+        // this is theoretical). Never deliver inline: the caller holds controlMutex_
+        // and may be Apple's decode thread holding the P0 fill lock. Keep a
+        // Faulted event in a fixed slot; anything else is informational.
+        if (event == AudioCoreRuntimeEvent::Faulted) {
+            overflowResult_.store(static_cast<LONG>(result), std::memory_order_release);
+            overflowFaulted_.store(true, std::memory_order_release);
+        }
+    }
+}
+
+void AudioCoreRuntime::FlushPendingEvents() const noexcept {
+    if (!callbacks_.onEvent) return;
+    // Called only from WorkerMain (outside any ControlScope) and from Stop()
+    // after the worker thread is joined. A handler that calls back into the
+    // runtime releases a ControlScope, which only wakes the worker; the loop
+    // below then picks up anything it queued.
+    static thread_local bool dispatching = false;
+    if (dispatching) return;
+    std::lock_guard dispatch(dispatchMutex_);
+    dispatching = true;
+    for (;;) {
+        std::vector<PendingEvent> events;
+        {
+            std::lock_guard lock(pendingEventMutex_);
+            events.swap(pendingEvents_);
+            // The swap moved the reserved capacity into the local vector;
+            // re-reserve here (worker thread, no other lock held) so Emit on
+            // Apple's threads keeps its no-allocation fast path.
+            try {
+                pendingEvents_.reserve(64);
+            } catch (...) {
+            }
+        }
+        if (overflowFaulted_.exchange(false, std::memory_order_acq_rel)) {
+            const PendingEvent overflow{AudioCoreRuntimeEvent::Faulted,
+                static_cast<HRESULT>(overflowResult_.load(std::memory_order_acquire))};
+            try {
+                events.push_back(overflow);
+            } catch (...) {
+                callbacks_.onEvent(callbacks_.context, overflow.event, overflow.result);
+            }
+        }
+        if (events.empty()) break;
+        for (const auto& pending : events) {
+            if (pending.event == AudioCoreRuntimeEvent::Faulted) {
+                // Without controlMutex_: the hook's handler quiesces the P0
+                // puller under the fill lock, which a decode thread may hold
+                // while waiting for controlMutex_.
+                callbacks_.onEvent(callbacks_.context, pending.event, pending.result);
+            } else {
+                // Bound/Active/Telemetry/Disabled read coordinator and sink
+                // state; hold the lock so Disable() cannot tear it under them.
+                std::lock_guard lock(controlMutex_);
+                callbacks_.onEvent(callbacks_.context, pending.event, pending.result);
+            }
+        }
+    }
+    dispatching = false;
 }
 
 AudioCoreRuntimeStats AudioCoreRuntime::Stats() const noexcept {
@@ -1483,7 +1573,7 @@ void AudioCoreRuntime::FinalizeEndOfStreamDrainLocked() noexcept {
     pendingLocalSuccessor_ = nullptr;
 
     // SRC completion requires device-clock drain evidence after terminal
-    // submission. Native-rate output retains its existing submission boundary.
+    // submission; native-rate output now uses the same device-clock drain.
     RetireCompletedCaptureLocked(drainedConverter);
 
     if (localSuccessor) {

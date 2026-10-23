@@ -3,6 +3,7 @@
 #include "IpcTransport.h"
 
 #include <windows.h>
+#include <appmodel.h>
 #include <commctrl.h>
 #include <tlhelp32.h>
 
@@ -10,6 +11,7 @@
 #include <atomic>
 #include <fstream>
 #include <filesystem>
+#include <iterator>
 #include <iostream>
 #include <iomanip>
 #include <mutex>
@@ -174,13 +176,13 @@ bool ClearPlayerLoad() {
 }
 
 void ShowErrorDialogAsync(ErrorCategory error, HRESULT result,
-                          std::uint64_t generation) {
+                          std::uint64_t generation, bool clearPlayerLoad = true) {
     if (error == ErrorCategory::None) error = ErrorCategory::Internal;
     const auto signature = (generation << 16u) ^ static_cast<std::uint64_t>(error);
     if (signature != 0 && g_lastErrorDialogSignature.exchange(signature) == signature) {
         return;
     }
-    std::thread([error, result] {
+    std::thread([error, result, clearPlayerLoad] {
         // Let a normal Apple Music shutdown remove its window before deciding
         // whether a disconnected Agent represents a user-visible failure.
         Sleep(250);
@@ -194,7 +196,11 @@ void ShowErrorDialogAsync(ErrorCategory error, HRESULT result,
             if (previousDpi) SetThreadDpiAwarenessContext(previousDpi);
             return;
         }
-        const bool loadClearLaunched = ClearPlayerLoad();
+        // A playback fault clears the current item so Apple does not keep
+        // rendering into a dead endpoint. A component failure (missing or
+        // quarantined hook DLL) has nothing to clear: audio is already on the
+        // normal shared path.
+        const bool loadClearLaunched = clearPlayerLoad && ClearPlayerLoad();
         Log(L"error cleanup clear-player-load launched=" +
             std::to_wstring(loadClearLaunched));
         const wchar_t* reason{};
@@ -245,6 +251,11 @@ void ShowErrorDialogAsync(ErrorCategory error, HRESULT result,
                              : L"The exclusive device started, but Apple Music stopped submitting audio.";
             break;
         case ErrorCategory::HookLoadFailed:
+            reason = L"The exclusive audio component (am-exclusive-hook.dll) is missing or "
+                     L"could not be loaded into Apple Music. Check antivirus quarantine, "
+                     L"then run AMExclusive-Setup.exe again. Audio continues on the normal "
+                     L"shared output until then.";
+            break;
         case ErrorCategory::PipeUnavailable:
         case ErrorCategory::BrokerUnavailable:
         case ErrorCategory::AgentNotFound:
@@ -270,7 +281,7 @@ void ShowErrorDialogAsync(ErrorCategory error, HRESULT result,
                  << static_cast<std::uint32_t>(result);
             text += code.str();
         }
-        text += loadClearLaunched
+        if (clearPlayerLoad) text += loadClearLaunched
             ? (chinese ? L"\n\n已清空当前播放；独占模式保持开启。"
                        : L"\n\nThe current load was cleared; Exclusive mode remains enabled.")
             : (chinese ? L"\n\n无法清空当前播放；独占模式仍保持开启。"
@@ -363,12 +374,70 @@ std::filesystem::path ProcessImagePath(DWORD pid) {
     return path;
 }
 
+// The installed Apple Music MSIX package directory is
+// <...>\WindowsApps\AppleInc.AppleMusicWin_<version>_x64__nzyj5cx40ttqa. The
+// publisher token is the same one the companion task trigger keys on.
+constexpr wchar_t kApplePackageDirectoryPrefix[] = L"AppleInc.AppleMusicWin_";
+constexpr wchar_t kApplePackageDirectorySuffix[] = L"__nzyj5cx40ttqa";
+constexpr wchar_t kApplePackageFamilyName[] = L"AppleInc.AppleMusicWin_nzyj5cx40ttqa";
+
+// A process only counts as the Apple Music host or agent when its image is the
+// named executable inside the installed Apple Music package directory and it is
+// a native x64 process. Name-only matching would hand the x64 hook DLL and the
+// x64 LoadLibraryW address to any same-session process that carries the name.
+bool IsPackagedAppleProcess(DWORD pid, const wchar_t* imageName) {
+    const auto image = ProcessImagePath(pid);
+    if (image.empty()) return false;
+    if (_wcsicmp(image.filename().c_str(), imageName) != 0) return false;
+    const auto packageDirectory = image.parent_path();
+    const std::wstring directoryName = packageDirectory.filename().wstring();
+    const std::wstring parentName = packageDirectory.parent_path().filename().wstring();
+    constexpr std::size_t prefixLength = std::size(kApplePackageDirectoryPrefix) - 1;
+    constexpr std::size_t suffixLength = std::size(kApplePackageDirectorySuffix) - 1;
+    if (_wcsicmp(parentName.c_str(), L"WindowsApps") != 0) return false;
+    if (directoryName.size() <= prefixLength + suffixLength ||
+        _wcsnicmp(directoryName.c_str(), kApplePackageDirectoryPrefix, prefixLength) != 0 ||
+        _wcsicmp(directoryName.c_str() + directoryName.size() - suffixLength,
+                 kApplePackageDirectorySuffix) != 0) {
+        return false;
+    }
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return false;
+    BOOL wow64 = FALSE;
+    const bool queried = IsWow64Process(process, &wow64) != FALSE;
+    // The path shape alone can be imitated by any folder named WindowsApps.
+    // A process that carries package identity must carry Apple Music's; a
+    // process with no identity (APPMODEL_ERROR_NO_PACKAGE) is judged by the
+    // path shape above, since whether the agent inherits identity is not
+    // something this code can assume.
+    bool identityOk = true;
+    wchar_t family[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1]{};
+    UINT32 familyLength = static_cast<UINT32>(std::size(family));
+    const LONG familyStatus = GetPackageFamilyName(process, &familyLength, family);
+    if (familyStatus == ERROR_SUCCESS) {
+        identityOk = _wcsicmp(family, kApplePackageFamilyName) == 0;
+    } else if (familyStatus != APPMODEL_ERROR_NO_PACKAGE) {
+        identityOk = false;
+    }
+    CloseHandle(process);
+    return queried && !wow64 && identityOk;
+}
+
 bool IsAppleMusicProcess(DWORD pid) {
-    return !ProcessImagePath(pid).empty();
+    return IsPackagedAppleProcess(pid, L"AppleMusic.exe");
+}
+
+ULONGLONG ProcessCreationTime(HANDLE process) {
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!GetProcessTimes(process, &created, &exited, &kernel, &user)) return 0;
+    ULARGE_INTEGER value{};
+    value.LowPart = created.dwLowDateTime;
+    value.HighPart = created.dwHighDateTime;
+    return value.QuadPart;
 }
 
 bool IsAppleMusicAgentProcess(DWORD pid) {
-    return !ProcessImagePath(pid).empty();
+    return IsPackagedAppleProcess(pid, L"AMPLibraryAgent.exe");
 }
 
 std::filesystem::path BrokerIniPath() {
@@ -408,6 +477,46 @@ bool InjectModule(DWORD pid, const std::filesystem::path& dllPath) {
     return wait == WAIT_OBJECT_0 && module != 0;
 }
 
+// A missing or unloadable hook DLL (antivirus quarantine is the usual cause)
+// used to be invisible: the watcher skipped injection silently and the UI sat
+// at "Enabled - Waiting for playback" while audio stayed on the shared path.
+// Publish it as a status error once, and clear it once the hook is in place.
+void ReportComponentFailure(ErrorCategory category, HRESULT hr) {
+    Message status{};
+    {
+        std::lock_guard lock(g_mutex);
+        if (g_status.error == category) return;
+        ++g_status.generation;
+        g_status.error = category;
+        g_status.hresult = hr;
+        g_status.senderPid = GetCurrentProcessId();
+        GetSystemTimeAsFileTime(&g_status.timestampUtc);
+        status = g_status;
+    }
+    Log(L"component failure published error=" +
+        std::to_wstring(static_cast<unsigned>(category)) +
+        L" hr=" + std::to_wstring(static_cast<unsigned long>(hr)));
+    Broadcast(status, nullptr);
+    if (status.enabledIntent) ShowErrorDialogAsync(category, hr, status.generation, false);
+}
+
+void ClearComponentFailure(ErrorCategory category) {
+    Message status{};
+    {
+        std::lock_guard lock(g_mutex);
+        if (g_status.error != category) return;
+        ++g_status.generation;
+        g_status.error = ErrorCategory::None;
+        g_status.hresult = S_OK;
+        g_status.senderPid = GetCurrentProcessId();
+        GetSystemTimeAsFileTime(&g_status.timestampUtc);
+        status = g_status;
+    }
+    Log(L"component failure cleared error=" +
+        std::to_wstring(static_cast<unsigned>(category)));
+    Broadcast(status, nullptr);
+}
+
 DWORD WINAPI ProcessWatcher(void*) {
     wchar_t brokerPath[MAX_PATH]{};
     GetModuleFileNameW(nullptr, brokerPath, static_cast<DWORD>(std::size(brokerPath)));
@@ -417,43 +526,82 @@ DWORD WINAPI ProcessWatcher(void*) {
     DWORD boundHostPid{};
     HANDLE boundHostProcess{};
     const ULONGLONG bindDeadline = GetTickCount64() + 3000ULL;
+    unsigned agentInjectionFailures = 0;
+
+    // Bind the newest live AppleMusic.exe in this session. When the user quits
+    // and relaunches within the old process's teardown, both are alive for a
+    // moment; the snapshot order is undefined and binding the exiting one made
+    // the companion exit as soon as it died, leaving the new instance without
+    // UI injection and with no way to start another companion.
+    const auto bindNewestHost = [&](DWORD excludePid) {
+        DWORD bestPid{};
+        HANDLE best{};
+        ULONGLONG bestCreated{};
+        for (DWORD pid : FindProcesses(L"AppleMusic.exe")) {
+            if (pid == excludePid) continue;
+            if (!IsAppleMusicProcess(pid)) {
+                Log(L"watcher could not resolve AppleMusic PID=" + std::to_wstring(pid));
+                continue;
+            }
+            HANDLE host = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                                      FALSE, pid);
+            if (!host) {
+                Log(L"watcher could not bind AppleMusic PID=" + std::to_wstring(pid));
+                continue;
+            }
+            if (WaitForSingleObject(host, 0) == WAIT_OBJECT_0) {
+                CloseHandle(host);
+                continue;
+            }
+            const ULONGLONG created = ProcessCreationTime(host);
+            if (!best || created > bestCreated) {
+                if (best) CloseHandle(best);
+                best = host;
+                bestPid = pid;
+                bestCreated = created;
+            } else {
+                CloseHandle(host);
+            }
+        }
+        if (!best) return false;
+        boundHostPid = bestPid;
+        boundHostProcess = best;
+        Log(L"companion bound to AppleMusic host pid=" + std::to_wstring(bestPid));
+        return true;
+    };
+    // The bound host is gone. A newer AppleMusic.exe in this session takes
+    // over the binding (the relaunch race above); otherwise the companion
+    // exits as before. Returns true when the watcher should keep running.
+    const auto hostLost = [&](const wchar_t* why) {
+        const DWORD lostPid = boundHostPid;
+        CloseHandle(boundHostProcess);
+        boundHostProcess = nullptr;
+        boundHostPid = 0;
+        agentInjectionFailures = 0;
+        if (bindNewestHost(lostPid)) {
+            Log(std::wstring(L"companion rebound after host ") + why + L" pid=" +
+                std::to_wstring(lostPid) + L" -> " + std::to_wstring(boundHostPid));
+            return true;
+        }
+        Log(std::wstring(L"companion exit: bound AppleMusic host ") + why + L" pid=" +
+            std::to_wstring(lostPid));
+        g_shutdown.store(true);
+        return false;
+    };
+
     while (!g_shutdown.load()) {
         if (boundHostProcess) {
             const DWORD hostState = WaitForSingleObject(boundHostProcess, 0);
             if (hostState == WAIT_OBJECT_0) {
-                Log(L"companion exit: bound AppleMusic host terminated pid=" +
-                    std::to_wstring(boundHostPid));
-                g_shutdown.store(true);
-                break;
-            }
-            if (hostState == WAIT_FAILED) {
-                Log(L"companion exit: bound AppleMusic host wait failed pid=" +
-                    std::to_wstring(boundHostPid));
-                g_shutdown.store(true);
-                break;
+                if (!hostLost(L"terminated")) break;
+            } else if (hostState == WAIT_FAILED) {
+                if (!hostLost(L"wait failed")) break;
             }
         }
 
         bool uiPresent = false;
         if (!boundHostProcess) {
-            const auto uiProcesses = FindProcesses(L"AppleMusic.exe");
-            for (DWORD pid : uiProcesses) {
-                if (!IsAppleMusicProcess(pid)) {
-                    Log(L"watcher could not resolve AppleMusic PID=" + std::to_wstring(pid));
-                    continue;
-                }
-                HANDLE host = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-                                          FALSE, pid);
-                if (!host) {
-                    Log(L"watcher could not bind AppleMusic PID=" + std::to_wstring(pid));
-                    continue;
-                }
-                boundHostPid = pid;
-                boundHostProcess = host;
-                uiPresent = true;
-                Log(L"companion bound to AppleMusic host pid=" + std::to_wstring(pid));
-                break;
-            }
+            uiPresent = bindNewestHost(0);
             if (!boundHostProcess && GetTickCount64() >= bindDeadline) {
                 Log(L"companion exit: no AppleMusic host appeared within startup grace");
                 g_shutdown.store(true);
@@ -490,11 +638,36 @@ DWORD WINAPI ProcessWatcher(void*) {
             }
         }
 
-        // The companion is a strict child of one AppleMusic.exe lifetime. Before
+        // Only an identity-verified agent counts (agentPresent, not
+        // anyAgentPresent): a same-session process that merely carries the
+        // name is never injected and must not produce a failure report.
+        if (!agentPresent) {
+            agentInjectionFailures = 0;
+        } else if (boundHostProcess) {
+            if (agentHookReady) {
+                // A loaded module stays loaded even if its file is later moved
+                // or renamed, so a missing file is only a failure while the
+                // hook is not in the agent.
+                agentInjectionFailures = 0;
+                ClearComponentFailure(ErrorCategory::HookLoadFailed);
+            } else if (!std::filesystem::exists(hookDll)) {
+                ReportComponentFailure(ErrorCategory::HookLoadFailed,
+                                       HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND));
+            } else if (++agentInjectionFailures >= 20) {
+                // Twenty consecutive 100 ms attempts: the file exists but never
+                // becomes a loaded module (blocked load, wrong architecture,
+                // access denied).
+                ReportComponentFailure(ErrorCategory::HookLoadFailed, E_FAIL);
+            }
+        }
+
+        // The companion follows the AppleMusic.exe host, never the agent. Before
         // binding, poll briefly for the AppModel-started host. After binding, wait
         // on that exact process handle instead of treating AMPLibraryAgent as an
-        // alternate host. This means an Agent that lingers cannot keep the
-        // companion alive, and a later AppleMusic process gets a fresh companion.
+        // alternate host, so a lingering Agent cannot keep the companion alive.
+        // When the host dies, a newer AppleMusic.exe in this session is adopted
+        // (quit-and-relaunch race); otherwise the companion exits and the next
+        // launch gets a fresh one from the scheduled task.
         DWORD watcherDelayMs = 500;
         if (!boundHostProcess) watcherDelayMs = 25;
         else if (!anyAgentPresent) watcherDelayMs = 25;
@@ -504,16 +677,9 @@ DWORD WINAPI ProcessWatcher(void*) {
         if (boundHostProcess) {
             const DWORD wait = WaitForSingleObject(boundHostProcess, watcherDelayMs);
             if (wait == WAIT_OBJECT_0) {
-                Log(L"companion exit: bound AppleMusic host terminated pid=" +
-                    std::to_wstring(boundHostPid));
-                g_shutdown.store(true);
-                break;
-            }
-            if (wait == WAIT_FAILED) {
-                Log(L"companion exit: bound AppleMusic host wait failed pid=" +
-                    std::to_wstring(boundHostPid));
-                g_shutdown.store(true);
-                break;
+                if (!hostLost(L"terminated")) break;
+            } else if (wait == WAIT_FAILED) {
+                if (!hostLost(L"wait failed")) break;
             }
         } else {
             Sleep(watcherDelayMs);

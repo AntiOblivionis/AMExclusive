@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace ammod::audio_v2 {
 
@@ -101,6 +102,10 @@ public:
 
     bool Start(const AudioCoreRuntimeCallbacks& callbacks) noexcept;
     void Stop() noexcept;
+    // Process exit: the worker thread and any lock holder may already have
+    // been terminated by ExitProcess. Stop() and the destructor then skip the
+    // join and the control mutex instead of hanging the exiting thread.
+    void AbandonForProcessExit() noexcept;
     void SetUiEnabled(bool enabled) noexcept;
     void SetHardwareBufferMilliseconds(std::uint32_t milliseconds) noexcept;
     void SetAllowResampling(bool enabled) noexcept;
@@ -210,8 +215,40 @@ private:
     static DWORD WINAPI WorkerThunk(void* context) noexcept;
     DWORD WorkerMain() noexcept;
 
-    void Wake() noexcept;
+    void Wake() const noexcept;
+    void WakeIfEventsPending() const noexcept;
+    // Emit queues; FlushPendingEvents delivers, and only ever on the runtime
+    // worker thread (or in Stop() after the worker is joined). Two reasons:
+    //  - The hook's Faulted handler takes the P0 fill lock, which Apple's
+    //    decode thread holds while it calls into this runtime. Delivering
+    //    under controlMutex_ on the worker was a lock-order inversion (any
+    //    sink fault during an end-of-stream Fill, Reset or Dispose deadlocked
+    //    the two threads); delivering on the decode thread itself would make
+    //    that handler relock a mutex the thread already owns.
+    //  - The Bound/Active/Telemetry handlers read coordinator state, so they
+    //    are delivered with controlMutex_ held (as before); Faulted is
+    //    delivered without it.
     void Emit(AudioCoreRuntimeEvent event, HRESULT result) noexcept;
+    void FlushPendingEvents() const noexcept;
+    // Scoped controlMutex_ ownership that wakes the worker on release when
+    // events were queued. Every controlMutex_ acquisition in the runtime goes
+    // through this type except the per-event lock inside FlushPendingEvents,
+    // which must not wake or flush recursively.
+    class ControlScope final {
+    public:
+        explicit ControlScope(const AudioCoreRuntime& runtime) noexcept
+            : runtime_(runtime), lock_(runtime.controlMutex_) {}
+        ~ControlScope() {
+            lock_.unlock();
+            runtime_.WakeIfEventsPending();
+        }
+        ControlScope(const ControlScope&) = delete;
+        ControlScope& operator=(const ControlScope&) = delete;
+
+    private:
+        const AudioCoreRuntime& runtime_;
+        std::unique_lock<std::mutex> lock_;
+    };
     void TryBindGraphLocked() noexcept;
     void TryActivateLocked() noexcept;
     void TryResumePausedSinkLocked() noexcept;
@@ -229,12 +266,23 @@ private:
     std::atomic<bool> running_{};
     std::atomic<bool> uiEnabled_{};
     std::atomic<bool> workerStop_{};
+    std::atomic<bool> abandoned_{};
     std::atomic<std::uint32_t> hardwareBufferMs_{20};
     std::atomic<bool> allowResampling_{};
     HANDLE wakeEvent_{};
     HANDLE workerThread_{};
 
     mutable std::mutex controlMutex_;
+    struct PendingEvent final {
+        AudioCoreRuntimeEvent event;
+        HRESULT result;
+    };
+    mutable std::mutex pendingEventMutex_;
+    mutable std::vector<PendingEvent> pendingEvents_;
+    mutable std::mutex dispatchMutex_;
+    // Allocation-failure fallback for Emit: a Faulted event is never dropped.
+    mutable std::atomic<bool> overflowFaulted_{};
+    mutable std::atomic<LONG> overflowResult_{S_OK};
     AudioCoreConverterRegistry registry_{};
     AudioCoreCoordinator coordinator_{};
     ApplePcmTap tap_;

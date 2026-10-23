@@ -32,21 +32,42 @@ if ($install -ne $expected -or -not $install.StartsWith([IO.Path]::GetFullPath($
     throw (Get-InstallerText "拒绝使用不安全的卸载路径：$install" "Refusing unsafe uninstall path: $install")
 }
 
+function Get-SessionProcess([string]$Name) {
+    # Only this logon session's processes; Get-Process spans every session.
+    $sessionId = (Get-Process -Id $PID).SessionId
+    return @(Get-Process $Name -ErrorAction SilentlyContinue |
+        Where-Object { $_.SessionId -eq $sessionId })
+}
+
 function Stop-AppleMusicRuntime {
-    Get-Process AppleMusic -ErrorAction SilentlyContinue | Stop-Process -Force
-    for ($i = 0; $i -lt 50 -and (Get-Process AppleMusic -ErrorAction SilentlyContinue); $i++) {
+    Get-SessionProcess AppleMusic | Stop-Process -Force
+    for ($i = 0; $i -lt 50 -and (Get-SessionProcess AppleMusic).Count -gt 0; $i++) {
         Start-Sleep -Milliseconds 100
     }
-    Get-Process AMPLibraryAgent -ErrorAction SilentlyContinue | Stop-Process -Force
-    for ($i = 0; $i -lt 50 -and (Get-Process AMPLibraryAgent -ErrorAction SilentlyContinue); $i++) {
+    Get-SessionProcess AMPLibraryAgent | Stop-Process -Force
+    for ($i = 0; $i -lt 50 -and (Get-SessionProcess AMPLibraryAgent).Count -gt 0; $i++) {
         Start-Sleep -Milliseconds 100
     }
-    Get-Process am-exclusive-broker -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-SessionProcess am-exclusive-broker | Stop-Process -Force
+}
+
+# Mirror of the installer's check: an uninstall under a different (elevated)
+# account would delete the shared folder but leave the signed-in user's
+# companion task and Apps entry behind while reporting success.
+$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$shellSessionId = (Get-Process -Id $PID).SessionId
+$shell = Get-CimInstance Win32_Process -Filter "Name = 'explorer.exe' AND SessionId = $shellSessionId" -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($shell) {
+    $shellOwner = Invoke-CimMethod -InputObject $shell -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+    if ($shellOwner -and $shellOwner.ReturnValue -eq 0 -and $shellOwner.Sid -and $shellOwner.Sid -ne $currentSid) {
+        throw (Get-InstallerText 'Uninstall is running under a different account than the signed-in user (administrator elevation). Run it without "Run as administrator" from the account that installed AMExclusive.' 'Uninstall is running under a different account than the signed-in user (administrator elevation). Run it without "Run as administrator" from the account that installed AMExclusive.')
+    }
 }
 
 $package = Get-AppxPackage -Name AppleInc.AppleMusicWin -ErrorAction SilentlyContinue
 $aumid = if ($package) { "$($package.PackageFamilyName)!App" } else { '' }
-$wasRunning = [bool](Get-Process AppleMusic -ErrorAction SilentlyContinue)
+$wasRunning = [bool](Get-SessionProcess AppleMusic)
 Stop-AppleMusicRuntime
 Write-ProgressMilestone 30 'stop_runtime'
 
@@ -62,6 +83,12 @@ Remove-Item -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninst
 Write-ProgressMilestone 60 'remove_registration'
 
 if (Test-Path -LiteralPath $install -PathType Container) {
+    # A directory that is the current directory of this process (double-click
+    # launch from the install folder, or an Apps-entry launch that inherited it)
+    # cannot be removed; files would be deleted and the final RemoveDirectory
+    # would fail, leaving an empty orphan folder and a failed uninstall.
+    Set-Location -LiteralPath $env:SystemRoot
+    [Environment]::CurrentDirectory = $env:SystemRoot
     Remove-Item -LiteralPath $install -Recurse -Force
 }
 Write-ProgressMilestone 85 'remove_directory'

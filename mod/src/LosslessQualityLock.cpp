@@ -2,9 +2,12 @@
 #include "LosslessQualityPolicy.h"
 #include "ApplePrivateOffsets.h"
 
+#include <windows.h>
+
 #include <MinHook.h>
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -244,25 +247,57 @@ std::uintptr_t Word(void* object, std::size_t offset) {
     std::memcpy(&value, static_cast<unsigned char*>(object) + offset, sizeof(value));
     return value;
 }
+// Reads of Apple-private object fields happen before any fingerprint can be
+// compared, so they are the one place a layout change could fault. The build
+// uses /EHsc: a C++ catch(...) does not see an access violation. Guard the raw
+// reads with SEH instead and report "unknown" so ApplyTree falls back to the
+// original behaviour. This function must stay free of C++ objects that need
+// unwinding; it only copies eight bytes.
+bool TryReadWord(void* object, std::size_t offset, std::uintptr_t& value) noexcept {
+    __try {
+        std::memcpy(&value, static_cast<unsigned char*>(object) + offset, sizeof(value));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool CollectStrict(void* filter, std::vector<void*>& strict, unsigned depth = 0) {
     if (!filter) return true;
     if (depth > 32 || strict.size() > 4096) return false;
     namespace offsets = ammod::apple_private::core_media_filter;
-    auto* table = reinterpret_cast<void*>(Word(filter, offsets::kFilterClassTable));
+    std::uintptr_t tableWord{};
+    if (!TryReadWord(filter, offsets::kFilterClassTable, tableWord)) return false;
+    auto* table = reinterpret_cast<void*>(tableWord);
     if (!table) return true;
-    auto* methods = reinterpret_cast<void*>(Word(table, offsets::kClassTableMethods));
+    std::uintptr_t methodsWord{};
+    if (!TryReadWord(table, offsets::kClassTableMethods, methodsWord)) return false;
+    auto* methods = reinterpret_cast<void*>(methodsWord);
     if (!methods) return true;
-    if (Word(methods, offsets::kSimpleApplySlot) == mediaBase + offsets::kSimpleApplyRva) {
-        if (Word(filter, offsets::kSimplePredicate) == reinterpret_cast<std::uintptr_t>(&Accept))
-            strict.push_back(filter);
-    } else if (Word(methods, offsets::kTreeApplySlot) == mediaBase + offsets::kTreeApplyRva) {
-        auto* children = reinterpret_cast<void*>(Word(filter, offsets::kTreeChildren));
+    std::uintptr_t simpleApply{};
+    std::uintptr_t treeApply{};
+    if (!TryReadWord(methods, offsets::kSimpleApplySlot, simpleApply) ||
+        !TryReadWord(methods, offsets::kTreeApplySlot, treeApply)) {
+        return false;
+    }
+    if (simpleApply == mediaBase + offsets::kSimpleApplyRva) {
+        std::uintptr_t predicate{};
+        if (!TryReadWord(filter, offsets::kSimplePredicate, predicate)) return false;
+        if (predicate == reinterpret_cast<std::uintptr_t>(&Accept)) strict.push_back(filter);
+    } else if (treeApply == mediaBase + offsets::kTreeApplyRva) {
+        std::uintptr_t childrenWord{};
+        std::uintptr_t fallbackWord{};
+        if (!TryReadWord(filter, offsets::kTreeChildren, childrenWord) ||
+            !TryReadWord(filter, offsets::kTreeFallback, fallbackWord)) {
+            return false;
+        }
+        auto* children = reinterpret_cast<void*>(childrenWord);
         const auto count = children ? arrayCount(children) : 0;
         if (count < 0 || count > 4096) return false;
         for (std::int64_t i = 0; i < count; ++i) {
             if (!CollectStrict(const_cast<void*>(arrayValue(children, i)), strict, depth + 1)) return false;
         }
-        return CollectStrict(reinterpret_cast<void*>(Word(filter, offsets::kTreeFallback)), strict, depth + 1);
+        return CollectStrict(reinterpret_cast<void*>(fallbackWord), strict, depth + 1);
     }
     return true;
 }
@@ -342,12 +377,57 @@ std::int32_t __cdecl ApplyTree(void* tree, void* input, void** output, void* inf
     }
 }
 
+// The tree-apply hook below patches a raw RVA inside CoreMedia.dll. Nothing
+// else in the process can prove that address still holds the verified
+// function after an Apple update, so the loaded image is compared against the
+// recorded prologue bytes first. On mismatch the quality lock stays
+// permanently unavailable in this process instead of detouring unknown code.
+std::atomic<bool> imageRejected{};
+
+bool ImageMatchesVerifiedBuild(HMODULE media) {
+    namespace offsets = ammod::apple_private::core_media_filter;
+    const auto* base = reinterpret_cast<const std::uint8_t*>(media);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) return false;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        return false;
+    }
+    const std::uintptr_t imageSize = nt->OptionalHeader.SizeOfImage;
+    const auto matches = [&](std::uintptr_t rva, const auto& prologue) {
+        return rva + prologue.size() <= imageSize &&
+               std::memcmp(base + rva, prologue.data(), prologue.size()) == 0;
+    };
+    const bool ok = matches(offsets::kSimpleApplyRva, offsets::kSimpleApplyPrologue) &&
+                    matches(offsets::kTreeApplyRva, offsets::kTreeApplyPrologue);
+    if (!ok && writeLog) {
+        wchar_t text[192]{};
+        std::swprintf(text, std::size(text),
+                      L"Highest ALAC quality filter hook disabled: CoreMedia image does not "
+                      L"match the verified build (timestamp=0x%08X sizeOfImage=0x%08X)",
+                      static_cast<unsigned>(nt->FileHeader.TimeDateStamp),
+                      static_cast<unsigned>(nt->OptionalHeader.SizeOfImage));
+        writeLog(text);
+    }
+    return ok;
+}
+
 } // namespace
+
+bool Unavailable() noexcept {
+    return imageRejected.load(std::memory_order_acquire);
+}
 
 bool Install(HMODULE media, HMODULE foundation, LogFunction log) {
     std::lock_guard lock(installMutex);
     if (installed) return true;
+    if (imageRejected.load(std::memory_order_acquire)) return false;
     writeLog = log;
+    if (!ImageMatchesVerifiedBuild(media)) {
+        imageRejected.store(true, std::memory_order_release);
+        return false;
+    }
     maxSampleRate = reinterpret_cast<decltype(maxSampleRate)>(GetProcAddress(media, "FigAlternateGetMaxAudioSampleRate"));
     arrayCreate = reinterpret_cast<decltype(arrayCreate)>(GetProcAddress(foundation, "CFArrayCreate"));
     arrayValue = reinterpret_cast<decltype(arrayValue)>(GetProcAddress(foundation, "CFArrayGetValueAtIndex"));

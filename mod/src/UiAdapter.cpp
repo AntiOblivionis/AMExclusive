@@ -706,6 +706,10 @@ void ApplyStatus(const Controls::ToggleSwitch& toggle) {
         if (status.endpointName[0]) presentation += L" · " + std::wstring(status.endpointName);
     } else if (status.state == RuntimeState::DisablePending) {
         presentation = Localized(L"正在恢复共享输出…", L"Restoring shared output…");
+    } else if (status.enabledIntent && status.error == ErrorCategory::HookLoadFailed) {
+        // The broker reports a missing or unloadable hook DLL while the user's
+        // intent is still on; "Waiting for playback" would hide that.
+        presentation = ErrorText(status.error);
     } else if (status.state == RuntimeState::Requested ||
                status.state == RuntimeState::WaitingForStream) {
         presentation = Localized(L"已开启 · 等待播放", L"Enabled · Waiting for playback");
@@ -827,21 +831,38 @@ void RememberToggle(const Controls::ToggleSwitch& toggle) {
         g_statusRefreshTimer.Interval(std::chrono::milliseconds(250));
         g_statusRefreshTimer.IsRepeating(true);
         g_statusRefreshTimer.Tick([](auto&&, auto&&) {
-            winrt::weak_ref<Controls::ToggleSwitch> target;
-            winrt::weak_ref<Controls::TextBox> hardwareBuffer;
-            winrt::weak_ref<Controls::ToggleSwitch> resampling;
-            winrt::weak_ref<Controls::Border> outputFormat;
-            {
-                std::lock_guard targetLock(g_uiTargetMutex);
-                target = g_toggle;
-                hardwareBuffer = g_hardwareBufferBox;
-                resampling = g_resamplingToggle;
-                outputFormat = g_outputFormatCard;
+            // Handlers run inside Apple's XAML frame. A failure here must stay
+            // inside this DLL; it must never surface as an unhandled error in
+            // the host's dispatcher.
+            try {
+                winrt::weak_ref<Controls::ToggleSwitch> target;
+                winrt::weak_ref<Controls::TextBox> hardwareBuffer;
+                winrt::weak_ref<Controls::ToggleSwitch> resampling;
+                winrt::weak_ref<Controls::Border> outputFormat;
+                {
+                    std::lock_guard targetLock(g_uiTargetMutex);
+                    target = g_toggle;
+                    hardwareBuffer = g_hardwareBufferBox;
+                    resampling = g_resamplingToggle;
+                    outputFormat = g_outputFormatCard;
+                }
+                if (auto control = target.get()) ApplyStatus(control);
+                if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
+                if (auto control = resampling.get()) ApplyResamplingStatus(control);
+                if (auto card = outputFormat.get()) ApplyOutputFormatStatus(card);
+            } catch (const winrt::hresult_error& error) {
+                // The Apply* helpers raise their suppress flags first and
+                // lower them last; a throw in between would leave user
+                // toggles ignored until the next successful tick.
+                g_suppressToggle.store(false);
+                g_suppressResamplingToggle.store(false);
+                Log(L"status refresh tick failed hresult=" +
+                    std::to_wstring(static_cast<std::uint32_t>(error.code())));
+            } catch (...) {
+                g_suppressToggle.store(false);
+                g_suppressResamplingToggle.store(false);
+                Log(L"status refresh tick failed with a non-WinRT exception");
             }
-            if (auto control = target.get()) ApplyStatus(control);
-            if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
-            if (auto control = resampling.get()) ApplyResamplingStatus(control);
-            if (auto card = outputFormat.get()) ApplyOutputFormatStatus(card);
         });
         g_statusRefreshTimer.Start();
         Log(L"UI status refresh timer started intervalMs=250");
@@ -882,10 +903,21 @@ void ScheduleStatusRefresh() {
     }
     if (dispatcher) {
         dispatcher.TryEnqueue([toggle, hardwareBuffer, resampling, outputFormat] {
-            if (auto control = toggle.get()) ApplyStatus(control);
-            if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
-            if (auto control = resampling.get()) ApplyResamplingStatus(control);
-            if (auto card = outputFormat.get()) ApplyOutputFormatStatus(card);
+            try {
+                if (auto control = toggle.get()) ApplyStatus(control);
+                if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
+                if (auto control = resampling.get()) ApplyResamplingStatus(control);
+                if (auto card = outputFormat.get()) ApplyOutputFormatStatus(card);
+            } catch (const winrt::hresult_error& error) {
+                g_suppressToggle.store(false);
+                g_suppressResamplingToggle.store(false);
+                Log(L"scheduled status refresh failed hresult=" +
+                    std::to_wstring(static_cast<std::uint32_t>(error.code())));
+            } catch (...) {
+                g_suppressToggle.store(false);
+                g_suppressResamplingToggle.store(false);
+                Log(L"scheduled status refresh failed with a non-WinRT exception");
+            }
         });
     }
 }
@@ -1181,15 +1213,22 @@ std::pair<Controls::Border, Controls::ToggleSwitch> CreateResamplingCard(
     Automation::AutomationProperties::SetName(resamplingToggle, resamplingTitle.Text());
     Automation::AutomationProperties::SetHelpText(resamplingToggle, resamplingDescription.Text());
     resamplingToggle.Toggled([](auto&& sender, auto&&) {
-        const int marker = g_programmaticResamplingValue.exchange(-1);
-        if (g_suppressResamplingToggle.load()) return;
-        const bool enabled = sender.template as<Controls::ToggleSwitch>().IsOn();
-        if (marker == (enabled ? 1 : 0)) return;
-        const int requested = g_requestedAllowResampling.load();
-        const bool current = requested >= 0 ? requested != 0 : StatusSnapshot().allowResampling != 0;
-        if (enabled == current) return;
-        SendAllowResampling(enabled);
-        Log(L"resampling setting queued enabled=" + std::to_wstring(enabled));
+        try {
+            const int marker = g_programmaticResamplingValue.exchange(-1);
+            if (g_suppressResamplingToggle.load()) return;
+            const bool enabled = sender.template as<Controls::ToggleSwitch>().IsOn();
+            if (marker == (enabled ? 1 : 0)) return;
+            const int requested = g_requestedAllowResampling.load();
+            const bool current = requested >= 0 ? requested != 0 : StatusSnapshot().allowResampling != 0;
+            if (enabled == current) return;
+            SendAllowResampling(enabled);
+            Log(L"resampling setting queued enabled=" + std::to_wstring(enabled));
+        } catch (const winrt::hresult_error& error) {
+            Log(L"resampling toggle handler failed hresult=" +
+                std::to_wstring(static_cast<std::uint32_t>(error.code())));
+        } catch (...) {
+            Log(L"resampling toggle handler failed with a non-WinRT exception");
+        }
     });
 
     Controls::ColumnDefinition resamplingLabelColumn;
@@ -1298,6 +1337,7 @@ void AttachOrRefreshToggle() {
                       L"Try to use WASAPI exclusive output on the current default playback device"));
         toggle.Toggled([](winrt::Windows::Foundation::IInspectable const& sender,
                           Xaml::RoutedEventArgs const&) {
+          try {
             if (g_suppressToggle.load()) return;
             auto control = sender.as<Controls::ToggleSwitch>();
             const bool enabled = control.IsOn();
@@ -1331,6 +1371,14 @@ void AttachOrRefreshToggle() {
                 }
                 g_suppressToggle.store(false);
             }
+          } catch (const winrt::hresult_error& error) {
+            g_suppressToggle.store(false);
+            Log(L"exclusive toggle handler failed hresult=" +
+                std::to_wstring(static_cast<std::uint32_t>(error.code())));
+          } catch (...) {
+            g_suppressToggle.store(false);
+            Log(L"exclusive toggle handler failed with a non-WinRT exception");
+          }
         });
         Controls::TextBlock title;
         title.Text(Localized(L"独占模式", L"Exclusive mode"));
@@ -1528,8 +1576,15 @@ void AttachOrRefreshToggle() {
         bufferApply.VerticalAlignment(Xaml::VerticalAlignment::Center);
         Automation::AutomationProperties::SetName(
             bufferApply, Localized(L"应用硬件缓冲区", L"Apply hardware buffer"));
-        bufferApply.Click([bufferInput](auto&&, auto&&) {
-            CommitHardwareBuffer(bufferInput);
+        bufferApply.Click([weakInput = winrt::make_weak(bufferInput)](auto&&, auto&&) {
+            try {
+                if (auto input = weakInput.get()) CommitHardwareBuffer(input);
+            } catch (const winrt::hresult_error& error) {
+                Log(L"hardware buffer apply failed hresult=" +
+                    std::to_wstring(static_cast<std::uint32_t>(error.code())));
+            } catch (...) {
+                Log(L"hardware buffer apply failed with a non-WinRT exception");
+            }
         });
 
         Controls::ColumnDefinition bufferLabelColumn;
@@ -1649,6 +1704,10 @@ DWORD WINAPI PipeThread(void*) {
             g_connected.store(true);
         }
         Log(L"UI broker IPC connected");
+        // Broker broadcasts fan out on independent threads, so an older status
+        // can arrive after a newer one. Broker generations only ever increase
+        // within one broker lifetime; the counter resets per connection.
+        std::uint64_t lastStatusGeneration = 0;
         if (const int requested = g_requestedHardwareBufferMs.load(); requested >= 0) {
             g_pendingHardwareBufferMs.store(requested);
             g_hardwareBufferAckDeadlineTick.store(0);
@@ -1757,6 +1816,13 @@ DWORD WINAPI PipeThread(void*) {
                 break;
             }
             if (incoming.type == MessageType::StatusChanged) {
+                if (incoming.generation < lastStatusGeneration) {
+                    Log(L"ignored stale broker status generation=" +
+                        std::to_wstring(incoming.generation) + L" latest=" +
+                        std::to_wstring(lastStatusGeneration));
+                    continue;
+                }
+                lastStatusGeneration = incoming.generation;
                 {
                     std::lock_guard lock(g_statusMutex);
                     g_status = incoming;
@@ -1811,9 +1877,15 @@ DWORD WINAPI BootstrapThread(void*) {
     Log(L"UI window lifecycle WinEvent hook=" +
         std::to_wstring(reinterpret_cast<std::uintptr_t>(g_windowLifecycleHook)));
 
+    // Each refresh walks Apple's whole visual tree on the UI thread several
+    // times. The loop below wakes on every delivered WinEvent, not only on the
+    // 5 s timeout, so rate-limit the periodic re-arm; root-window events still
+    // arm directly from WindowLifecycleEvent.
+    ULONGLONG lastPeriodicArmTick = 0;
+    DWORD waitMs = 5000;
     for (;;) {
         const DWORD wait = MsgWaitForMultipleObjects(
-            0, nullptr, FALSE, 5000, QS_ALLINPUT);
+            0, nullptr, FALSE, waitMs, QS_ALLINPUT);
         if (wait == WAIT_OBJECT_0) {
             MSG message{};
             while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
@@ -1822,7 +1894,20 @@ DWORD WINAPI BootstrapThread(void*) {
             }
         }
         if (!g_mainWindow || !IsWindow(g_mainWindow)) g_mainWindow = FindMainWindow();
-        if (g_mainWindow) (void)ArmUiThreadRefresh(g_mainWindow);
+        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG sinceArm = now - lastPeriodicArmTick;
+        if (!g_mainWindow) {
+            waitMs = 5000;
+        } else if (sinceArm >= 2000) {
+            lastPeriodicArmTick = now;
+            (void)ArmUiThreadRefresh(g_mainWindow);
+            waitMs = 5000;
+        } else {
+            // A wake arrived inside the rate-limit window (for example the
+            // WinEvents of an in-app navigation to Settings). Re-arm when the
+            // window ends rather than after the full 5 s idle timeout.
+            waitMs = static_cast<DWORD>(std::max<ULONGLONG>(1, 2000 - sinceArm));
+        }
     }
 }
 
