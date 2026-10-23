@@ -622,6 +622,18 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
         registry_.FindCandidateAnyPrecision(sampleRate, channels, observationId,
                                              candidateConverter, sourceBitDepth);
     }
+    // Apple initializes the hardware-output parent AudioUnit after the child
+    // graph unit that owns the P0 converter (the inverse order of the parent
+    // Start edge OnAudioUnitStarted already handles). That parent init exposes
+    // no LPCM input format and resolves no candidate; treating it as a graph
+    // identity change retired the bind created milliseconds earlier, so capture
+    // died below the prebuffer threshold and no attempt ever activated (ENG-1).
+    // A formatless, candidate-less init while a bind is live or pending belongs
+    // to the current graph: leave the graph identity alone.
+    if (!candidateConverter && sampleRate == 0 && channels == 0 &&
+        (graphBound_ || pendingGraphBind_.converter)) {
+        return;
+    }
     const bool graphIdentityChanged =
         graphUnit_ != unit || graphConverter_ != candidateConverter;
     pendingGraphBind_ = {};
