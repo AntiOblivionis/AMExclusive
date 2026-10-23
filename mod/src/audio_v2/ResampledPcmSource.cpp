@@ -275,7 +275,7 @@ HRESULT ResampledPcmSource::Prepare(std::uint32_t capacityFrames) noexcept {
         if (streamEnded_ && positionFrame_ >= inputFrames_) outputEnded_ = true;
     }
     UpdatePending();
-    return S_OK;
+    return outputEnded_ && stagedFrames_ == 0 ? S_FALSE : S_OK;
 }
 
 HRESULT ResampledPcmSource::Fill(std::int32_t* destination, std::uint32_t capacityFrames,

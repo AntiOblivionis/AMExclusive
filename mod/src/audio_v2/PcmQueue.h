@@ -114,6 +114,10 @@ public:
         endOfStreamSealed_.store(false, std::memory_order_release);
     }
     std::size_t Size() const noexcept { return queue_.size(); }
+    bool CanAccept(std::uint32_t frames) const noexcept {
+        const auto blocks = (static_cast<std::size_t>(frames) + kMaxBlockFrames - 1u) / kMaxBlockFrames;
+        return blocks <= queue_.capacity() && queue_.size() <= queue_.capacity() - blocks;
+    }
     std::size_t QueuedFrames() const noexcept {
         return queuedFrames_.load(std::memory_order_acquire);
     }

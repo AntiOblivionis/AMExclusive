@@ -4,14 +4,18 @@
 #include "ApplePcmTap.h"
 #include "AudioCoreConverterRegistry.h"
 #include "WasapiExclusiveSink.h"
+#include "../ProcessLifetime.h"
 
 #include <audioclient.h>
 #include <windows.h>
 
 #include <atomic>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <memory>
+#include <optional>
 #include <string>
 
 namespace ammod::audio_v2 {
@@ -23,6 +27,8 @@ enum class AudioCoreRuntimeEvent : std::uint8_t {
     Disabled,
     Telemetry,
 };
+
+struct AudioCoreRuntimeEventSnapshot;
 
 struct AudioCoreRuntimeCallbacks final {
     void* context{};
@@ -40,6 +46,14 @@ struct AudioCoreRuntimeCallbacks final {
     // Expensive per-sample verification is diagnostic-only. Production keeps
     // the exact mapper fail-closed but does not remap every sample a second time.
     bool deepDiagnostics{};
+    void (*onEventSnapshot)(void*, const AudioCoreRuntimeEventSnapshot&) noexcept{};
+    std::uint64_t (*captureEventContext)(void*) noexcept{};
+    void (*onEventBoundary)(void*, std::uint64_t) noexcept{};
+    // Nonblocking producer lease. A control callback may already own the P0
+    // lock; failure defers promotion to the worker instead of reversing locks.
+    bool (*tryAcquireProducer)(void*) noexcept{};
+    void (*releaseProducer)(void*) noexcept{};
+    void (*onConverterBound)(void*, void*) noexcept{};
 };
 
 struct AudioCorePcmFillStats final {
@@ -87,6 +101,18 @@ struct AudioCoreRuntimeStats final {
     AudioCorePcmFillStats pcmFill{};
 };
 
+struct AudioCoreRuntimeEventSnapshot final {
+    AudioCoreRuntimeEvent event{};
+    HRESULT result{S_OK};
+    std::uint64_t epoch{};
+    std::uint64_t contextToken{};
+    std::uint64_t mediaGeneration{};
+    void* converter{};
+    PcmFormat outputFormat{}, sourceFormat{};
+    bool resampled{}, reducingBitDepth{}, sourceMappingExact{}, converting{};
+    AudioCoreRuntimeStats stats{};
+};
+
 // Production bridge for the v2 core. Hook entry points call the converter and
 // AudioUnit methods here; all endpoint ownership transitions happen on the
 // private worker thread. The only callback-thread operation is copying the
@@ -101,6 +127,10 @@ public:
 
     bool Start(const AudioCoreRuntimeCallbacks& callbacks) noexcept;
     void Stop() noexcept;
+    // Process exit: the worker thread and any lock holder may already have
+    // been terminated by ExitProcess. Stop() and the destructor then skip the
+    // join and the control mutex instead of hanging the exiting thread.
+    void AbandonForProcessExit() noexcept;
     void SetUiEnabled(bool enabled) noexcept;
     void SetHardwareBufferMilliseconds(std::uint32_t milliseconds) noexcept;
     void SetAllowResampling(bool enabled) noexcept;
@@ -117,7 +147,8 @@ public:
 
     void OnConverterCreated(void* converter, const ApplePcmFormatView& source,
                             const ApplePcmFormatView& destination,
-                            std::uint64_t observationId) noexcept;
+                            std::uint64_t observationId,
+                            bool descriptorRefresh = false) noexcept;
     void OnConverterSourcePrecision(void* converter, std::uint32_t sourceBitDepth,
                                     std::uint32_t sampleRate,
                                     std::uint32_t channels) noexcept;
@@ -160,6 +191,9 @@ public:
     bool OnPcmOutput(void* converter, const ApplePcmFormatView& format,
                      const ApplePcmBufferListView& list,
                      std::uint32_t producedPackets) noexcept;
+    // Called before the original decoder Fill. Only the identified pending
+    // successor is back-pressured, before it can consume encoded input.
+    bool ShouldDeferPcmPull(void* converter, std::uint32_t requestedFrames) noexcept;
 
     bool DestinationFormat(void* converter, ApplePcmFormatView& format) const noexcept;
 
@@ -210,8 +244,41 @@ private:
     static DWORD WINAPI WorkerThunk(void* context) noexcept;
     DWORD WorkerMain() noexcept;
 
-    void Wake() noexcept;
+    void Wake() const noexcept;
+    void WakeIfEventsPending() const noexcept;
+    // Emit captures identity and display data under the control lock. The
+    // worker (or Stop after joining it) dispatches immutable production
+    // snapshots outside that lock. Publication rechecks both event epoch and
+    // captured IPC context; the fault observer never touches the P0 producer.
+    // Legacy non-fault observers remain serialized with coordinator state.
     void Emit(AudioCoreRuntimeEvent event, HRESULT result) noexcept;
+    void FlushPendingEvents() const noexcept;
+    void AdvanceEventEpochLocked() noexcept;
+    bool EventCurrentLocked(const AudioCoreRuntimeEventSnapshot&) const noexcept;
+    void ArmPendingCaptureLocked(const ConverterRegistrationSnapshot&) noexcept;
+    void ClearPendingCaptureLocked() noexcept;
+    bool StagePendingPcm(const ConverterRegistrationSnapshot&, const ApplePcmFormatView&,
+                         const ApplePcmBufferListView&, std::uint32_t) noexcept;
+    bool PromotePendingPcmLocked(void*) noexcept;
+    // Scoped controlMutex_ ownership that wakes the worker on release when
+    // events were queued. Every controlMutex_ acquisition in the runtime goes
+    // through this type except the per-event lock inside FlushPendingEvents,
+    // which must not wake or flush recursively.
+    class ControlScope final {
+    public:
+        explicit ControlScope(const AudioCoreRuntime& runtime) noexcept
+            : runtime_(runtime), lock_(runtime.controlMutex_) {}
+        ~ControlScope() {
+            lock_.unlock();
+            runtime_.WakeIfEventsPending();
+        }
+        ControlScope(const ControlScope&) = delete;
+        ControlScope& operator=(const ControlScope&) = delete;
+
+    private:
+        const AudioCoreRuntime& runtime_;
+        std::unique_lock<std::mutex> lock_;
+    };
     void TryBindGraphLocked() noexcept;
     void TryActivateLocked() noexcept;
     void TryResumePausedSinkLocked() noexcept;
@@ -220,7 +287,7 @@ private:
     void FinalizeEndOfStreamDrainLocked() noexcept;
     void RetireCompletedCaptureLocked(void* converter) noexcept;
     void TryBindPendingGraphLocked() noexcept;
-    void RetireCaptureLocked(bool keepGraph) noexcept;
+    void RetireCaptureLocked(bool keepGraph, bool keepPendingCapture = false) noexcept;
     bool BuildFormat(const ConverterRegistrationSnapshot& snapshot,
                      PcmFormat& output) const noexcept;
     std::uint32_t PeriodFrames(std::uint32_t sampleRate) const noexcept;
@@ -229,15 +296,37 @@ private:
     std::atomic<bool> running_{};
     std::atomic<bool> uiEnabled_{};
     std::atomic<bool> workerStop_{};
+    std::atomic<bool> abandoned_{};
     std::atomic<std::uint32_t> hardwareBufferMs_{20};
     std::atomic<bool> allowResampling_{};
     HANDLE wakeEvent_{};
     HANDLE workerThread_{};
 
     mutable std::mutex controlMutex_;
+    mutable std::mutex pendingEventMutex_;
+    mutable std::array<AudioCoreRuntimeEventSnapshot, 64> pendingEvents_{};
+    mutable std::size_t pendingEventCount_{};
+    mutable std::optional<AudioCoreRuntimeEventSnapshot> overflowFault_;
+    mutable std::mutex dispatchMutex_;
+    std::uint64_t eventEpoch_{1};
     AudioCoreConverterRegistry registry_{};
-    AudioCoreCoordinator coordinator_{};
+    ammod::ProcessLifetimeOwner<AudioCoreCoordinator> coordinatorOwner_;
+    AudioCoreCoordinator& coordinator_;
     ApplePcmTap tap_;
+
+    struct PendingCapture final {
+        void* converter{};
+        std::uint64_t registrationId{};
+        PcmFormat format{};
+        PcmQueue queue{256};
+        std::uint64_t sequence{}, nextFrame{};
+        std::atomic<bool> failed{};
+    };
+    std::unique_ptr<PendingCapture> pendingCaptureOwner_;
+    std::atomic<PendingCapture*> pendingCapture_{};
+    std::atomic<void*> pendingDeferredConverter_{};
+    bool pendingCaptureAllocationFailed_{};
+    bool pendingProducerLeaseHeld_{};
 
     std::atomic<std::uint32_t> callbackDepth_{};
     std::atomic<void*> boundConverter_{};
@@ -268,6 +357,7 @@ private:
         void* unit{};
         void* converter{};
         std::uint64_t observationId{};
+        std::uint64_t registrationId{};
     } pendingGraphBind_{};
     // Streaming native Stop is not decoder EOF. Hold the current generation
     // across AudioUnit Stop/Uninitialize while HookDll synchronously flushes

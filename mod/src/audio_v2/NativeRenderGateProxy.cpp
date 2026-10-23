@@ -78,6 +78,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!object) return E_POINTER;
         *object = nullptr;
         if (iid == __uuidof(IUnknown) || iid == __uuidof(IAudioClock)) {
@@ -91,18 +92,21 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
 
     ULONG STDMETHODCALLTYPE Release() override {
+        if (ammod::ProcessExiting()) return 1;
         const ULONG remaining = --references_;
         if (!remaining) delete this;
         return remaining;
     }
 
     HRESULT STDMETHODCALLTYPE GetFrequency(UINT64* frequency) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!frequency) return E_POINTER;
         *frequency = buffer_->Rate();
         return *frequency != 0 ? S_OK : AUDCLNT_E_NOT_INITIALIZED;
     }
 
     HRESULT STDMETHODCALLTYPE GetPosition(UINT64* position, UINT64* qpcPosition) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!position) return E_POINTER;
         *position = buffer_->Position();
         if (!qpcPosition) return S_OK;
@@ -119,6 +123,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE GetCharacteristics(DWORD* characteristics) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!characteristics) return E_POINTER;
         // The SDK used by the Apple Music package does not expose a named
         // fixed-clock characteristic; zero is the documented neutral value
@@ -140,6 +145,7 @@ public:
     PumpStreamVolume() noexcept { volumes_.fill(1.0f); }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!object) return E_POINTER;
         *object = nullptr;
         if (iid == __uuidof(IUnknown) || iid == __uuidof(IAudioStreamVolume)) {
@@ -153,18 +159,21 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
 
     ULONG STDMETHODCALLTYPE Release() override {
+        if (ammod::ProcessExiting()) return 1;
         const ULONG remaining = --references_;
         if (!remaining) delete this;
         return remaining;
     }
 
     HRESULT STDMETHODCALLTYPE GetChannelCount(UINT32* channelCount) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!channelCount) return E_POINTER;
         *channelCount = 2;
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE SetChannelVolume(UINT32 channel, const float volume) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (channel >= volumes_.size() || volume < 0.0f || volume > 1.0f) return E_INVALIDARG;
         std::lock_guard lock(mutex_);
         volumes_[channel] = volume;
@@ -172,6 +181,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE GetChannelVolume(UINT32 channel, float* volume) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!volume) return E_POINTER;
         if (channel >= volumes_.size()) return E_INVALIDARG;
         std::lock_guard lock(mutex_);
@@ -181,6 +191,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE SetAllVolumes(UINT32 channelCount,
                                              const float* volumes) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!volumes) return E_POINTER;
         if (channelCount != volumes_.size()) return E_INVALIDARG;
         for (UINT32 index = 0; index < channelCount; ++index) {
@@ -192,6 +203,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE GetAllVolumes(UINT32 channelCount, float* volumes) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!volumes) return E_POINTER;
         if (channelCount != volumes_.size()) return E_INVALIDARG;
         std::lock_guard lock(mutex_);
@@ -210,6 +222,7 @@ private:
 class PumpSessionControl final : public IAudioSessionControl2 {
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!object) return E_POINTER;
         *object = nullptr;
         if (iid == __uuidof(IUnknown) || iid == __uuidof(IAudioSessionControl2)) {
@@ -228,60 +241,75 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
 
     ULONG STDMETHODCALLTYPE Release() override {
+        if (ammod::ProcessExiting()) return 1;
         const ULONG remaining = --references_;
         if (!remaining) delete this;
         return remaining;
     }
 
     HRESULT STDMETHODCALLTYPE GetState(AudioSessionState* state) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!state) return E_POINTER;
         *state = AudioSessionStateActive;
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE GetDisplayName(LPWSTR* name) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         return CopyString(name, L"Apple Music");
     }
 
-    HRESULT STDMETHODCALLTYPE SetDisplayName(LPCWSTR, LPCGUID) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetDisplayName(LPCWSTR, LPCGUID) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING; return S_OK; }
 
     HRESULT STDMETHODCALLTYPE GetIconPath(LPWSTR* path) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         return CopyString(path, L"");
     }
 
-    HRESULT STDMETHODCALLTYPE SetIconPath(LPCWSTR, LPCGUID) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetIconPath(LPCWSTR, LPCGUID) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING; return S_OK; }
 
     HRESULT STDMETHODCALLTYPE GetGroupingParam(GUID* grouping) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!grouping) return E_POINTER;
         *grouping = GUID_NULL;
         return S_OK;
     }
 
-    HRESULT STDMETHODCALLTYPE SetGroupingParam(LPCGUID, LPCGUID) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetGroupingParam(LPCGUID, LPCGUID) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING; return S_OK; }
 
     HRESULT STDMETHODCALLTYPE RegisterAudioSessionNotification(
-        IAudioSessionEvents*) override { return S_OK; }
+        IAudioSessionEvents*) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING; return S_OK; }
 
     HRESULT STDMETHODCALLTYPE UnregisterAudioSessionNotification(
-        IAudioSessionEvents*) override { return S_OK; }
+        IAudioSessionEvents*) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING; return S_OK; }
 
     HRESULT STDMETHODCALLTYPE GetSessionIdentifier(LPWSTR* identifier) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         return CopyString(identifier, L"AMExclusive/pump-session");
     }
 
     HRESULT STDMETHODCALLTYPE GetSessionInstanceIdentifier(LPWSTR* identifier) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         return CopyString(identifier, L"AMExclusive/pump-session-instance");
     }
 
     HRESULT STDMETHODCALLTYPE GetProcessId(DWORD* processId) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!processId) return E_POINTER;
         *processId = GetCurrentProcessId();
         return S_OK;
     }
 
-    HRESULT STDMETHODCALLTYPE IsSystemSoundsSession() override { return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE IsSystemSoundsSession() override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING; return S_FALSE; }
 
-    HRESULT STDMETHODCALLTYPE SetDuckingPreference(BOOL) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetDuckingPreference(BOOL) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING; return S_OK; }
 
 private:
     static HRESULT CopyString(LPWSTR* destination, LPCWSTR value) noexcept {
@@ -358,6 +386,7 @@ void NativeRenderGateProxy::EnableShadowMode() noexcept {
 }
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::QueryInterface(REFIID iid, void** object) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     if (!object) return E_POINTER;
     *object = nullptr;
     if (iid == __uuidof(IUnknown) || iid == __uuidof(IAudioClient)) {
@@ -375,6 +404,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::QueryInterface(REFIID iid, voi
 }
 
 ULONG STDMETHODCALLTYPE NativeAudioClientProxy::Release() {
+        if (ammod::ProcessExiting()) return 1;
     const ULONG remaining = --references_;
     if (!remaining) delete this;
     return remaining;
@@ -383,6 +413,7 @@ ULONG STDMETHODCALLTYPE NativeAudioClientProxy::Release() {
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Initialize(
     AUDCLNT_SHAREMODE shareMode, DWORD flags, REFERENCE_TIME duration,
     REFERENCE_TIME periodicity, const WAVEFORMATEX* format, LPCGUID sessionGuid) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
     {
         std::lock_guard control(controlMutex_);
@@ -427,6 +458,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Initialize(
 }
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetBufferSize(UINT32* frames) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
     {
         std::lock_guard lock(innerMutex_);
@@ -445,6 +477,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetBufferSize(UINT32* frames) 
 }
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetStreamLatency(REFERENCE_TIME* latency) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
     {
         std::lock_guard lock(innerMutex_);
@@ -463,6 +496,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetStreamLatency(REFERENCE_TIM
 }
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetCurrentPadding(UINT32* frames) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
     {
         std::lock_guard lock(innerMutex_);
@@ -483,6 +517,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetCurrentPadding(UINT32* fram
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::IsFormatSupported(
     AUDCLNT_SHAREMODE mode, const WAVEFORMATEX* format, WAVEFORMATEX** closest) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
     {
         std::lock_guard lock(innerMutex_);
@@ -505,6 +540,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::IsFormatSupported(
 }
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetMixFormat(WAVEFORMATEX** format) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     // This is only AME's advertised software-engine default. It is not source
     // metadata, not a physical Windows endpoint setting, and not an admission
     // requirement for a later shared Initialize call.
@@ -515,6 +551,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetMixFormat(WAVEFORMATEX** fo
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetDevicePeriod(
     REFERENCE_TIME* defaultPeriod, REFERENCE_TIME* minimumPeriod) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     HRESULT result = S_OK;
     if (!defaultPeriod && !minimumPeriod) {
         result = E_POINTER;
@@ -527,6 +564,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetDevicePeriod(
 }
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Start() {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
     {
         std::lock_guard control(controlMutex_);
@@ -552,6 +590,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Start() {
 }
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Stop() {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     // Natural streaming EOF is not guaranteed to produce a final zero-packet
     // Fill before Apple asks the software-backed client to Stop. Give the
     // existing native scheduler a brief chance to finish its producer tail
@@ -581,6 +620,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Stop() {
 }
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Reset() {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
     {
         std::lock_guard control(controlMutex_);
@@ -596,6 +636,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Reset() {
 }
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::SetEventHandle(HANDLE eventHandle) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
     {
         std::lock_guard lock(innerMutex_);
@@ -611,6 +652,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::SetEventHandle(HANDLE eventHan
 }
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetService(REFIID iid, void** service) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     if (!service) {
         TraceService(iid, E_POINTER);
         return E_POINTER;
@@ -718,6 +760,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetService(REFIID iid, void** 
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::IsOffloadCapable(
     AUDIO_STREAM_CATEGORY category, BOOL* capable) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     auto* client = Inner2();
     if (!client) return E_NOINTERFACE;
     const HRESULT result = client->IsOffloadCapable(category, capable);
@@ -727,6 +770,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::IsOffloadCapable(
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::SetClientProperties(
     const AudioClientProperties* properties) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     auto* client = Inner2();
     if (!client) return E_NOINTERFACE;
     const HRESULT result = client->SetClientProperties(properties);
@@ -737,6 +781,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::SetClientProperties(
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetBufferSizeLimits(
     const WAVEFORMATEX* format, BOOL eventDriven, REFERENCE_TIME* minimum,
     REFERENCE_TIME* maximum) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     if (IsUsableSharedFormat(format)) {
         if (!minimum || !maximum) return E_POINTER;
         (void)eventDriven;
@@ -754,6 +799,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetBufferSizeLimits(
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetSharedModeEnginePeriod(
     const WAVEFORMATEX* format, UINT32* defaultFrames, UINT32* fundamentalFrames,
     UINT32* minimumFrames, UINT32* maximumFrames) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     if (!format || !defaultFrames || !fundamentalFrames || !minimumFrames || !maximumFrames) {
         return E_POINTER;
     }
@@ -768,6 +814,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetSharedModeEnginePeriod(
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetCurrentSharedModeEnginePeriod(
     WAVEFORMATEX** format, UINT32* frames) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     if (!format || !frames) return E_POINTER;
     UINT32 sampleRate{};
     {
@@ -782,6 +829,7 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::GetCurrentSharedModeEnginePeri
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::InitializeSharedAudioStream(
     DWORD flags, UINT32 periodFrames, const WAVEFORMATEX* format, LPCGUID sessionGuid) {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
     if (!format) return E_POINTER;
     if (!IsUsableSharedFormat(format)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
     if (periodFrames != SoftwareQuantumFrames(format->nSamplesPerSec)) {

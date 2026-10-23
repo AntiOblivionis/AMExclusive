@@ -65,11 +65,17 @@ function Resolve-ReleaseDirectory([string]$Requested) {
 }
 
 function Stop-AppleMusicRuntime {
+    # Get-Process spans every logon session. Only this session's Apple Music
+    # is ours to stop; another user's instance would fail with access denied
+    # (aborting the install) or, if it could be stopped, be killed under them.
+    $sessionId = (Get-Process -Id $PID).SessionId
     foreach ($name in @('AppleMusic', 'AMPLibraryAgent', 'am-exclusive-broker')) {
-        $processes = @(Get-Process $name -ErrorAction SilentlyContinue)
+        $processes = @(Get-Process $name -ErrorAction SilentlyContinue |
+            Where-Object { $_.SessionId -eq $sessionId })
         $processes | Stop-Process -Force
         $processes | Wait-Process -Timeout 5 -ErrorAction Stop
-        if (Get-Process $name -ErrorAction SilentlyContinue) {
+        if (Get-Process $name -ErrorAction SilentlyContinue |
+                Where-Object { $_.SessionId -eq $sessionId }) {
             throw (Get-InstallerText "运行进程未停止：$name" "Runtime did not stop: $name")
         }
     }
@@ -80,6 +86,32 @@ function Start-AppleMusic([string]$Aumid) {
     Start-Process -FilePath $env:WINDIR\explorer.exe -ArgumentList "shell:AppsFolder\$Aumid"
 }
 
+# Everything this script registers (directory ACL, companion task, Apps entry)
+# is keyed to the token running it. Under over-the-shoulder UAC an elevated
+# token belongs to the administrator who approved the prompt, not to the
+# signed-in user who will run Apple Music; the install would then silently
+# target the wrong account. Compare against the owner of this session's shell.
+function Assert-SessionUser {
+    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $shellSessionId = (Get-Process -Id $PID).SessionId
+    $unknown = Get-InstallerText '无法验证当前桌面用户。请从使用 Apple Music 的用户桌面重试；安装和卸载尚未修改任何文件或注册。' 'Cannot verify the current desktop user. Retry from the desktop of the account using Apple Music; no installation files or registrations have been changed.'
+    try {
+        $shells = @(Get-CimInstance Win32_Process -Filter "Name = 'explorer.exe' AND SessionId = $shellSessionId" -ErrorAction Stop)
+        if ($shells.Count -eq 0) { throw $unknown }
+        foreach ($shell in $shells) {
+            $owner = Invoke-CimMethod -InputObject $shell -MethodName GetOwnerSid -ErrorAction Stop
+            if (-not $owner -or $owner.ReturnValue -ne 0 -or -not $owner.Sid) { throw $unknown }
+            $ownerSid = (New-Object Security.Principal.SecurityIdentifier -ArgumentList $owner.Sid).Value
+            if ($ownerSid -ne $currentSid) {
+                throw (Get-InstallerText '运行账户与当前桌面用户不同。请从使用 Apple Music 的账户直接运行，不要使用其他账户提升权限。' 'The running account differs from the desktop user. Run directly from the account using Apple Music without elevation to a different account.')
+            }
+        }
+    } catch {
+        if ($_.Exception.Message -match '运行账户|running account') { throw }
+        throw $unknown
+    }
+}
+Assert-SessionUser
 $source = Resolve-ReleaseDirectory $SourceDirectory
 $install = [IO.Path]::GetFullPath($InstallDirectory)
 $expectedInstall = [IO.Path]::GetFullPath((Join-Path $env:PUBLIC 'AMExclusive'))
@@ -133,7 +165,8 @@ $expectedHashes['THIRD_PARTY_NOTICES.md'] = Get-Sha256Hex $thirdPartyNoticeSourc
 $installedVersion = (Get-Item -LiteralPath (Join-Path $source 'am-exclusive-broker.exe')).VersionInfo.ProductVersion
 if (-not $installedVersion) { throw (Get-InstallerText '伴生程序发布文件缺少产品版本信息。' 'Release broker is missing product version metadata.') }
 
-$wasRunning = [bool](Get-Process AppleMusic -ErrorAction SilentlyContinue)
+$wasRunning = [bool](Get-Process AppleMusic -ErrorAction SilentlyContinue |
+    Where-Object { $_.SessionId -eq (Get-Process -Id $PID).SessionId })
 Stop-AppleMusicRuntime
 Write-ProgressMilestone 32 'stop_runtime'
 

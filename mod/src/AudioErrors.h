@@ -11,6 +11,8 @@ inline constexpr HRESULT kBitPerfectFormatUnavailable =
     MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x202);
 inline constexpr HRESULT kExclusiveFormatUnavailable =
     MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x203);
+inline constexpr HRESULT kEndpointDrainTimeout =
+    MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x204);
 
 constexpr bool IsPlaybackRejection(HRESULT error) noexcept {
     return error == kUnsupportedLocalInt32 || error == kBitPerfectFormatUnavailable ||

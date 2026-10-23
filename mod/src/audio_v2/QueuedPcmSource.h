@@ -49,6 +49,13 @@ public:
         return block && block->endOfStream && block->frames > blockOffsetFrames_;
     }
 
+    HRESULT Prepare(std::uint32_t capacityFrames) noexcept override {
+        if (capacityFrames == 0) return E_INVALIDARG;
+        if ((ended_ || queue_.EndOfStreamSealed()) &&
+            AvailableFrames() == 0) return S_FALSE;
+        return CanProvide(capacityFrames) ? S_OK : kAudioSourceWouldBlock;
+    }
+
     std::size_t AvailableFrames() const noexcept override {
         if (ended_) return 0;
         const auto queued = queue_.QueuedFrames();

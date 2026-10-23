@@ -1,10 +1,14 @@
 #include "LosslessQualityLock.h"
 #include "LosslessQualityPolicy.h"
 #include "ApplePrivateOffsets.h"
+#include "ProcessLifetime.h"
+
+#include <windows.h>
 
 #include <MinHook.h>
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -41,6 +45,10 @@ void(__cdecl* dataSetLength)(void*, std::int64_t){};
 unsigned char*(__cdecl* dataBytes)(void*){};
 std::int64_t(__cdecl* dataLength)(const void*){};
 void(__cdecl* release)(const void*){};
+const void*(__cdecl* retain)(const void*){};
+unsigned long(__cdecl* typeId)(const void*){};
+unsigned long(__cdecl* arrayTypeId)(){};
+unsigned long(__cdecl* dataTypeId)(){};
 const void* arrayCallbacks{};
 LogFunction writeLog{};
 std::mutex installMutex;
@@ -122,6 +130,7 @@ void ResetEvaluation(EvaluationState& evaluation, bool isEnabled,
 }
 
 void __cdecl Reset(void* context) {
+    if (ammod::ProcessExiting()) return;
     auto& state = *GetState(context);
     auto& evaluation = state.directEvaluation;
     const auto currentGeneration = policyGeneration.load(std::memory_order_acquire);
@@ -144,6 +153,7 @@ void __cdecl Reset(void* context) {
 }
 
 void __cdecl Observe(void* alternate, void* context, void* filter) {
+    if (ammod::ProcessExiting()) return;
     auto& state = *GetState(context);
     auto& evaluation = CurrentEvaluation(state);
     if (InterlockedCompareExchange(&evaluation.enabled, 0, 0) == 0) return;
@@ -169,6 +179,7 @@ void __cdecl Observe(void* alternate, void* context, void* filter) {
 }
 
 unsigned char __cdecl Accept(void* alternate, void* context, void* filter) {
+    if (ammod::ProcessExiting()) return 1;
     auto& state = *GetState(context);
     auto& evaluation = CurrentEvaluation(state);
     if (InterlockedCompareExchange(&evaluation.enabled, 0, 0) == 0) return 1;
@@ -186,12 +197,14 @@ unsigned char __cdecl Accept(void* alternate, void* context, void* filter) {
 }
 
 void* __cdecl Describe(void* filter, void* context) {
+    if (ammod::ProcessExiting()) return nullptr;
     const auto& state = *GetState(context);
     return state.nativeDescription ? state.nativeDescription(filter, NativeContext(context)) : nullptr;
 }
 
 std::int32_t __cdecl Create(void* allocator, void* name, std::uint32_t priority,
                             const Callbacks* callbacks, void* context, void** output) {
+    if (ammod::ProcessExiting()) return originalCreate(allocator, name, priority, callbacks, context, output);
     if (!creatingStrictFilter) {
         return originalCreate(allocator, name, priority, callbacks, context, output);
     }
@@ -239,41 +252,113 @@ std::int32_t __cdecl Create(void* allocator, void* name, std::uint32_t priority,
 // is mutated. The tree's own security/availability filters still execute first;
 // our final intersection can only REMOVE results, never make a rejected stream
 // playable. Its fallback is otherwise able to reintroduce lower ALAC candidates.
-std::uintptr_t Word(void* object, std::size_t offset) {
-    std::uintptr_t value{};
-    std::memcpy(&value, static_cast<unsigned char*>(object) + offset, sizeof(value));
-    return value;
+// Reads of Apple-private object fields happen before any fingerprint can be
+// compared, so they are the one place a layout change could fault. The build
+// uses /EHsc: a C++ catch(...) does not see an access violation. Guard the raw
+// reads with SEH instead and reject the unverifiable strict evaluation.
+// This function must stay free of C++ objects that need
+// unwinding; it only copies eight bytes.
+bool TryReadWord(void* object, std::size_t offset, std::uintptr_t& value) noexcept {
+    __try {
+        std::memcpy(&value, static_cast<unsigned char*>(object) + offset, sizeof(value));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
+
+bool TryArrayCount(const void* array, std::int64_t& count) noexcept {
+    __try {
+        if (!array || typeId(array) != arrayTypeId()) return false;
+        count = arrayCount(array);
+        return count >= 0 && count <= 65536;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool TryArrayValue(const void* array, std::int64_t index, const void*& value) noexcept {
+    __try { value = arrayValue(array, index); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool TryRetainStrictState(void* filter, void*& context, State*& state) noexcept {
+    __try {
+        std::uintptr_t word{};
+        if (!TryReadWord(filter, ammod::apple_private::core_media_filter::kStrictContext, word)) return false;
+        context = reinterpret_cast<void*>(word);
+        std::int64_t count{};
+        if (!TryArrayCount(context, count) || count != 2) return false;
+        const auto data = arrayValue(context, 1);
+        if (!data || typeId(data) != dataTypeId() || dataLength(data) != sizeof(State)) return false;
+        state = reinterpret_cast<State*>(dataBytes(const_cast<void*>(data)));
+        if (!state || !state->nativeAccept) return false;
+        return retain(context) != nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+struct StrictView final { void* filter{}; void* context{}; State* state{}; };
+struct StrictViews final {
+    std::vector<StrictView> values;
+    ~StrictViews() { for (const auto& view : values) release(view.context); }
+};
+
 bool CollectStrict(void* filter, std::vector<void*>& strict, unsigned depth = 0) {
     if (!filter) return true;
     if (depth > 32 || strict.size() > 4096) return false;
     namespace offsets = ammod::apple_private::core_media_filter;
-    auto* table = reinterpret_cast<void*>(Word(filter, offsets::kFilterClassTable));
+    std::uintptr_t tableWord{};
+    if (!TryReadWord(filter, offsets::kFilterClassTable, tableWord)) return false;
+    auto* table = reinterpret_cast<void*>(tableWord);
     if (!table) return true;
-    auto* methods = reinterpret_cast<void*>(Word(table, offsets::kClassTableMethods));
+    std::uintptr_t methodsWord{};
+    if (!TryReadWord(table, offsets::kClassTableMethods, methodsWord)) return false;
+    auto* methods = reinterpret_cast<void*>(methodsWord);
     if (!methods) return true;
-    if (Word(methods, offsets::kSimpleApplySlot) == mediaBase + offsets::kSimpleApplyRva) {
-        if (Word(filter, offsets::kSimplePredicate) == reinterpret_cast<std::uintptr_t>(&Accept))
-            strict.push_back(filter);
-    } else if (Word(methods, offsets::kTreeApplySlot) == mediaBase + offsets::kTreeApplyRva) {
-        auto* children = reinterpret_cast<void*>(Word(filter, offsets::kTreeChildren));
-        const auto count = children ? arrayCount(children) : 0;
+    std::uintptr_t simpleApply{};
+    std::uintptr_t treeApply{};
+    if (!TryReadWord(methods, offsets::kSimpleApplySlot, simpleApply) ||
+        !TryReadWord(methods, offsets::kTreeApplySlot, treeApply)) {
+        return false;
+    }
+    if (simpleApply == mediaBase + offsets::kSimpleApplyRva) {
+        std::uintptr_t predicate{};
+        if (!TryReadWord(filter, offsets::kSimplePredicate, predicate)) return false;
+        if (predicate == reinterpret_cast<std::uintptr_t>(&Accept)) strict.push_back(filter);
+    } else if (treeApply == mediaBase + offsets::kTreeApplyRva) {
+        std::uintptr_t childrenWord{};
+        std::uintptr_t fallbackWord{};
+        if (!TryReadWord(filter, offsets::kTreeChildren, childrenWord) ||
+            !TryReadWord(filter, offsets::kTreeFallback, fallbackWord)) {
+            return false;
+        }
+        auto* children = reinterpret_cast<void*>(childrenWord);
+        std::int64_t count{};
+        if (children && !TryArrayCount(children, count)) return false;
         if (count < 0 || count > 4096) return false;
         for (std::int64_t i = 0; i < count; ++i) {
-            if (!CollectStrict(const_cast<void*>(arrayValue(children, i)), strict, depth + 1)) return false;
+            const void* child{};
+            if (!TryArrayValue(children, i, child) ||
+                !CollectStrict(const_cast<void*>(child), strict, depth + 1)) return false;
         }
-        return CollectStrict(reinterpret_cast<void*>(Word(filter, offsets::kTreeFallback)), strict, depth + 1);
+        return CollectStrict(reinterpret_cast<void*>(fallbackWord), strict, depth + 1);
     }
     return true;
 }
 
 std::int32_t __cdecl ApplyTree(void* tree, void* input, void** output, void* info) {
+    if (ammod::ProcessExiting()) return originalTreeApply(tree, input, output, info);
     if (!hasStrictFilters.load(std::memory_order_acquire))
         return originalTreeApply(tree, input, output, info);
     try {
         std::vector<void*> strict;
         if (!CollectStrict(tree, strict)) return -1;
         if (strict.empty()) return originalTreeApply(tree, input, output, info);
+        StrictViews views;
+        views.values.reserve(strict.size());
+        for (void* filter : strict) {
+            void* context{}; State* state{};
+            if (!TryRetainStrictState(filter, context, state)) return -1;
+            views.values.push_back({filter, context, state});
+        }
 
         // A filter object may outlive one media item and the same retained
         // filter may participate in overlapping tree evaluations. Keep tree
@@ -284,10 +369,8 @@ std::int32_t __cdecl ApplyTree(void* tree, void* input, void** output, void* inf
         const auto evaluationGeneration = policyGeneration.load(std::memory_order_acquire);
         TreeEvaluationFrame frame;
         frame.entries.reserve(strict.size());
-        for (void* filter : strict) {
-            void* context = reinterpret_cast<void*>(Word(
-                filter, ammod::apple_private::core_media_filter::kStrictContext));
-            auto* state = GetState(context);
+        for (const auto& view : views.values) {
+            auto* state = view.state;
             const bool alreadyPresent = std::any_of(
                 frame.entries.begin(), frame.entries.end(),
                 [state](const TreeEvaluationEntry& entry) { return entry.state == state; });
@@ -304,11 +387,11 @@ std::int32_t __cdecl ApplyTree(void* tree, void* input, void** output, void* inf
         // list before bandwidth leaves can remove high-rate ALAC candidates.
         const auto count = input ? arrayCount(input) : 0;
         if (count < 0 || count > 65536) return -1;
-        for (void* filter : strict) {
-            void* context = reinterpret_cast<void*>(Word(filter, ammod::apple_private::core_media_filter::kStrictContext));
+        for (const auto& view : views.values) {
+            void* context = view.context;
             for (std::int64_t i = 0; i < count; ++i)
-                Observe(const_cast<void*>(arrayValue(input, i)), context, filter);
-            auto& state = *GetState(context);
+                Observe(const_cast<void*>(arrayValue(input, i)), context, view.filter);
+            auto& state = *view.state;
             auto& evaluation = CurrentEvaluation(state);
             if (InterlockedCompareExchange(&evaluation.sawLossless, 0, 0) == 0 && writeLog) {
                 writeLog(L"Strict ALAC filter found no lossless candidate in current evaluation; preserving AAC-only native selection");
@@ -321,8 +404,8 @@ std::int32_t __cdecl ApplyTree(void* tree, void* input, void** output, void* inf
         for (std::int64_t i = 0; i < returned; ++i) {
             void* alternate = const_cast<void*>(arrayValue(*output, i));
             bool admitted = true;
-            for (void* filter : strict) {
-                if (!Accept(alternate, reinterpret_cast<void*>(Word(filter, ammod::apple_private::core_media_filter::kStrictContext)), filter)) {
+            for (const auto& view : views.values) {
+                if (!Accept(alternate, view.context, view.filter)) {
                     admitted = false;
                     break;
                 }
@@ -342,12 +425,57 @@ std::int32_t __cdecl ApplyTree(void* tree, void* input, void** output, void* inf
     }
 }
 
+// The tree-apply hook below patches a raw RVA inside CoreMedia.dll. Nothing
+// else in the process can prove that address still holds the verified
+// function after an Apple update, so the loaded image is compared against the
+// recorded prologue bytes first. On mismatch the quality lock stays
+// permanently unavailable in this process instead of detouring unknown code.
+std::atomic<bool> imageRejected{};
+
+bool ImageMatchesVerifiedBuild(HMODULE media) {
+    namespace offsets = ammod::apple_private::core_media_filter;
+    const auto* base = reinterpret_cast<const std::uint8_t*>(media);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) return false;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        return false;
+    }
+    const std::uintptr_t imageSize = nt->OptionalHeader.SizeOfImage;
+    const auto matches = [&](std::uintptr_t rva, const auto& prologue) {
+        return rva + prologue.size() <= imageSize &&
+               std::memcmp(base + rva, prologue.data(), prologue.size()) == 0;
+    };
+    const bool ok = matches(offsets::kSimpleApplyRva, offsets::kSimpleApplyPrologue) &&
+                    matches(offsets::kTreeApplyRva, offsets::kTreeApplyPrologue);
+    if (!ok && writeLog) {
+        wchar_t text[192]{};
+        std::swprintf(text, std::size(text),
+                      L"Highest ALAC quality filter hook disabled: CoreMedia image does not "
+                      L"match the verified build (timestamp=0x%08X sizeOfImage=0x%08X)",
+                      static_cast<unsigned>(nt->FileHeader.TimeDateStamp),
+                      static_cast<unsigned>(nt->OptionalHeader.SizeOfImage));
+        writeLog(text);
+    }
+    return ok;
+}
+
 } // namespace
+
+bool Unavailable() noexcept {
+    return imageRejected.load(std::memory_order_acquire);
+}
 
 bool Install(HMODULE media, HMODULE foundation, LogFunction log) {
     std::lock_guard lock(installMutex);
     if (installed) return true;
+    if (imageRejected.load(std::memory_order_acquire)) return false;
     writeLog = log;
+    if (!ImageMatchesVerifiedBuild(media)) {
+        imageRejected.store(true, std::memory_order_release);
+        return false;
+    }
     maxSampleRate = reinterpret_cast<decltype(maxSampleRate)>(GetProcAddress(media, "FigAlternateGetMaxAudioSampleRate"));
     arrayCreate = reinterpret_cast<decltype(arrayCreate)>(GetProcAddress(foundation, "CFArrayCreate"));
     arrayValue = reinterpret_cast<decltype(arrayValue)>(GetProcAddress(foundation, "CFArrayGetValueAtIndex"));
@@ -357,11 +485,15 @@ bool Install(HMODULE media, HMODULE foundation, LogFunction log) {
     dataBytes = reinterpret_cast<decltype(dataBytes)>(GetProcAddress(foundation, "CFDataGetMutableBytePtr"));
     dataLength = reinterpret_cast<decltype(dataLength)>(GetProcAddress(foundation, "CFDataGetLength"));
     release = reinterpret_cast<decltype(release)>(GetProcAddress(foundation, "CFRelease"));
+    retain = reinterpret_cast<decltype(retain)>(GetProcAddress(foundation, "CFRetain"));
+    typeId = reinterpret_cast<decltype(typeId)>(GetProcAddress(foundation, "CFGetTypeID"));
+    arrayTypeId = reinterpret_cast<decltype(arrayTypeId)>(GetProcAddress(foundation, "CFArrayGetTypeID"));
+    dataTypeId = reinterpret_cast<decltype(dataTypeId)>(GetProcAddress(foundation, "CFDataGetTypeID"));
     arrayCallbacks = GetProcAddress(foundation, "kCFTypeArrayCallBacks");
     auto target = reinterpret_cast<void*>(GetProcAddress(media, "FigSimpleAlternateFilterCreate"));
     if (!maxSampleRate || !arrayCreate || !arrayValue || !arrayCount || !dataCreate ||
         !dataSetLength || !dataBytes || !dataLength ||
-        !release || !arrayCallbacks || !target) return false;
+        !release || !retain || !typeId || !arrayTypeId || !dataTypeId || !arrayCallbacks || !target) return false;
     if (!originalCreate && MH_CreateHook(target, reinterpret_cast<void*>(Create),
                                         reinterpret_cast<void**>(&originalCreate)) != MH_OK) return false;
     const auto status = MH_EnableHook(target);

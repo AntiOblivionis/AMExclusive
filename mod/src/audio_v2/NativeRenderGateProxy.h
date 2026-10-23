@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 #include "SoftwareRenderBuffer.h"
+#include "../ProcessLifetime.h"
 
 namespace ammod::audio_v2 {
 
@@ -90,6 +91,7 @@ public:
     NativeRenderGateProxy& operator=(const NativeRenderGateProxy&) = delete;
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (!object) return E_POINTER;
         *object = nullptr;
         if (iid == __uuidof(IUnknown) || iid == __uuidof(IAudioRenderClient)) {
@@ -104,12 +106,14 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
 
     ULONG STDMETHODCALLTYPE Release() override {
+        if (ammod::ProcessExiting()) return 1;
         const ULONG remaining = --references_;
         if (!remaining) delete this;
         return remaining;
     }
 
     HRESULT STDMETHODCALLTYPE GetBuffer(UINT32 frames, BYTE** data) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         if (data) *data = nullptr;
         // Real clients retain WASAPI ownership. Software clients reserve the
         // same shared ledger used by padding and clock queries.
@@ -155,6 +159,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE ReleaseBuffer(UINT32 frames, DWORD flags) override {
+        if (ammod::ProcessExiting()) return AUDCLNT_E_SERVICE_NOT_RUNNING;
         DWORD effectiveFlags = flags;
         bool shadow = false;
         const bool suppress = ShouldSuppress();

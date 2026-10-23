@@ -28,6 +28,7 @@ struct ConverterRegistration final {
 
 struct ConverterRegistrationSnapshot final {
     std::size_t slot{};
+    std::uint64_t registrationId{};
     ConverterRegistration registration{};
     std::uint64_t nextFrame{};
     bool discontinuity{};
@@ -46,7 +47,8 @@ public:
     AudioCoreConverterRegistry(const AudioCoreConverterRegistry&) = delete;
     AudioCoreConverterRegistry& operator=(const AudioCoreConverterRegistry&) = delete;
 
-    bool Register(const ConverterRegistration& registration) noexcept {
+    bool Register(const ConverterRegistration& registration,
+                  bool descriptorRefresh = false) noexcept {
         if (!registration.converter || registration.mediaGeneration == 0 ||
             !IsValidFormat(registration.outputFormat) ||
             (registration.sourceBitDepth != 0 &&
@@ -55,6 +57,26 @@ public:
             return false;
         }
         Slot* slot = FindSlot(registration.converter);
+        // A property query describes the same decoder lifetime. Preserve its
+        // frame cursor, binding and pending PCM when only precision/observation
+        // metadata becomes available. Actual creation always mints a new ID.
+        if (slot && descriptorRefresh &&
+            slot->rate.load(std::memory_order_acquire) == registration.outputFormat.sampleRate &&
+            slot->channels.load(std::memory_order_acquire) == registration.outputFormat.channels &&
+            slot->containerBits.load(std::memory_order_acquire) == registration.outputFormat.containerBits &&
+            slot->encoding.load(std::memory_order_acquire) == static_cast<std::uint8_t>(registration.outputFormat.encoding) &&
+            slot->encodedFormat.load(std::memory_order_acquire) == registration.encodedFormat &&
+            slot->appleFormatFlags.load(std::memory_order_acquire) == registration.appleFormatFlags &&
+            slot->appleBytesPerFrame.load(std::memory_order_acquire) == registration.appleBytesPerFrame &&
+            (registration.sourceBitDepth == 0 || slot->sourceBitDepth.load(std::memory_order_acquire) == 0 ||
+             slot->sourceBitDepth.load(std::memory_order_acquire) == registration.sourceBitDepth)) {
+            slot->observationId.store(registration.observationId, std::memory_order_release);
+            if (registration.sourceBitDepth != 0) {
+                UpdateSourcePrecision(registration.converter, registration.sourceBitDepth,
+                                      registration.outputFormat.sampleRate, registration.outputFormat.channels);
+            }
+            return true;
+        }
         if (!slot) {
             for (auto& candidate : slots_) {
                 std::uintptr_t expected = 0;
@@ -73,6 +95,7 @@ public:
         // immutable descriptor is written, and finally the real key is
         // released with release semantics.
         slot->key.store(kReservedKey, std::memory_order_release);
+        slot->registrationId.store(++nextRegistrationId_, std::memory_order_release);
         slot->rate.store(registration.outputFormat.sampleRate, std::memory_order_relaxed);
         slot->channels.store(registration.outputFormat.channels, std::memory_order_relaxed);
         slot->validBits.store(registration.outputFormat.validBits, std::memory_order_relaxed);
@@ -312,7 +335,9 @@ public:
         for (std::size_t index = 0; index < slots_.size(); ++index) {
             const auto& slot = slots_[index];
             if (slot.key.load(std::memory_order_acquire) != key) continue;
+            const auto registrationId = slot.registrationId.load(std::memory_order_acquire);
             snapshot.slot = index;
+            snapshot.registrationId = registrationId;
             snapshot.registration.converter = converter;
             snapshot.registration.outputFormat = {
                 slot.rate.load(std::memory_order_relaxed),
@@ -348,7 +373,8 @@ public:
             snapshot.bound = slot.bound.load(std::memory_order_acquire);
             // Validate publication once more. A concurrent retire/reuse makes
             // this callback a no-op instead of using a mixed descriptor.
-            return slot.key.load(std::memory_order_acquire) == key;
+            return slot.key.load(std::memory_order_acquire) == key &&
+                slot.registrationId.load(std::memory_order_acquire) == registrationId;
         }
         return false;
     }
@@ -372,6 +398,7 @@ private:
     struct Slot final {
         static constexpr std::uintptr_t kEmpty = 0;
         std::atomic<std::uintptr_t> key{kEmpty};
+        std::atomic<std::uint64_t> registrationId{};
         std::atomic<std::uint32_t> rate{};
         std::atomic<std::uint32_t> channels{};
         std::atomic<std::uint32_t> validBits{};
@@ -395,6 +422,7 @@ private:
     };
 
     static constexpr std::uintptr_t kReservedKey = 1;
+    std::uint64_t nextRegistrationId_{}; // Register is serialized by Runtime.
 
     Slot* FindSlot(void* converter) noexcept {
         const auto key = reinterpret_cast<std::uintptr_t>(converter);

@@ -1,6 +1,7 @@
 #include "BoundedLog.h"
 #include "IpcProtocol.h"
 #include "IpcTransport.h"
+#include "UiRefreshState.h"
 
 #include <windows.h>
 
@@ -27,9 +28,11 @@
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -70,76 +73,36 @@ std::atomic<ULONGLONG> g_resamplingAckDeadlineTick{};
 std::atomic<bool> g_suppressResamplingToggle{};
 std::atomic<int> g_programmaticResamplingValue{-1};
 std::atomic<std::uint64_t> g_lastLoggedGeneration{UINT64_MAX};
-std::atomic<HHOOK> g_uiHook{};
-std::atomic<DWORD> g_uiHookThreadId{};
 std::atomic<std::uint64_t> g_transportEpoch{};
 std::atomic<std::uint64_t> g_activeSeekEpoch{};
 std::atomic<std::uintptr_t> g_activeSeekOwner{};
 std::atomic<ULONGLONG> g_lastSkipPointerTick{};
 std::deque<Message> g_transportPending;
-std::vector<ObserverRef> g_transportButtonObservers;
-std::vector<ObserverRef> g_skipBackObservers;
-std::vector<ObserverRef> g_skipForwardObservers;
-std::vector<ObserverRef> g_trackListPointerRootObservers;
-std::vector<ObserverRef> g_scrubberObservers;
-std::vector<ObserverRef> g_scrubberThumbObservers;
-std::vector<ObserverRef> g_transportPopupObservers;
-std::vector<WindowObserverRef> g_transportWindowObservers;
-std::atomic<bool> g_transportAttachScheduled{};
-std::uintptr_t g_lastTrackRowPressIdentity{};
-std::uint64_t g_lastTrackRowPressEpoch{};
-ULONGLONG g_lastTrackRowPressTick{};
+// Weak XAML controls must only be resolved on their owning UI thread.
+thread_local std::vector<ObserverRef> g_transportButtonObservers;
+thread_local std::vector<ObserverRef> g_skipBackObservers;
+thread_local std::vector<ObserverRef> g_skipForwardObservers;
+thread_local std::vector<ObserverRef> g_trackListPointerRootObservers;
+thread_local std::vector<ObserverRef> g_scrubberObservers;
+thread_local std::vector<ObserverRef> g_scrubberThumbObservers;
+thread_local std::vector<ObserverRef> g_transportPopupObservers;
+thread_local std::vector<WindowObserverRef> g_transportWindowObservers;
+thread_local std::uintptr_t g_lastTrackRowPressIdentity{};
+thread_local std::uint64_t g_lastTrackRowPressEpoch{};
+thread_local ULONGLONG g_lastTrackRowPressTick{};
 HWINEVENTHOOK g_windowLifecycleHook{};
-HWND g_mainWindow{};
 winrt::weak_ref<Controls::ToggleSwitch> g_toggle;
 winrt::weak_ref<Controls::TextBox> g_hardwareBufferBox;
 winrt::weak_ref<Controls::ToggleSwitch> g_resamplingToggle;
 winrt::weak_ref<Controls::Border> g_outputFormatCard;
 Microsoft::UI::Dispatching::DispatcherQueue g_dispatcher{nullptr};
 Microsoft::UI::Dispatching::DispatcherQueueTimer g_statusRefreshTimer{nullptr};
+WindowObserverRef g_settingsWindow;
 
-void AttachTransportObservers();
-void AttachOrRefreshToggle();
+void AttachTransportObservers(const Xaml::Window& window, const std::wstring& windowProperty);
+bool AttachOrRefreshToggle(const Xaml::DependencyObject& page);
 void ScheduleTransportObserverAttach();
-LRESULT CALLBACK UiThreadHook(int code, WPARAM wParam, LPARAM lParam);
-
-bool ArmUiThreadRefresh(HWND window) {
-    if (!window || !IsWindow(window)) return false;
-    DWORD pid{};
-    const DWORD threadId = GetWindowThreadProcessId(window, &pid);
-    if (!threadId || pid != GetCurrentProcessId()) return false;
-
-    for (;;) {
-        HHOOK current = g_uiHook.load(std::memory_order_acquire);
-        const DWORD currentThread = g_uiHookThreadId.load(std::memory_order_acquire);
-        if (current && currentThread == threadId) {
-            PostMessageW(window, WM_NULL, 0, 0);
-            return true;
-        }
-        if (current) {
-            HHOOK expected = current;
-            if (!g_uiHook.compare_exchange_strong(
-                    expected, nullptr, std::memory_order_acq_rel,
-                    std::memory_order_acquire)) {
-                continue;
-            }
-            g_uiHookThreadId.store(0, std::memory_order_release);
-            UnhookWindowsHookEx(current);
-        }
-
-        HHOOK hook = SetWindowsHookExW(WH_GETMESSAGE, UiThreadHook, g_module, threadId);
-        if (!hook) return false;
-        HHOOK expected{};
-        if (g_uiHook.compare_exchange_strong(
-                expected, hook, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            g_uiHookThreadId.store(threadId, std::memory_order_release);
-            PostMessageW(window, WM_NULL, 0, 0);
-            return true;
-        }
-        UnhookWindowsHookEx(hook);
-    }
-}
+void ScheduleUiDiscovery();
 
 void CALLBACK WindowLifecycleEvent(HWINEVENTHOOK, DWORD event, HWND window,
                                    LONG objectId, LONG childId, DWORD, DWORD) {
@@ -148,7 +111,9 @@ void CALLBACK WindowLifecycleEvent(HWINEVENTHOOK, DWORD event, HWND window,
         GetAncestor(window, GA_ROOT) != window) {
         return;
     }
-    (void)ArmUiThreadRefresh(window);
+    // HWND ownership does not identify a XAML apartment. Always dispatch via
+    // the actual XAML Window, even when this event came from an auxiliary HWND.
+    ScheduleUiDiscovery();
 }
 
 bool UseChineseUi() {
@@ -224,10 +189,17 @@ std::wstring ErrorText(ErrorCategory category) {
         return Localized(
             L"独占设备已启动，但 Apple Music 未继续提交音频；独占模式仍保持开启，将在下一首歌曲重试",
             L"Apple Music stopped sending audio; exclusive mode remains enabled and will retry on the next song");
+    case ErrorCategory::EndpointDrainTimeout:
+        return Localized(
+            L"等待播放设备完成歌曲尾部播放时超时；请重试歌曲",
+            L"Timed out waiting for the playback device to finish the track tail; retry the song");
     case ErrorCategory::BufferSizeNotAligned:
         return Localized(
             L"声卡驱动拒绝了当前硬件缓冲区；请调整硬件缓冲区后重试",
             L"The audio driver rejected the current hardware buffer; adjust Hardware buffer and try again");
+    case ErrorCategory::ProtocolVersionMismatch:
+        return Localized(L"独占音频组件版本不一致；请修复安装并重启 Apple Music",
+                         L"Audio component versions do not match; repair installation and restart Apple Music");
     case ErrorCategory::HookLoadFailed:
     case ErrorCategory::BrokerUnavailable:
     case ErrorCategory::PipeUnavailable:
@@ -335,31 +307,19 @@ void CommitSeekGesture(std::uintptr_t owner = 0, std::wstring_view reason = {}) 
     }
 }
 
-HWND FindMainWindow() {
-    struct Context { DWORD pid; HWND window; } context{GetCurrentProcessId(), nullptr};
-    EnumWindows([](HWND window, LPARAM value) -> BOOL {
-        auto& context = *reinterpret_cast<Context*>(value);
-        DWORD pid{};
-        GetWindowThreadProcessId(window, &pid);
-        if (pid == context.pid && IsWindowVisible(window) && GetWindow(window, GW_OWNER) == nullptr) {
-            context.window = window;
-            return FALSE;
-        }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&context));
-    return context.window;
-}
-
 using GetAppPropertyFn = Windows::Foundation::IInspectable(__cdecl*)(hstring const&);
 
 GetAppPropertyFn GetAppPropertyFunction() {
-    static GetAppPropertyFn function = [] {
+    static std::atomic<GetAppPropertyFn> cached{};
+    if (auto function = cached.load(std::memory_order_acquire)) return function;
+    const auto function = [] {
         HMODULE utils = GetModuleHandleW(L"AMP.Utils.dll");
         if (!utils) return GetAppPropertyFn{};
         constexpr char exportName[] =
             "?GetAppProperty@SharedUtils@@YA?AUIInspectable@Foundation@Windows@winrt@@AEBUhstring@5@@Z";
         return reinterpret_cast<GetAppPropertyFn>(GetProcAddress(utils, exportName));
     }();
+    if (function) cached.store(function, std::memory_order_release);
     return function;
 }
 
@@ -369,16 +329,13 @@ Xaml::Window GetXamlWindowProperty(std::wstring_view propertyName) {
     try {
         return function(hstring(propertyName)).try_as<Xaml::Window>();
     } catch (const hresult_error& error) {
+        if (propertyName == L"MiniPlayerWindow" && error.code() == E_BOUNDS) return nullptr;
         Log(L"GetAppProperty(" + std::wstring(propertyName) + L") failed hr=0x" +
             [&] { std::wostringstream text; text << std::hex << error.code().value; return text.str(); }());
         return nullptr;
     } catch (...) {
         return nullptr;
     }
-}
-
-Xaml::Window GetMainXamlWindow() {
-    return GetXamlWindowProperty(L"MainWindow");
 }
 
 void AppendUniqueWindow(std::vector<std::pair<std::wstring, Xaml::Window>>& windows,
@@ -706,6 +663,11 @@ void ApplyStatus(const Controls::ToggleSwitch& toggle) {
         if (status.endpointName[0]) presentation += L" · " + std::wstring(status.endpointName);
     } else if (status.state == RuntimeState::DisablePending) {
         presentation = Localized(L"正在恢复共享输出…", L"Restoring shared output…");
+    } else if (status.enabledIntent && (status.error == ErrorCategory::HookLoadFailed ||
+                                      status.error == ErrorCategory::ProtocolVersionMismatch)) {
+        // Surface a component failure while preserving the user's intent;
+        // "Waiting for playback" would hide the required repair.
+        presentation = ErrorText(status.error);
     } else if (status.state == RuntimeState::Requested ||
                status.state == RuntimeState::WaitingForStream) {
         presentation = Localized(L"已开启 · 等待播放", L"Enabled · Waiting for playback");
@@ -817,6 +779,366 @@ void CommitHardwareBuffer(const Controls::TextBox& input) {
         std::to_wstring(milliseconds));
 }
 
+struct UiHostWatch {
+    ObserverRef node;
+    Xaml::DependencyProperty property{nullptr};
+    std::int64_t propertyToken{};
+    event_token loaded{}, unloaded{};
+    std::uintptr_t identity{};
+};
+
+struct UiWindowContext {
+    WindowObserverRef window;
+    Microsoft::UI::Dispatching::DispatcherQueue dispatcher{nullptr};
+    std::wstring propertyName;
+    ammod::UiRefreshState requests;
+    std::atomic<bool> closed{};
+    std::atomic<bool> routesDirty{true}, transportDirty{true};
+    // Everything below is confined to dispatcher, including weak resolution.
+    ObserverRef root, page;
+    std::uint64_t rootRevision{};
+    ULONGLONG pageObservedTick{};
+    bool pageMounted{};
+    bool windowObserved{};
+    bool ownerListed{};
+    std::vector<UiHostWatch> hosts;
+    std::unordered_set<std::uintptr_t> hostIds;
+    event_token layout{};
+    Windows::Foundation::IInspectable tapped{nullptr}, keyDown{nullptr};
+    unsigned routeNodes{}, refreshCount{}, routeWalkCount{}, transportWalkCount{};
+    ULONGLONG longestRefreshMs{}, lastDiagnosticTick{};
+};
+
+std::mutex g_uiWindowsMutex;
+std::vector<std::shared_ptr<UiWindowContext>> g_uiWindows;
+thread_local std::vector<std::weak_ptr<UiWindowContext>> g_threadUiWindows;
+void RefreshUiWindow(const std::shared_ptr<UiWindowContext>& context);
+
+void QueueUiRefresh(const std::shared_ptr<UiWindowContext>& context) {
+    const auto ticket = context->requests.Request();
+    if (!ticket) return;
+    try {
+        if (context->dispatcher.TryEnqueue(Microsoft::UI::Dispatching::DispatcherQueuePriority::Low,
+            [context, ticket] {
+                if (!context->requests.Take(ticket)) return;
+                try {
+                    RefreshUiWindow(context);
+                } catch (const hresult_error& error) {
+                    Log(L"window UI refresh failed hr=" +
+                        std::to_wstring(static_cast<std::uint32_t>(error.code())));
+                } catch (...) {
+                    Log(L"window UI refresh failed with unknown exception");
+                }
+            })) return;
+    } catch (...) {
+        // A dispatcher may be shutting down while a WinEvent requests work.
+    }
+    (void)context->requests.Take(ticket);
+}
+
+void WakeUiWindow(const std::weak_ptr<UiWindowContext>& weak,
+                  std::uint64_t rootRevision) noexcept {
+    try {
+        if (auto context = weak.lock(); context && !context->closed.load() &&
+            context->rootRevision == rootRevision) {
+            context->requests.ArmLayout(GetTickCount64());
+            context->routesDirty.store(true);
+            context->transportDirty.store(true);
+            QueueUiRefresh(context);
+        }
+    } catch (...) {
+        // XAML event callbacks must not throw into the host application.
+    }
+}
+
+void ClearUiRoot(const std::shared_ptr<UiWindowContext>& context) {
+    ++context->rootRevision; // In-flight old-root events lose authority first.
+    context->requests.StopLayout();
+    for (const auto& watch : context->hosts) {
+        try {
+            if (auto node = watch.node.get()) {
+                if (watch.property)
+                    node.UnregisterPropertyChangedCallback(watch.property, watch.propertyToken);
+                if (auto element = node.try_as<Xaml::FrameworkElement>()) {
+                    element.Loaded(watch.loaded);
+                    element.Unloaded(watch.unloaded);
+                }
+            }
+        } catch (...) {}
+    }
+    context->hosts.clear();
+    context->hostIds.clear();
+    if (auto page = context->page.get().try_as<Xaml::FrameworkElement>()) {
+        try { page.LayoutUpdated(context->layout); } catch (...) {}
+    }
+    if (auto root = context->root.get().try_as<Xaml::FrameworkElement>()) {
+        try {
+            if (context->tapped)
+                root.RemoveHandler(Xaml::UIElement::TappedEvent(), context->tapped);
+            if (context->keyDown)
+                root.RemoveHandler(Xaml::UIElement::KeyDownEvent(), context->keyDown);
+        } catch (...) {}
+    }
+    context->root = {};
+    context->page = {};
+    context->tapped = nullptr;
+    context->keyDown = nullptr;
+    context->pageMounted = false;
+}
+
+void ObserveUiHosts(const Xaml::DependencyObject& root,
+                    const std::shared_ptr<UiWindowContext>& context,
+                    Xaml::DependencyObject& playbackPage) {
+    context->routeNodes = static_cast<unsigned>(ammod::WalkUiRoutes(root,
+        [](const auto& node) { return reinterpret_cast<std::uintptr_t>(get_abi(node)); },
+        [&](const Xaml::DependencyObject& node, auto logical, auto visual) {
+        // Scrolling/virtualization is not navigation. Never subscribe to, or
+        // descend into, library rows, buttons or our own cards.
+        if (node.try_as<Controls::ItemsControl>() || node.try_as<Controls::ItemsRepeater>() ||
+            node.try_as<Primitives::ButtonBase>()) return;
+        auto element = node.try_as<Xaml::FrameworkElement>();
+        if (element && std::wstring_view(element.Name()).starts_with(L"AMExclusive")) return;
+        auto page = node.try_as<Controls::Page>();
+        const bool isPage = page && std::wstring_view(get_class_name(node)).find(
+            L"PlaybackSettingsPage") != std::wstring_view::npos;
+        if (isPage) playbackPage = node;
+        auto frame = node.try_as<Controls::Frame>();
+        auto userControl = node.try_as<Controls::UserControl>();
+        const bool isRoot = node == root;
+        Xaml::DependencyProperty property{nullptr};
+        Xaml::DependencyObject logicalChild{nullptr};
+        if (frame) {
+            property = Controls::ContentControl::ContentProperty();
+            logicalChild = frame.Content().try_as<Xaml::DependencyObject>();
+        } else if (userControl) {
+            property = Controls::UserControl::ContentProperty();
+            logicalChild = userControl.Content();
+        } else if (auto content = node.try_as<Controls::ContentControl>()) {
+            auto child = content.Content().try_as<Xaml::DependencyObject>();
+            if (isRoot || (child && child.try_as<Controls::Page>())) {
+                property = Controls::ContentControl::ContentProperty();
+                logicalChild = child;
+            }
+        }
+        const auto identity = reinterpret_cast<std::uintptr_t>(get_abi(node));
+        // O(1) lookup replaces repeated weak-resolution scans of every host.
+        // Reserve the final observer slot for the actual settings page.
+        if (element && (frame || userControl || page || isRoot || property) &&
+            context->hosts.size() < (isPage ? 64u : 63u) &&
+            !context->hostIds.contains(identity)) {
+            const std::weak_ptr<UiWindowContext> weak = context;
+            const auto revision = context->rootRevision;
+            // Loaded does not bubble. Subscribe to the actual Page/container.
+            UiHostWatch watch{make_weak(node), property};
+            watch.identity = identity;
+            watch.loaded = element.Loaded([weak, revision](auto&&, auto&&) noexcept {
+                WakeUiWindow(weak, revision);
+            });
+            watch.unloaded = element.Unloaded([weak, revision, isPage](auto&&, auto&&) noexcept {
+                if (auto live = weak.lock(); live && live->rootRevision == revision && isPage)
+                    live->pageMounted = false;
+                WakeUiWindow(weak, revision);
+            });
+            if (property) {
+                watch.propertyToken = node.RegisterPropertyChangedCallback(property,
+                    [weak, revision](auto&&, auto&&) noexcept { WakeUiWindow(weak, revision); });
+            }
+            context->hosts.push_back(std::move(watch));
+            context->hostIds.insert(identity);
+        }
+        if (isPage) return; // Its native control/template tree is not routing.
+        if (logicalChild) { logical(logicalChild); return; }
+        const auto count = Media::VisualTreeHelper::GetChildrenCount(node);
+        for (int index = 0; index < count; ++index)
+            if (!visual(Media::VisualTreeHelper::GetChild(node, index))) break;
+    }));
+}
+
+void RefreshUiWindow(const std::shared_ptr<UiWindowContext>& context) {
+    if (context->closed.load() || !context->dispatcher.HasThreadAccess()) return;
+    auto window = context->window.get();
+    if (!window || !window.DispatcherQueue().HasThreadAccess()) return;
+    if (GetXamlWindowProperty(context->propertyName) != window) {
+        ClearUiRoot(context);
+        return; // A queued callback may belong to a replaced Window property.
+    }
+    const auto refreshStart = GetTickCount64();
+    bool discover = context->routesDirty.exchange(false);
+    bool transport = context->transportDirty.exchange(false);
+    if (!context->ownerListed) {
+        g_threadUiWindows.emplace_back(context);
+        context->ownerListed = true;
+    }
+    if (!context->windowObserved) {
+        const std::weak_ptr<UiWindowContext> weak = context;
+        window.Activated([weak](auto&&, auto&&) noexcept {
+            if (auto live = weak.lock()) WakeUiWindow(weak, live->rootRevision);
+        });
+        window.VisibilityChanged([weak](auto&&, auto&&) noexcept {
+            if (auto live = weak.lock()) WakeUiWindow(weak, live->rootRevision);
+        });
+        window.Closed([weak](auto&&, auto&&) noexcept {
+            if (auto live = weak.lock()) {
+                live->closed.store(true);
+                live->requests.Close();
+                try { ClearUiRoot(live); } catch (...) {}
+                try {
+                    if (live->propertyName == L"MainWindow") {
+                        std::lock_guard lock(g_uiTargetMutex);
+                        if (g_settingsWindow.get() == live->window.get()) {
+                            if (g_statusRefreshTimer) g_statusRefreshTimer.Stop();
+                            g_statusRefreshTimer = nullptr;
+                            g_toggle = {}; g_hardwareBufferBox = {};
+                            g_resamplingToggle = {}; g_outputFormatCard = {};
+                            g_dispatcher = nullptr;
+                            g_settingsWindow = {};
+                        }
+                    }
+                } catch (...) {}
+            }
+        });
+        context->windowObserved = true;
+        Log(L"UI dispatcher bound window=" + context->propertyName);
+    }
+    const bool main = context->propertyName == L"MainWindow";
+    if (main) {
+        Microsoft::UI::Dispatching::DispatcherQueue oldDispatcher{nullptr};
+        Microsoft::UI::Dispatching::DispatcherQueueTimer oldTimer{nullptr};
+        {
+            std::lock_guard lock(g_uiTargetMutex);
+            if (g_dispatcher != context->dispatcher) {
+                oldDispatcher = g_dispatcher;
+                oldTimer = g_statusRefreshTimer;
+                g_statusRefreshTimer = nullptr;
+                g_toggle = {}; g_hardwareBufferBox = {};
+                g_resamplingToggle = {}; g_outputFormatCard = {};
+                g_dispatcher = context->dispatcher;
+            }
+            g_settingsWindow = context->window;
+        }
+        if (oldDispatcher && oldTimer)
+            oldDispatcher.TryEnqueue([oldTimer]() noexcept {
+                try { oldTimer.Stop(); } catch (...) {}
+            });
+    }
+    auto content = window.Content().try_as<Xaml::DependencyObject>();
+    if (content != context->root.get()) {
+        discover = transport = true;
+        ClearUiRoot(context);
+        context->root = content ? make_weak(content) : ObserverRef{};
+        if (auto root = content.try_as<Xaml::FrameworkElement>()) {
+            const std::weak_ptr<UiWindowContext> weak = context;
+            const auto revision = context->rootRevision;
+            context->tapped = box_value(Input::TappedEventHandler(
+                [weak, revision](auto&&, auto&&) noexcept { WakeUiWindow(weak, revision); }));
+            context->keyDown = box_value(Input::KeyEventHandler(
+                [weak, revision](auto&&, auto&&) noexcept { WakeUiWindow(weak, revision); }));
+            root.AddHandler(Xaml::UIElement::TappedEvent(), context->tapped, true);
+            root.AddHandler(Xaml::UIElement::KeyDownEvent(), context->keyDown, true);
+            context->requests.ArmLayout(GetTickCount64());
+        }
+    }
+    if (!content) return;
+    Xaml::DependencyObject page = context->page.get();
+    if (discover) {
+        std::erase_if(context->hosts, [&context](const auto& watch) {
+            if (watch.node.get()) return false;
+            context->hostIds.erase(watch.identity);
+            return true;
+        });
+        page = nullptr;
+        ObserveUiHosts(content, context, page);
+        ++context->routeWalkCount;
+    }
+    if (main && page != context->page.get()) {
+        if (auto oldPage = context->page.get().try_as<Xaml::FrameworkElement>())
+            oldPage.LayoutUpdated(context->layout);
+        context->page = page ? make_weak(page) : ObserverRef{};
+        context->pageMounted = false;
+        context->pageObservedTick = GetTickCount64();
+        if (auto element = page.try_as<Xaml::FrameworkElement>()) {
+            const std::weak_ptr<UiWindowContext> weak = context;
+            const auto weakPage = make_weak(page);
+            const auto revision = context->rootRevision;
+            context->layout = element.LayoutUpdated(
+                [weak, weakPage, revision](auto&&, auto&&) noexcept {
+                    try {
+                        if (auto live = weak.lock(); live && live->rootRevision == revision &&
+                            live->page.get() == weakPage.get() &&
+                            live->requests.OnLayout(GetTickCount64())) QueueUiRefresh(live);
+                    } catch (...) {}
+                });
+            context->requests.ArmLayout(GetTickCount64());
+            Log(L"PlaybackSettingsPage observed; awaiting loaded/template readiness");
+        }
+    }
+    if (main && page && !context->pageMounted) {
+        auto element = page.try_as<Xaml::FrameworkElement>();
+        if (element && element.IsLoaded() && AttachOrRefreshToggle(page)) {
+            context->pageMounted = true;
+            context->requests.StopLayout();
+            Log(L"PlaybackSettingsPage cards ready observedToMountMs=" +
+                std::to_wstring(GetTickCount64() - context->pageObservedTick));
+        }
+    }
+    if (main && context->pageMounted) context->requests.StopLayout();
+    if (transport) {
+        AttachTransportObservers(window, context->propertyName);
+        ++context->transportWalkCount;
+    }
+    ++context->refreshCount;
+    context->longestRefreshMs = std::max(context->longestRefreshMs, GetTickCount64() - refreshStart);
+    const auto now = GetTickCount64();
+    if (now - context->lastDiagnosticTick >= 5000) {
+        Log(L"UI work window=" + context->propertyName +
+            L" refreshes=" + std::to_wstring(context->refreshCount) +
+            L" routeScans=" + std::to_wstring(context->routeWalkCount) +
+            L" transportScans=" + std::to_wstring(context->transportWalkCount) +
+            L" routeNodes=" + std::to_wstring(context->routeNodes) +
+            L" hosts=" + std::to_wstring(context->hosts.size()) +
+            L" maxRefreshMs=" + std::to_wstring(context->longestRefreshMs));
+        context->lastDiagnosticTick = now;
+        context->refreshCount = context->routeWalkCount = context->transportWalkCount = 0;
+        context->longestRefreshMs = 0;
+    }
+}
+
+void ScheduleUiDiscovery() {
+    // Window.DispatcherQueue is documented as callable from any thread. No
+    // XAML content/control is read until the callback reaches that queue.
+    try {
+        for (const auto& [propertyName, window] : GetTransportXamlWindows()) {
+            auto dispatcher = window.DispatcherQueue();
+            if (!dispatcher) continue;
+            std::shared_ptr<UiWindowContext> context;
+            {
+                std::lock_guard lock(g_uiWindowsMutex);
+                std::erase_if(g_uiWindows, [](const auto& entry) {
+                    return !entry->window.get();
+                });
+                for (const auto& entry : g_uiWindows) {
+                    if (entry->window.get() == window) { context = entry; break; }
+                }
+                if (!context) {
+                    context = std::make_shared<UiWindowContext>();
+                    context->window = make_weak(window);
+                    context->dispatcher = dispatcher;
+                    context->propertyName = propertyName;
+                    g_uiWindows.push_back(context);
+                }
+            }
+            context->routesDirty.store(true);
+            context->transportDirty.store(true);
+            QueueUiRefresh(context);
+        }
+    } catch (const hresult_error& error) {
+        Log(L"UI dispatcher discovery failed hr=" +
+            std::to_wstring(static_cast<std::uint32_t>(error.code())));
+    } catch (...) {
+        Log(L"UI dispatcher discovery failed with unknown exception");
+    }
+}
+
 void RememberToggle(const Controls::ToggleSwitch& toggle) {
     std::lock_guard lock(g_uiTargetMutex);
     g_toggle = make_weak(toggle);
@@ -827,21 +1149,39 @@ void RememberToggle(const Controls::ToggleSwitch& toggle) {
         g_statusRefreshTimer.Interval(std::chrono::milliseconds(250));
         g_statusRefreshTimer.IsRepeating(true);
         g_statusRefreshTimer.Tick([](auto&&, auto&&) {
-            winrt::weak_ref<Controls::ToggleSwitch> target;
-            winrt::weak_ref<Controls::TextBox> hardwareBuffer;
-            winrt::weak_ref<Controls::ToggleSwitch> resampling;
-            winrt::weak_ref<Controls::Border> outputFormat;
-            {
-                std::lock_guard targetLock(g_uiTargetMutex);
-                target = g_toggle;
-                hardwareBuffer = g_hardwareBufferBox;
-                resampling = g_resamplingToggle;
-                outputFormat = g_outputFormatCard;
+            // Handlers run inside Apple's XAML frame. A failure here must stay
+            // inside this DLL; it must never surface as an unhandled error in
+            // the host's dispatcher.
+            try {
+                winrt::weak_ref<Controls::ToggleSwitch> target;
+                winrt::weak_ref<Controls::TextBox> hardwareBuffer;
+                winrt::weak_ref<Controls::ToggleSwitch> resampling;
+                winrt::weak_ref<Controls::Border> outputFormat;
+                {
+                    std::lock_guard targetLock(g_uiTargetMutex);
+                    if (!g_dispatcher || !g_dispatcher.HasThreadAccess()) return;
+                    target = g_toggle;
+                    hardwareBuffer = g_hardwareBufferBox;
+                    resampling = g_resamplingToggle;
+                    outputFormat = g_outputFormatCard;
+                }
+                if (auto control = target.get()) ApplyStatus(control);
+                if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
+                if (auto control = resampling.get()) ApplyResamplingStatus(control);
+                if (auto card = outputFormat.get()) ApplyOutputFormatStatus(card);
+            } catch (const winrt::hresult_error& error) {
+                // The Apply* helpers raise their suppress flags first and
+                // lower them last; a throw in between would leave user
+                // toggles ignored until the next successful tick.
+                g_suppressToggle.store(false);
+                g_suppressResamplingToggle.store(false);
+                Log(L"status refresh tick failed hresult=" +
+                    std::to_wstring(static_cast<std::uint32_t>(error.code())));
+            } catch (...) {
+                g_suppressToggle.store(false);
+                g_suppressResamplingToggle.store(false);
+                Log(L"status refresh tick failed with a non-WinRT exception");
             }
-            if (auto control = target.get()) ApplyStatus(control);
-            if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
-            if (auto control = resampling.get()) ApplyResamplingStatus(control);
-            if (auto card = outputFormat.get()) ApplyOutputFormatStatus(card);
         });
         g_statusRefreshTimer.Start();
         Log(L"UI status refresh timer started intervalMs=250");
@@ -882,30 +1222,34 @@ void ScheduleStatusRefresh() {
     }
     if (dispatcher) {
         dispatcher.TryEnqueue([toggle, hardwareBuffer, resampling, outputFormat] {
-            if (auto control = toggle.get()) ApplyStatus(control);
-            if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
-            if (auto control = resampling.get()) ApplyResamplingStatus(control);
-            if (auto card = outputFormat.get()) ApplyOutputFormatStatus(card);
+            try {
+                if (auto control = toggle.get()) ApplyStatus(control);
+                if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
+                if (auto control = resampling.get()) ApplyResamplingStatus(control);
+                if (auto card = outputFormat.get()) ApplyOutputFormatStatus(card);
+            } catch (const winrt::hresult_error& error) {
+                g_suppressToggle.store(false);
+                g_suppressResamplingToggle.store(false);
+                Log(L"scheduled status refresh failed hresult=" +
+                    std::to_wstring(static_cast<std::uint32_t>(error.code())));
+            } catch (...) {
+                g_suppressToggle.store(false);
+                g_suppressResamplingToggle.store(false);
+                Log(L"scheduled status refresh failed with a non-WinRT exception");
+            }
         });
     }
 }
 
 void ScheduleTransportObserverAttach() {
-    auto dispatcher = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
-    if (!dispatcher) {
-        AttachTransportObservers();
-        return;
-    }
-    bool expected = false;
-    if (!g_transportAttachScheduled.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        return;
-    }
-    if (!dispatcher.TryEnqueue([] {
-            g_transportAttachScheduled.store(false, std::memory_order_release);
-            AttachTransportObservers();
-        })) {
-        g_transportAttachScheduled.store(false, std::memory_order_release);
+    // Input events already know the current apartment. Reuse its contexts;
+    // do not rediscover every Window or walk settings on each pointer event.
+    std::erase_if(g_threadUiWindows, [](const auto& weak) { return weak.expired(); });
+    for (const auto& weak : g_threadUiWindows) {
+        if (auto context = weak.lock(); context && !context->closed.load()) {
+            context->transportDirty.store(true);
+            QueueUiRefresh(context);
+        }
     }
 }
 
@@ -928,13 +1272,12 @@ void AttachTransportPopupLifecycle(const Primitives::Popup& popup) {
     });
 }
 
-void AttachTransportObservers() {
+void AttachTransportObservers(const Xaml::Window& window, const std::wstring& windowProperty) {
     try {
-        const auto windows = GetTransportXamlWindows();
-        for (const auto& [windowProperty, window] : windows) {
+        if (!window || !window.DispatcherQueue().HasThreadAccess()) return;
+        {
             auto content = window.Content().try_as<Xaml::DependencyObject>();
-            if (!content) continue;
-            if (!get_abi(window)) continue;
+            if (!content) return;
             AttachTransportWindowLifecycle(window);
 
             // Preserve the original MainWindow direct-selection behavior while
@@ -1181,15 +1524,22 @@ std::pair<Controls::Border, Controls::ToggleSwitch> CreateResamplingCard(
     Automation::AutomationProperties::SetName(resamplingToggle, resamplingTitle.Text());
     Automation::AutomationProperties::SetHelpText(resamplingToggle, resamplingDescription.Text());
     resamplingToggle.Toggled([](auto&& sender, auto&&) {
-        const int marker = g_programmaticResamplingValue.exchange(-1);
-        if (g_suppressResamplingToggle.load()) return;
-        const bool enabled = sender.template as<Controls::ToggleSwitch>().IsOn();
-        if (marker == (enabled ? 1 : 0)) return;
-        const int requested = g_requestedAllowResampling.load();
-        const bool current = requested >= 0 ? requested != 0 : StatusSnapshot().allowResampling != 0;
-        if (enabled == current) return;
-        SendAllowResampling(enabled);
-        Log(L"resampling setting queued enabled=" + std::to_wstring(enabled));
+        try {
+            const int marker = g_programmaticResamplingValue.exchange(-1);
+            if (g_suppressResamplingToggle.load()) return;
+            const bool enabled = sender.template as<Controls::ToggleSwitch>().IsOn();
+            if (marker == (enabled ? 1 : 0)) return;
+            const int requested = g_requestedAllowResampling.load();
+            const bool current = requested >= 0 ? requested != 0 : StatusSnapshot().allowResampling != 0;
+            if (enabled == current) return;
+            SendAllowResampling(enabled);
+            Log(L"resampling setting queued enabled=" + std::to_wstring(enabled));
+        } catch (const winrt::hresult_error& error) {
+            Log(L"resampling toggle handler failed hresult=" +
+                std::to_wstring(static_cast<std::uint32_t>(error.code())));
+        } catch (...) {
+            Log(L"resampling toggle handler failed with a non-WinRT exception");
+        }
     });
 
     Controls::ColumnDefinition resamplingLabelColumn;
@@ -1226,36 +1576,36 @@ Controls::Border CreateOutputFormatCard(
     return formatCard;
 }
 
-void AttachOrRefreshToggle() {
+bool AttachOrRefreshToggle(const Xaml::DependencyObject& page) {
     try {
-        auto window = GetMainXamlWindow();
-        if (!window) return;
-        auto content = window.Content().try_as<Xaml::DependencyObject>();
-        if (!content) return;
-        auto page = FindByClass(content, L"PlaybackSettingsPage");
-        if (!page) return;
+        if (!page || !page.DispatcherQueue().HasThreadAccess()) return false;
 
         if (auto existing = FindByName(page, L"AMExclusiveModeToggle")) {
+            unsigned complete{};
             if (auto toggle = existing.try_as<Controls::ToggleSwitch>()) {
                 RememberToggle(toggle);
                 ApplyStatus(toggle);
+                ++complete;
             }
             if (auto input = FindByName(page, L"AMExclusiveHardwareBufferInput")
                                  .try_as<Controls::TextBox>()) {
                 RememberHardwareBufferBox(input);
                 ApplyHardwareBufferStatus(input);
+                ++complete;
             }
             if (auto resampling = FindByName(page, L"AMExclusiveResamplingToggle")
                                       .try_as<Controls::ToggleSwitch>()) {
                 RememberResamplingToggle(resampling);
                 ApplyResamplingStatus(resampling);
+                ++complete;
             }
             if (auto formatCard = FindByName(page, L"AMExclusiveOutputFormatCard")
                                       .try_as<Controls::Border>()) {
                 RememberOutputFormatCard(formatCard);
                 ApplyOutputFormatStatus(formatCard);
+                ++complete;
             }
-            return;
+            return complete == 4;
         }
 
         Controls::StackPanel target{nullptr};
@@ -1263,7 +1613,7 @@ void AttachOrRefreshToggle() {
         FindBestStackPanel(page, target, score);
         if (!target || !score) {
             Log(L"PlaybackSettingsPage found but no toggle-bearing StackPanel anchor was verified");
-            return;
+            return false;
         }
 
         auto nativeToggle = FindLastNativeToggle(target);
@@ -1298,6 +1648,7 @@ void AttachOrRefreshToggle() {
                       L"Try to use WASAPI exclusive output on the current default playback device"));
         toggle.Toggled([](winrt::Windows::Foundation::IInspectable const& sender,
                           Xaml::RoutedEventArgs const&) {
+          try {
             if (g_suppressToggle.load()) return;
             auto control = sender.as<Controls::ToggleSwitch>();
             const bool enabled = control.IsOn();
@@ -1331,6 +1682,14 @@ void AttachOrRefreshToggle() {
                 }
                 g_suppressToggle.store(false);
             }
+          } catch (const winrt::hresult_error& error) {
+            g_suppressToggle.store(false);
+            Log(L"exclusive toggle handler failed hresult=" +
+                std::to_wstring(static_cast<std::uint32_t>(error.code())));
+          } catch (...) {
+            g_suppressToggle.store(false);
+            Log(L"exclusive toggle handler failed with a non-WinRT exception");
+          }
         });
         Controls::TextBlock title;
         title.Text(Localized(L"独占模式", L"Exclusive mode"));
@@ -1489,7 +1848,6 @@ void AttachOrRefreshToggle() {
                 }
             });
         }
-        target.Children().Append(card);
 
         Controls::TextBlock bufferTitle;
         bufferTitle.Text(Localized(L"硬件缓冲区", L"Hardware buffer"));
@@ -1528,8 +1886,15 @@ void AttachOrRefreshToggle() {
         bufferApply.VerticalAlignment(Xaml::VerticalAlignment::Center);
         Automation::AutomationProperties::SetName(
             bufferApply, Localized(L"应用硬件缓冲区", L"Apply hardware buffer"));
-        bufferApply.Click([bufferInput](auto&&, auto&&) {
-            CommitHardwareBuffer(bufferInput);
+        bufferApply.Click([weakInput = winrt::make_weak(bufferInput)](auto&&, auto&&) {
+            try {
+                if (auto input = weakInput.get()) CommitHardwareBuffer(input);
+            } catch (const winrt::hresult_error& error) {
+                Log(L"hardware buffer apply failed hresult=" +
+                    std::to_wstring(static_cast<std::uint32_t>(error.code())));
+            } catch (...) {
+                Log(L"hardware buffer apply failed with a non-WinRT exception");
+            }
         });
 
         Controls::ColumnDefinition bufferLabelColumn;
@@ -1562,11 +1927,21 @@ void AttachOrRefreshToggle() {
         bufferCard.VerticalAlignment(card.VerticalAlignment());
         bufferCard.MinHeight(card.MinHeight());
         bufferCard.MaxWidth(card.MaxWidth());
-        target.Children().Append(bufferCard);
         auto [resamplingCard, resamplingToggle] = CreateResamplingCard(card, toggle, nativeText);
-        target.Children().Append(resamplingCard);
         auto formatCard = CreateOutputFormatCard(card, nativeText);
-        target.Children().Append(formatCard);
+        // Construct all cards before publishing any. If an append fails, only
+        // remove this batch, so the next readiness callback can retry cleanly.
+        const Xaml::UIElement cards[]{card, bufferCard, resamplingCard, formatCard};
+        auto children = target.Children();
+        try {
+            for (const auto& item : cards) children.Append(item);
+        } catch (...) {
+            for (const auto& item : cards) {
+                std::uint32_t index{};
+                if (children.IndexOf(item, index)) children.RemoveAt(index);
+            }
+            throw;
+        }
 
         RememberToggle(toggle);
         RememberHardwareBufferBox(bufferInput);
@@ -1579,6 +1954,7 @@ void AttachOrRefreshToggle() {
         Log(L"Hardware buffer settings card attached to PlaybackSettingsPage");
         Log(L"Resampling settings card attached to PlaybackSettingsPage");
         Log(L"Audio format settings card attached to PlaybackSettingsPage");
+        return true;
     } catch (const hresult_error& error) {
         std::wostringstream text;
         text << L"UI attach failed hr=0x" << std::hex << error.code().value << L" " << error.message().c_str();
@@ -1586,17 +1962,7 @@ void AttachOrRefreshToggle() {
     } catch (...) {
         Log(L"UI attach failed with unknown exception");
     }
-}
-
-LRESULT CALLBACK UiThreadHook(int code, WPARAM wParam, LPARAM lParam) {
-    HHOOK hook = g_uiHook.exchange(nullptr, std::memory_order_acq_rel);
-    g_uiHookThreadId.store(0, std::memory_order_release);
-    if (hook) UnhookWindowsHookEx(hook);
-    if (code >= 0) {
-        AttachTransportObservers();
-        AttachOrRefreshToggle();
-    }
-    return CallNextHookEx(nullptr, code, wParam, lParam);
+    return false;
 }
 
 bool StartBrokerIfNeeded() {
@@ -1649,6 +2015,10 @@ DWORD WINAPI PipeThread(void*) {
             g_connected.store(true);
         }
         Log(L"UI broker IPC connected");
+        // Broker broadcasts fan out on independent threads, so an older status
+        // can arrive after a newer one. Broker generations only ever increase
+        // within one broker lifetime; the counter resets per connection.
+        std::uint64_t lastStatusGeneration = 0;
         if (const int requested = g_requestedHardwareBufferMs.load(); requested >= 0) {
             g_pendingHardwareBufferMs.store(requested);
             g_hardwareBufferAckDeadlineTick.store(0);
@@ -1757,6 +2127,13 @@ DWORD WINAPI PipeThread(void*) {
                 break;
             }
             if (incoming.type == MessageType::StatusChanged) {
+                if (incoming.generation < lastStatusGeneration) {
+                    Log(L"ignored stale broker status generation=" +
+                        std::to_wstring(incoming.generation) + L" latest=" +
+                        std::to_wstring(lastStatusGeneration));
+                    continue;
+                }
+                lastStatusGeneration = incoming.generation;
                 {
                     std::lock_guard lock(g_statusMutex);
                     g_status = incoming;
@@ -1802,6 +2179,7 @@ DWORD WINAPI BootstrapThread(void*) {
         g_status = NewMessage(MessageType::StatusChanged, Role::Ui);
         g_status.state = RuntimeState::Off;
     }
+    (void)CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     Log(L"UI adapter loaded");
     if (HANDLE pipeThread = CreateThread(nullptr, 0, PipeThread, nullptr, 0, nullptr)) CloseHandle(pipeThread);
 
@@ -1811,9 +2189,13 @@ DWORD WINAPI BootstrapThread(void*) {
     Log(L"UI window lifecycle WinEvent hook=" +
         std::to_wstring(reinterpret_cast<std::uintptr_t>(g_windowLifecycleHook)));
 
+    // This timer only recovers a missed/new Window/root. Actual navigation and
+    // page readiness are event-driven on the verified window dispatcher.
+    ScheduleUiDiscovery();
+    ULONGLONG lastFallbackTick = GetTickCount64();
+    DWORD waitMs = 5000;
     for (;;) {
-        const DWORD wait = MsgWaitForMultipleObjects(
-            0, nullptr, FALSE, 5000, QS_ALLINPUT);
+        const DWORD wait = MsgWaitForMultipleObjects(0, nullptr, FALSE, waitMs, QS_ALLINPUT);
         if (wait == WAIT_OBJECT_0) {
             MSG message{};
             while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
@@ -1821,8 +2203,15 @@ DWORD WINAPI BootstrapThread(void*) {
                 DispatchMessageW(&message);
             }
         }
-        if (!g_mainWindow || !IsWindow(g_mainWindow)) g_mainWindow = FindMainWindow();
-        if (g_mainWindow) (void)ArmUiThreadRefresh(g_mainWindow);
+        const auto now = GetTickCount64();
+        const auto elapsed = now - lastFallbackTick;
+        if (elapsed >= 5000) {
+            lastFallbackTick = now;
+            ScheduleUiDiscovery();
+            waitMs = 5000;
+        } else {
+            waitMs = static_cast<DWORD>(5000 - elapsed);
+        }
     }
 }
 

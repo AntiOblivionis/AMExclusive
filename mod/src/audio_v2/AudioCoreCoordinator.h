@@ -109,7 +109,9 @@ public:
         // when the worker observes EOS. Always let it see the producer seal;
         // independent queue/staging snapshots cannot prove that it is empty.
         return PendingSourceFrames() != 0 ||
-            (IsConverting() && !sink_.EndOfStreamComplete());
+            (sink_.State() != WasapiSinkState::Closed &&
+             (IsConverting() || sink_.Stats().submittedFrames != 0) &&
+             !sink_.EndOfStreamComplete());
     }
     bool SealEndOfStream() noexcept {
         if (!queue_) return false;

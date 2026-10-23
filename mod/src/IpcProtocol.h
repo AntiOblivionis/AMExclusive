@@ -12,7 +12,7 @@ namespace ammod::ipc {
 
 inline constexpr std::uint32_t kMagic = 0x50494D41; // "AMIP" little-endian
 inline constexpr std::uint16_t kProtocolMajor = 2;
-inline constexpr std::uint16_t kProtocolMinor = 1;
+inline constexpr std::uint16_t kProtocolMinor = 2;
 inline constexpr std::size_t kEndpointIdChars = 256;
 inline constexpr std::size_t kEndpointNameChars = 128;
 inline constexpr std::size_t kFormatChars = 160;
@@ -83,6 +83,7 @@ enum class ErrorCategory : std::uint16_t {
     UnsupportedLocalInt32,
     BitPerfectFormatUnavailable,
     ExclusiveFormatUnavailable,
+    EndpointDrainTimeout,
 };
 
 #pragma pack(push, 1)
@@ -93,6 +94,9 @@ struct Message {
     MessageType type{MessageType::Invalid};
     Role role{Role::Unknown};
     std::uint32_t bytes{sizeof(Message)};
+    // Since 2.2, Broker StatusChanged carries a stable intent/connection token
+    // here. Agent StatusChanged/AttemptFailed must echo it. Command request IDs
+    // retain their existing meaning. The wire size and offsets are unchanged.
     GUID requestId{};
     FILETIME timestampUtc{};
     std::uint32_t senderPid{};
@@ -133,6 +137,8 @@ inline ErrorCategory CategorizeAudioError(HRESULT hr) noexcept {
         return ErrorCategory::BitPerfectFormatUnavailable;
     case ammod::audio::kExclusiveFormatUnavailable:
         return ErrorCategory::ExclusiveFormatUnavailable;
+    case ammod::audio::kEndpointDrainTimeout: return ErrorCategory::EndpointDrainTimeout;
+    case HRESULT_FROM_WIN32(ERROR_TIMEOUT): return ErrorCategory::Timeout;
     case AUDCLNT_E_UNSUPPORTED_FORMAT: return ErrorCategory::FormatUnsupported;
     case AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED: return ErrorCategory::ExclusiveNotAllowed;
     case AUDCLNT_E_DEVICE_IN_USE: return ErrorCategory::DeviceInUse;

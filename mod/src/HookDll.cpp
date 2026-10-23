@@ -183,13 +183,20 @@ std::atomic<bool> g_configuredQualityKnown{};
 std::mutex g_hookMutex;
 std::mutex g_pipeMutex;
 std::mutex g_outboundMutex;
-std::deque<ammod::ipc::Message> g_outbound;
+struct OutboundAgentEvent final {
+    ammod::ipc::Message message{};
+    std::uint64_t contextToken{}, eventEpoch{};
+};
+std::deque<OutboundAgentEvent> g_outbound;
+std::uint64_t g_eventContextToken{1}, g_announcedEventEpoch{};
+GUID g_brokerIntentToken{};
 HANDLE g_pipe{INVALID_HANDLE_VALUE};
 std::atomic<bool> g_ipcConnected{};
 std::atomic<bool> g_ipcEnabled{};
 std::atomic<bool> g_qualityHooksInstalled{};
 ammod::audio_v2::AudioCoreGate g_audioCoreGate;
-ammod::audio_v2::AudioCoreRuntime g_audioCoreRuntime;
+ammod::ProcessLifetimeOwner<ammod::audio_v2::AudioCoreRuntime> g_runtimeOwner;
+ammod::audio_v2::AudioCoreRuntime& g_audioCoreRuntime = g_runtimeOwner.Get();
 CoCreateInstanceFn g_v2OriginalCoCreateInstance{};
 EnumAudioEndpointsFn g_v2OriginalEnumAudioEndpoints{};
 GetDefaultEndpointFn g_v2OriginalGetDefaultEndpoint{};
@@ -1293,6 +1300,7 @@ bool StrictLosslessRequested() {
 }
 
 void __cdecl HookAVCFSetPreferredMaximumSampleRate(void* playerItem, double sampleRate) {
+    if (ammod::ProcessExiting()) { if (g_originalAVCFSetPreferredMaximumSampleRate) g_originalAVCFSetPreferredMaximumSampleRate(playerItem, sampleRate); return; }
     RefreshConfiguredAudioQuality();
     const auto ceiling = ammod::quality::ProfileCeiling(true,
         g_configuredQualityKnown.load(), g_configuredLosslessEnabled.load(),
@@ -1308,6 +1316,7 @@ void __cdecl HookAVCFSetPreferredMaximumSampleRate(void* playerItem, double samp
 }
 
 void __cdecl HookAVCFSetVariantPreferences(void* playerItem, std::uint32_t preferences) {
+    if (ammod::ProcessExiting()) { if (g_originalAVCFSetVariantPreferences) g_originalAVCFSetVariantPreferences(playerItem, preferences); return; }
     RefreshConfiguredAudioQuality();
     // Apple Music 1.6.4.90 can persist streaming quality 20/losslessEnabled=true yet
     // construct a player item without AVVariantPreferenceScalabilityToLosslessAudio
@@ -1334,6 +1343,7 @@ void __cdecl HookAVCFSetVariantPreferences(void* playerItem, std::uint32_t prefe
 
 AppleOSStatus __cdecl HookFigAlternateEligibleLosslessFilterCreate(
     void* allocator, void* options, void* outFilter) {
+    if (ammod::ProcessExiting()) return g_originalFigAlternateEligibleLosslessFilterCreate ? g_originalFigAlternateEligibleLosslessFilterCreate(allocator, options, outFilter) : -1;
     RefreshConfiguredAudioQuality();
     AppleOSStatus result{-1};
     bool strictSubtypeFilter{};
@@ -1559,7 +1569,13 @@ bool InstallQualityLockHooks() {
         g_figAlternateAllowableMediaSubtypeFilterCreate;
     if (!metadataReady) return false;
 
-    const bool highestLossless = ammod::quality::Install(coreMedia, coreFoundation, Log);
+    bool highestLossless = false;
+    {
+        // Only the MinHook calls themselves count as "installer active"; the
+        // retry loops around this function sleep most of the time and must
+        // not keep the process-exit unhook gate closed.
+        highestLossless = ammod::quality::Install(coreMedia, coreFoundation, Log);
+    }
     if (!highestLossless) {
         Log(L"Highest ALAC quality filter unavailable; quality hooks remain disabled");
         return false;
@@ -1597,6 +1613,13 @@ DWORD WINAPI QualityLockHookLoop(void*) {
     // UI/Broker intent belongs only to the removed audio-core path.
     while (!InstallQualityLockHooks()) {
         ammod::quality::SetEnabled(false);
+        if (ammod::quality::Unavailable()) {
+            // The loaded CoreMedia image is not the verified build; the raw-RVA
+            // quality hook must never be written into it. Leave the policy off
+            // for the life of this process instead of retrying forever.
+            Log(L"Quality lock permanently disabled for this process: unverified CoreMedia build");
+            return 0;
+        }
         Sleep(250);
     }
     ammod::quality::SetEnabled(true);
@@ -1705,12 +1728,59 @@ void CopyText(wchar_t (&destination)[N], std::wstring_view source) {
     destination[count] = L'\0';
 }
 
+std::uint64_t CaptureRuntimeEventContext(void*) noexcept {
+    std::lock_guard lock(g_outboundMutex);
+    return g_eventContextToken;
+}
+
+void PublishRuntimeEventBoundary(void*, std::uint64_t epoch) noexcept {
+    std::lock_guard lock(g_outboundMutex);
+    g_announcedEventEpoch = epoch;
+    std::erase_if(g_outbound, [epoch](const OutboundAgentEvent& event) {
+        return event.eventEpoch != 0 && event.eventEpoch != epoch;
+    });
+}
+
+void RetireEventConnection() noexcept {
+    std::lock_guard lock(g_outboundMutex);
+    ++g_eventContextToken;
+    g_brokerIntentToken = {};
+    g_outbound.clear();
+}
+
+void AcceptBrokerEventContext(const ammod::ipc::Message& incoming) noexcept {
+    std::lock_guard lock(g_outboundMutex);
+    if (!IsEqualGUID(g_brokerIntentToken, incoming.requestId)) {
+        ++g_eventContextToken;
+        g_brokerIntentToken = incoming.requestId;
+        g_outbound.clear();
+    }
+}
+
+bool TakeOutboundAgentEvent(OutboundAgentEvent& event) noexcept {
+    std::lock_guard lock(g_outboundMutex);
+    while (!g_outbound.empty()) {
+        event = g_outbound.front();
+        g_outbound.pop_front();
+        if (event.contextToken == g_eventContextToken &&
+            (event.eventEpoch == 0 || event.eventEpoch == g_announcedEventEpoch)) return true;
+    }
+    return false;
+}
+bool TryAcquirePcmProducer(void*) noexcept { return g_p0FillMutex.try_lock(); }
+void ReleasePcmProducer(void*) noexcept { g_p0FillMutex.unlock(); }
+void PromoteBoundLocalConverter(void*, void* converter) noexcept {
+    if (converter && g_v2PendingLocalConverter.load(std::memory_order_acquire) == converter)
+        (void)PromoteV2LocalQueue(converter);
+}
+
 void SendAgentEvent(ammod::ipc::MessageType type, ammod::ipc::RuntimeState state,
                     bool enabled, const std::wstring& endpoint = {},
                     const WAVEFORMATEX* format = nullptr, HRESULT hr = S_OK,
                     ammod::ipc::ErrorCategory category = ammod::ipc::ErrorCategory::None,
                     const std::wstring& detail = {},
-                    const std::wstring& displayFormat = {}) {
+                    const std::wstring& displayFormat = {},
+                    std::uint64_t contextToken = 0, std::uint64_t eventEpoch = 0) {
     using namespace ammod::ipc;
     if (!g_ipcConnected.load()) return;
     auto message = NewMessage(type, Role::Agent);
@@ -1723,7 +1793,12 @@ void SendAgentEvent(ammod::ipc::MessageType type, ammod::ipc::RuntimeState state
     CopyText(message.format, displayFormat.empty() ? FormatText(format) : displayFormat);
     CopyText(message.detail, detail);
     std::lock_guard lock(g_outboundMutex);
-    g_outbound.push_back(message);
+    if (!g_ipcConnected.load(std::memory_order_acquire) ||
+        IsEqualGUID(g_brokerIntentToken, GUID{}) ||
+        (contextToken != 0 && contextToken != g_eventContextToken) ||
+        (eventEpoch != 0 && eventEpoch != g_announcedEventEpoch)) return;
+    message.requestId = g_brokerIntentToken;
+    g_outbound.push_back({message, contextToken ? contextToken : g_eventContextToken, eventEpoch});
 }
 
 bool ExclusiveRequested() {
@@ -1734,14 +1809,12 @@ bool ExclusiveRequested() {
         g_audioCoreGate.UiEnabled();
 }
 
-void AudioCoreRuntimeEventCallback(void* context,
-                                   ammod::audio_v2::AudioCoreRuntimeEvent event,
-                                   HRESULT result) noexcept {
-    auto* runtime = static_cast<ammod::audio_v2::AudioCoreRuntime*>(context);
-    if (!runtime) return;
+void AudioCoreRuntimeEventCallback(void*, const ammod::audio_v2::AudioCoreRuntimeEventSnapshot& snapshot) noexcept {
+    const auto event = snapshot.event;
+    const auto result = snapshot.result;
     switch (event) {
     case ammod::audio_v2::AudioCoreRuntimeEvent::Bound: {
-        const auto& format = runtime->Coordinator().OutputFormat();
+        const auto& format = snapshot.outputFormat;
         const auto sourceBits = format.sourceValidBits == 0
             ? format.validBits : format.sourceValidBits;
         Log(L"audio core v2 bound active AudioUnit/P0 converter outputFormat{rate=" +
@@ -1753,16 +1826,13 @@ void AudioCoreRuntimeEventCallback(void* context,
             (format.encoding == ammod::audio_v2::PcmEncoding::IeeeFloat
                 ? L" encoding=float interleaved=1}" : L" encoding=signed-int interleaved=1}"));
         Log(L"audio core v2 bound qpc=" + std::to_wstring(CurrentQpc()));
-        if (void* pendingLocal = g_v2PendingLocalConverter.load(std::memory_order_acquire);
-            pendingLocal && runtime->BoundConverter() == pendingLocal) {
-            (void)PromoteV2LocalQueue(pendingLocal);
-        }
         SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
-                       ammod::ipc::RuntimeState::Probing, true);
+                       ammod::ipc::RuntimeState::Probing, true, {}, nullptr, S_OK,
+                       ammod::ipc::ErrorCategory::None, {}, {}, snapshot.contextToken, snapshot.epoch);
         break;
     }
     case ammod::audio_v2::AudioCoreRuntimeEvent::Active: {
-        const auto& format = runtime->Coordinator().OutputFormat();
+        const auto& format = snapshot.outputFormat;
         const auto sourceBits = format.sourceValidBits == 0
             ? format.validBits : format.sourceValidBits;
         if (!kNativeAcquisitionPassthrough) {
@@ -1778,12 +1848,12 @@ void AudioCoreRuntimeEventCallback(void* context,
             std::to_wstring(format.containerBits) + L" sourceBits=" +
             std::to_wstring(sourceBits) + L" encoding=signed-int interleaved=1}");
         Log(L"audio core v2 active qpc=" + std::to_wstring(CurrentQpc()));
-        const auto& sourceFormat = runtime->Coordinator().SourceFormat();
-        const bool resampled = runtime->Coordinator().IsResampling();
-        const bool depthReduced = runtime->Coordinator().IsReducingBitDepth();
+        const auto& sourceFormat = snapshot.sourceFormat;
+        const bool resampled = snapshot.resampled;
+        const bool depthReduced = snapshot.reducingBitDepth;
         const bool floatOutput = format.encoding == ammod::audio_v2::PcmEncoding::IeeeFloat;
-        const bool sourceMappingExact = runtime->Coordinator().IsSourceMappingExact();
-        const bool converted = runtime->Coordinator().IsConverting() || !sourceMappingExact;
+        const bool sourceMappingExact = snapshot.sourceMappingExact;
+        const bool converted = snapshot.converting || !sourceMappingExact;
         const auto describe = [](const ammod::audio_v2::PcmFormat& pcm) {
             std::wostringstream text;
             text << pcm.validBits << (pcm.encoding == ammod::audio_v2::PcmEncoding::IeeeFloat
@@ -1802,20 +1872,21 @@ void AudioCoreRuntimeEventCallback(void* context,
                        ammod::ipc::RuntimeState::Active, true, {}, nullptr, S_OK,
                        ammod::ipc::ErrorCategory::None,
                        (floatOutput || !sourceMappingExact) ? L"converted" : depthReduced ? (resampled ? L"resampled-requantized" : L"requantized") :
-                           (resampled ? L"resampled" : L"native"), displayFormat);
+                           (resampled ? L"resampled" : L"native"), displayFormat, snapshot.contextToken, snapshot.epoch);
         break;
     }
     case ammod::audio_v2::AudioCoreRuntimeEvent::Faulted: {
         const bool playbackRejected = ammod::audio::IsPlaybackRejection(result);
         if (!playbackRejected) {
-            // Stop this failed generation locally. The Broker owns the user's
-            // persisted intent and immediately re-arms the Agent from the
-            // WaitingForStream status sent below.
-            g_nativeP0Puller.DisableForUiOff();
-            g_ipcEnabled.store(false, std::memory_order_release);
-            g_audioCoreGate.SetUiEnabled(false);
+            // Runtime already retired this generation. Publication must never
+            // acquire the P0 producer lock or disable a later audio generation.
             Log(L"audio core v2 faulted; current attempt retired, exclusive intent remains armed result=" +
-                HResultText(result));
+                HResultText(result) +
+                L" clockPosition=" + std::to_wstring(snapshot.stats.sink.clockPosition) +
+                L" clockTarget=" + std::to_wstring(snapshot.stats.sink.clockTarget) +
+                L" clockFrequency=" + std::to_wstring(snapshot.stats.sink.clockFrequency) +
+                L" clockRead=" + HResultText(snapshot.stats.sink.clockReadResult) +
+                L" drainElapsedMs=" + std::to_wstring(snapshot.stats.sink.drainElapsedMs));
         } else {
             Log(L"audio core v2 rejected current playback; AME remains armed result=" +
                 HResultText(result));
@@ -1825,15 +1896,16 @@ void AudioCoreRuntimeEventCallback(void* context,
                        true, {}, nullptr, result,
                        ammod::ipc::CategorizeAudioError(result),
                        playbackRejected ? L"audio_core_v2_playback_rejected"
-                                        : L"audio_core_v2_faulted");
+                                        : L"audio_core_v2_faulted", {}, snapshot.contextToken, snapshot.epoch);
         break;
     }
     case ammod::audio_v2::AudioCoreRuntimeEvent::Disabled:
         SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
-                       ammod::ipc::RuntimeState::Off, false);
+                       ammod::ipc::RuntimeState::Off, false, {}, nullptr, S_OK,
+                       ammod::ipc::ErrorCategory::None, {}, {}, snapshot.contextToken, snapshot.epoch);
         break;
     case ammod::audio_v2::AudioCoreRuntimeEvent::Telemetry: {
-        const auto stats = runtime->Stats();
+        const auto stats = snapshot.stats;
         const auto& sink = stats.sink;
         const auto& tap = stats.tap;
         const auto& fill = stats.pcmFill;
@@ -2148,6 +2220,7 @@ bool PromoteV2LocalQueue(void* converter) {
 AppleOSStatus __cdecl HookV2AudioConverterNew(const AudioStreamBasicDescription* source,
                                               const AudioStreamBasicDescription* destination,
                                               void** converter) {
+    if (ammod::ProcessExiting()) return g_v2OriginalAudioConverterNew ? g_v2OriginalAudioConverterNew(source, destination, converter) : -1;
     const auto result = g_v2OriginalAudioConverterNew
         ? g_v2OriginalAudioConverterNew(source, destination, converter) : -1;
     if (result == 0 && converter && *converter &&
@@ -2184,6 +2257,7 @@ AppleOSStatus __cdecl HookV2AudioConverterNewSpecific(
     const AudioStreamBasicDescription* destination,
     std::uint32_t classDescriptionCount, const void* classDescriptions,
     void** converter) {
+    if (ammod::ProcessExiting()) return g_v2OriginalAudioConverterNewSpecific ? g_v2OriginalAudioConverterNewSpecific(source, destination, classDescriptionCount, classDescriptions, converter) : -1;
     const auto result = g_v2OriginalAudioConverterNewSpecific
         ? g_v2OriginalAudioConverterNewSpecific(source, destination, classDescriptionCount,
                                                  classDescriptions, converter) : -1;
@@ -2221,6 +2295,7 @@ AppleOSStatus __cdecl HookV2AudioConverterSetProperty(void* converter,
                                                       std::uint32_t propertyId,
                                                       std::uint32_t dataSize,
                                                       const void* data) {
+    if (ammod::ProcessExiting()) return g_v2OriginalAudioConverterSetProperty ? g_v2OriginalAudioConverterSetProperty(converter, propertyId, dataSize, data) : -1;
     const bool serializedCursorUpdate = propertyId ==
         ammod::apple_private::audio_converter_property::kCursor &&
         g_nativeP0Puller.Tracks(converter);
@@ -2296,7 +2371,7 @@ AppleOSStatus __cdecl HookV2AudioConverterSetProperty(void* converter,
                                                        converter, _ReturnAddress());
                             g_audioCoreRuntime.OnConverterCreated(
                                 converter, sourceView, destinationView,
-                                g_threadGraphFormat.observationId);
+                                g_threadGraphFormat.observationId, true);
                             Log(L"v2 converter ASBD refreshed after ALAC cookie converter=" +
                                 std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)) +
                                 L" sourceRate=" +
@@ -2330,6 +2405,7 @@ AppleOSStatus __cdecl HookV2AudioConverterGetProperty(void* converter,
                                                        std::uint32_t propertyId,
                                                        std::uint32_t* dataSize,
                                                        void* data) {
+    if (ammod::ProcessExiting()) return g_v2OriginalAudioConverterGetProperty ? g_v2OriginalAudioConverterGetProperty(converter, propertyId, dataSize, data) : -1;
     const auto result = g_v2OriginalAudioConverterGetProperty
         ? g_v2OriginalAudioConverterGetProperty(converter, propertyId, dataSize, data) : -1;
     if (g_nativeTraceEnabled.load(std::memory_order_acquire) &&
@@ -2365,7 +2441,7 @@ AppleOSStatus __cdecl HookV2AudioConverterGetProperty(void* converter,
                 ObserveDecodedSourceFormat(&source, format, converter, _ReturnAddress());
                 g_audioCoreRuntime.OnConverterCreated(
                     converter, sourceView, destinationView,
-                    g_threadGraphFormat.observationId);
+                    g_threadGraphFormat.observationId, true);
                 Log(L"v2 streaming converter registered from output ASBD converter=" +
                     std::to_wstring(reinterpret_cast<std::uintptr_t>(converter)) +
                     L" registered=" + std::to_wstring(
@@ -2379,10 +2455,20 @@ AppleOSStatus __cdecl HookV2AudioConverterGetProperty(void* converter,
 AppleOSStatus __cdecl HookV2AudioConverterFillComplexBuffer(
     void* converter, AudioConverterComplexInputDataProcFn inputProc, void* inputUserData,
     std::uint32_t* outputPackets, void* outputData, void* packetDescriptions) {
+    if (ammod::ProcessExiting()) return g_v2OriginalAudioConverterFillComplexBuffer ? g_v2OriginalAudioConverterFillComplexBuffer(converter, inputProc, inputUserData, outputPackets, outputData, packetDescriptions) : -1;
     const bool p0Candidate = g_audioCoreRuntime.IsP0Converter(converter);
     std::unique_lock<std::mutex> p0FillLock;
     if (p0Candidate) {
         p0FillLock = std::unique_lock<std::mutex>(g_p0FillMutex);
+        if (g_audioCoreRuntime.ShouldDeferPcmPull(converter, outputPackets ? *outputPackets : 0)) {
+            if (outputPackets) *outputPackets = 0;
+            if (outputData) {
+                auto* list = static_cast<AppleAudioBufferList*>(outputData);
+                if (list->mNumberBuffers <= 8)
+                    for (std::uint32_t i = 0; i < list->mNumberBuffers; ++i) list->mBuffers[i].mDataByteSize = 0;
+            }
+            return 3; // Native retryable empty read; encoded input was not consumed.
+        }
         // After the Mod-owned worker has successfully reached the bound P0
         // tap, the Apple caller is kept alive with the same normal empty-read
         // status used by Apple's callback.  It never enters the decoder again;
@@ -2580,6 +2666,7 @@ AppleOSStatus __cdecl HookV2AudioConverterFillComplexBuffer(
 }
 
 AppleOSStatus __cdecl HookV2AudioConverterReset(void* converter) {
+    if (ammod::ProcessExiting()) return g_v2OriginalAudioConverterReset ? g_v2OriginalAudioConverterReset(converter) : -1;
     const auto localQueue = FindV2LocalQueue(converter);
     bool localSeekReset{};
     if (localQueue) {
@@ -2646,6 +2733,7 @@ AppleOSStatus __cdecl HookV2AudioConverterReset(void* converter) {
 }
 
 AppleOSStatus __cdecl HookV2AudioConverterDispose(void* converter) {
+    if (ammod::ProcessExiting()) return g_v2OriginalAudioConverterDispose ? g_v2OriginalAudioConverterDispose(converter) : -1;
     const auto localQueue = FindV2LocalQueue(converter);
     const bool uiEnabled = g_audioCoreRuntime.UiEnabled();
     const bool registeredBefore = uiEnabled && g_audioCoreRuntime.IsConverterRegistered(converter);
@@ -2719,6 +2807,7 @@ AppleOSStatus __cdecl HookV2AudioConverterDispose(void* converter) {
 AppleOSStatus __cdecl HookV2AudioUnitSetProperty(void* unit, std::uint32_t propertyId,
                                                   std::uint32_t scope, std::uint32_t element,
                                                   const void* data, std::uint32_t dataSize) {
+    if (ammod::ProcessExiting()) return g_v2OriginalAudioUnitSetProperty ? g_v2OriginalAudioUnitSetProperty(unit, propertyId, scope, element, data, dataSize) : -1;
     const auto result = g_v2OriginalAudioUnitSetProperty
         ? g_v2OriginalAudioUnitSetProperty(unit, propertyId, scope, element, data, dataSize)
         : -1;
@@ -2776,6 +2865,7 @@ AppleOSStatus __cdecl HookV2AudioUnitSetProperty(void* unit, std::uint32_t prope
 AppleOSStatus __cdecl HookV2AudioUnitRender(void* unit, std::uint32_t* actionFlags,
                                               const void* timestamp, std::uint32_t bus,
                                               std::uint32_t frames, void* buffers) {
+    if (ammod::ProcessExiting()) return g_v2OriginalAudioUnitRender ? g_v2OriginalAudioUnitRender(unit, actionFlags, timestamp, bus, frames, buffers) : -1;
     // Production is observation-only and must stay effectively transparent on
     // Apple's real-time render thread. Deep PCM signatures/timestamp diagnostics
     // are opt-in through native_trace; they are never needed for playback.
@@ -2919,6 +3009,7 @@ AppleOSStatus __cdecl HookV2AudioUnitRender(void* unit, std::uint32_t* actionFla
 }
 
 AppleOSStatus __cdecl HookV2AudioUnitInitialize(void* unit) {
+    if (ammod::ProcessExiting()) return g_v2OriginalAudioUnitInitialize ? g_v2OriginalAudioUnitInitialize(unit) : -1;
     const auto result = g_v2OriginalAudioUnitInitialize
         ? g_v2OriginalAudioUnitInitialize(unit) : -1;
     if (result == 0 && g_audioCoreRuntime.UiEnabled()) {
@@ -2982,6 +3073,7 @@ AppleOSStatus __cdecl HookV2AudioUnitInitialize(void* unit) {
 }
 
 AppleOSStatus __cdecl HookV2AudioOutputUnitStart(void* unit) {
+    if (ammod::ProcessExiting()) return g_v2OriginalAudioOutputUnitStart ? g_v2OriginalAudioOutputUnitStart(unit) : -1;
     const auto result = g_v2OriginalAudioOutputUnitStart
         ? g_v2OriginalAudioOutputUnitStart(unit) : -1;
     Log(L"v2 AudioOutputUnitStart unit=" +
@@ -3020,6 +3112,7 @@ AppleOSStatus __cdecl HookV2AudioOutputUnitStart(void* unit) {
 }
 
 AppleOSStatus __cdecl HookV2AudioOutputUnitStop(void* unit) {
+    if (ammod::ProcessExiting()) return g_v2OriginalAudioOutputUnitStop ? g_v2OriginalAudioOutputUnitStop(unit) : -1;
     const auto result = g_v2OriginalAudioOutputUnitStop
         ? g_v2OriginalAudioOutputUnitStop(unit) : -1;
     Log(L"v2 AudioOutputUnitStop unit=" +
@@ -3031,6 +3124,7 @@ AppleOSStatus __cdecl HookV2AudioOutputUnitStop(void* unit) {
 }
 
 AppleOSStatus __cdecl HookV2AudioUnitUninitialize(void* unit) {
+    if (ammod::ProcessExiting()) return g_v2OriginalAudioUnitUninitialize ? g_v2OriginalAudioUnitUninitialize(unit) : -1;
     const auto result = g_v2OriginalAudioUnitUninitialize
         ? g_v2OriginalAudioUnitUninitialize(unit) : -1;
     Log(L"v2 AudioUnitUninitialize unit=" +
@@ -3247,6 +3341,7 @@ void HookV2Device(IMMDevice* device);
 
 HRESULT STDMETHODCALLTYPE HookV2DeviceActivate(IMMDevice* self, REFIID iid, DWORD context,
                                                PROPVARIANT* params, void** object) {
+    if (ammod::ProcessExiting()) return g_v2OriginalDeviceActivate ? g_v2OriginalDeviceActivate(self, iid, context, params, object) : E_UNEXPECTED;
     const auto result = g_v2OriginalDeviceActivate
         ? g_v2OriginalDeviceActivate(self, iid, context, params, object) : E_UNEXPECTED;
     if (FAILED(result) || !object || !*object || ammod::audio_v2::NativeProxyBypassed() ||
@@ -3278,6 +3373,7 @@ HRESULT STDMETHODCALLTYPE HookV2DeviceActivate(IMMDevice* self, REFIID iid, DWOR
 
 HRESULT STDMETHODCALLTYPE HookV2CollectionItem(IMMDeviceCollection* self, UINT index,
                                                 IMMDevice** device) {
+    if (ammod::ProcessExiting()) return g_v2OriginalCollectionItem ? g_v2OriginalCollectionItem(self, index, device) : E_UNEXPECTED;
     const auto result = g_v2OriginalCollectionItem
         ? g_v2OriginalCollectionItem(self, index, device) : E_UNEXPECTED;
     if (SUCCEEDED(result) && device && *device) HookV2Device(*device);
@@ -3287,6 +3383,7 @@ HRESULT STDMETHODCALLTYPE HookV2CollectionItem(IMMDeviceCollection* self, UINT i
 HRESULT STDMETHODCALLTYPE HookV2EnumAudioEndpoints(IMMDeviceEnumerator* self, EDataFlow flow,
                                                    DWORD state,
                                                    IMMDeviceCollection** collection) {
+    if (ammod::ProcessExiting()) return g_v2OriginalEnumAudioEndpoints ? g_v2OriginalEnumAudioEndpoints(self, flow, state, collection) : E_UNEXPECTED;
     const auto result = g_v2OriginalEnumAudioEndpoints
         ? g_v2OriginalEnumAudioEndpoints(self, flow, state, collection) : E_UNEXPECTED;
     if (SUCCEEDED(result) && collection && *collection) {
@@ -3299,6 +3396,7 @@ HRESULT STDMETHODCALLTYPE HookV2EnumAudioEndpoints(IMMDeviceEnumerator* self, ED
 
 HRESULT STDMETHODCALLTYPE HookV2GetDefaultEndpoint(IMMDeviceEnumerator* self, EDataFlow flow,
                                                     ERole role, IMMDevice** device) {
+    if (ammod::ProcessExiting()) return g_v2OriginalGetDefaultEndpoint ? g_v2OriginalGetDefaultEndpoint(self, flow, role, device) : E_UNEXPECTED;
     const auto result = g_v2OriginalGetDefaultEndpoint
         ? g_v2OriginalGetDefaultEndpoint(self, flow, role, device) : E_UNEXPECTED;
     if (SUCCEEDED(result) && device && *device) HookV2Device(*device);
@@ -3307,6 +3405,7 @@ HRESULT STDMETHODCALLTYPE HookV2GetDefaultEndpoint(IMMDeviceEnumerator* self, ED
 
 HRESULT STDMETHODCALLTYPE HookV2GetDevice(IMMDeviceEnumerator* self, LPCWSTR id,
                                           IMMDevice** device) {
+    if (ammod::ProcessExiting()) return g_v2OriginalGetDevice ? g_v2OriginalGetDevice(self, id, device) : E_UNEXPECTED;
     const auto result = g_v2OriginalGetDevice
         ? g_v2OriginalGetDevice(self, id, device) : E_UNEXPECTED;
     if (SUCCEEDED(result) && device && *device) HookV2Device(*device);
@@ -3332,6 +3431,7 @@ void HookV2Enumerator(IMMDeviceEnumerator* enumerator) {
 
 HRESULT WINAPI HookV2CoCreateInstance(REFCLSID clsid, LPUNKNOWN outer, DWORD context,
                                       REFIID iid, LPVOID* object) {
+    if (ammod::ProcessExiting()) return g_v2OriginalCoCreateInstance ? g_v2OriginalCoCreateInstance(clsid, outer, context, iid, object) : E_UNEXPECTED;
     const auto result = g_v2OriginalCoCreateInstance
         ? g_v2OriginalCoCreateInstance(clsid, outer, context, iid, object) : E_UNEXPECTED;
     if (SUCCEEDED(result) && object && *object && iid == __uuidof(IMMDeviceEnumerator)) {
@@ -3443,6 +3543,7 @@ DWORD WINAPI PipeClientLoop(void*) {
             Sleep(1000);
             continue;
         }
+        RetireEventConnection();
         DWORD mode = PIPE_READMODE_MESSAGE;
         if (!SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr)) {
             CloseHandle(pipe);
@@ -3462,22 +3563,16 @@ DWORD WINAPI PipeClientLoop(void*) {
             if (!WriteMessage(pipe, hello)) g_ipcConnected.store(false);
         }
         Log(L"broker IPC connected");
+        // See UiAdapter: broker status broadcasts are not ordered across
+        // threads; drop anything older than the latest generation seen on this
+        // connection.
+        std::uint64_t lastStatusGeneration = 0;
 
         Message incoming{};
         while (g_ipcConnected.load()) {
-            Message outbound{};
-            bool hasOutbound{};
-            {
-                std::lock_guard lock(g_outboundMutex);
-                if (!g_outbound.empty()) {
-                    outbound = g_outbound.front();
-                    g_outbound.pop_front();
-                    hasOutbound = true;
-                }
-            }
-            if (hasOutbound && !WriteMessage(pipe, outbound)) {
-                std::lock_guard lock(g_outboundMutex);
-                g_outbound.push_front(outbound);
+            OutboundAgentEvent outbound{};
+            const bool hasOutbound = TakeOutboundAgentEvent(outbound);
+            if (hasOutbound && !WriteMessage(pipe, outbound.message)) {
                 g_ipcConnected.store(false);
                 break;
             }
@@ -3485,7 +3580,19 @@ DWORD WINAPI PipeClientLoop(void*) {
                 if (GetLastError() == ERROR_TIMEOUT) continue;
                 break;
             }
+            if (incoming.type == MessageType::HelloAck && incoming.minor < 2) {
+                Log(L"broker lacks scoped audio-event support; connection retired");
+                break;
+            }
             if (incoming.type == MessageType::StatusChanged) {
+                if (incoming.generation < lastStatusGeneration) {
+                    Log(L"ignored stale broker status generation=" +
+                        std::to_wstring(incoming.generation) + L" latest=" +
+                        std::to_wstring(lastStatusGeneration));
+                    continue;
+                }
+                lastStatusGeneration = incoming.generation;
+                AcceptBrokerEventContext(incoming);
                 const bool enabled = incoming.enabledIntent != 0;
                 const auto hardwareBufferMs = incoming.hardwareBufferMs
                     ? incoming.hardwareBufferMs : 20u;
@@ -3529,6 +3636,7 @@ DWORD WINAPI PipeClientLoop(void*) {
                 break;
             }
         }
+        RetireEventConnection();
         {
             std::lock_guard lock(g_pipeMutex);
             g_ipcConnected.store(false);
@@ -3545,6 +3653,9 @@ DWORD WINAPI PipeClientLoop(void*) {
 }
 
 DWORD WINAPI InitializeHooks(void*) {
+    HMODULE pinned{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(&InitializeHooks), &pinned)) return 1;
     wchar_t modulePath[MAX_PATH]{};
     GetModuleFileNameW(g_module, modulePath, static_cast<DWORD>(std::size(modulePath)));
     const auto directory = std::filesystem::path(modulePath).parent_path();
@@ -3559,11 +3670,13 @@ DWORD WINAPI InitializeHooks(void*) {
     // exclusive endpoint. The runtime must therefore preserve native/graph
     // started bookkeeping across the endpoint handoff.
     const ammod::audio_v2::AudioCoreRuntimeCallbacks runtimeCallbacks{
-        &g_audioCoreRuntime, &AudioCoreRuntimeEventCallback, &V2OnSinkLifecycle,
+        &g_audioCoreRuntime, nullptr, &V2OnSinkLifecycle,
         &V2PrepareNativeHandoff, &V2FinalizeNativeHandoff,
         &V2ResumeNativeAfterFailedHandoff, &V2PrepareNativeGraphHandoff,
         &V2ResumeNativeGraphAfterFailedHandoff, kNativeAcquisitionPassthrough,
-        g_nativeTraceEnabled.load(std::memory_order_acquire)};
+        g_nativeTraceEnabled.load(std::memory_order_acquire),
+        &AudioCoreRuntimeEventCallback, &CaptureRuntimeEventContext, &PublishRuntimeEventBoundary,
+        &TryAcquirePcmProducer, &ReleasePcmProducer, &PromoteBoundLocalConverter};
     if (!g_audioCoreRuntime.Start(runtimeCallbacks)) {
         Log(L"audio core v2 runtime worker failed to start; core remains fail-closed");
     }
@@ -3602,11 +3715,18 @@ DWORD WINAPI InitializeHooks(void*) {
 
 } // namespace
 
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_module = instance;
         DisableThreadLibraryCalls(instance);
         if (HANDLE thread = CreateThread(nullptr, 0, InitializeHooks, nullptr, 0, nullptr)) CloseHandle(thread);
+    } else if (reason == DLL_PROCESS_DETACH && reserved) {
+        // No MinHook, joins, COM, locks or deallocation under loader lock.
+        // Late teardown detours take the original-function path, while the
+        // runtime's process-lifetime owner suppresses its whole destructor tree.
+        ammod::processExiting.store(true, std::memory_order_release);
+        g_audioCoreRuntime.AbandonForProcessExit();
+        g_runtimeOwner.Abandon();
     }
     return TRUE;
 }

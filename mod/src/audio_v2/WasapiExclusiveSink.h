@@ -57,6 +57,11 @@ struct WasapiSinkStats final {
     std::uint64_t getBufferFailures{};
     std::uint64_t releaseBufferFailures{};
     HRESULT lastError{S_OK};
+    std::uint64_t clockPosition{};
+    std::uint64_t clockTarget{};
+    std::uint64_t clockFrequency{};
+    std::uint64_t drainElapsedMs{};
+    HRESULT clockReadResult{S_OK};
 };
 
 enum class WasapiSinkState : std::uint8_t {
@@ -107,10 +112,14 @@ private:
     HRESULT InitializeClient() noexcept;
     HRESULT RenderOneBuffer() noexcept;
     HRESULT CheckEndOfStreamDrain() noexcept;
+    HRESULT ReadClockPosition(std::uint64_t& position) noexcept;
+    bool FramesToClockTicks(std::uint64_t frames, std::uint64_t& ticks) const noexcept;
+    void ResetClockTimeline() noexcept;
     void StopInternal(bool preserveBuffer) noexcept;
     void RecordError(HRESULT error) noexcept;
     void NotifyLifecycle(WasapiSinkLifecycleEvent event, HRESULT result) noexcept;
     void ReleaseInterfaces() noexcept;
+    void ReleaseComInitialization() noexcept;
 
     WasapiSinkConfig config_{};
     WAVEFORMATEXTENSIBLE waveFormat_{};
@@ -127,6 +136,18 @@ private:
     std::uint64_t drainWaitStartedTick_{};
     bool drainPositionValid_{};
     bool pausedWithBuffer_{};
+    // Device position and committed PCM share the same stream-relative origin.
+    // Keep this ledger across Pause; reset it only with the actual client Reset.
+    std::uint64_t clockSubmittedFrames_{};
+    std::uint64_t clockGapTicks_{};
+    bool clockPositionValid_{};
+    std::atomic<std::uint64_t> clockFrequency_{};
+    std::atomic<std::uint64_t> clockPosition_{};
+    std::atomic<std::uint64_t> clockTarget_{};
+    std::atomic<std::uint64_t> drainElapsedMs_{};
+    std::atomic<LONG> clockReadResult_{S_OK};
+    // Bounded wait for the Running render loop; see Open().
+    DWORD renderWatchdogMs_{1000};
 
     HANDLE shutdownEvent_{};
     HANDLE audioEvent_{};
@@ -138,7 +159,9 @@ private:
     std::atomic<bool> endOfStreamComplete_{};
     IIntegerPcmSource* source_{};
     std::uint32_t bufferFrames_{};
-    bool comInitialized_{};
+    // MTA usage is a process lease, balanced by this exact cookie on any
+    // control thread. It never consumes Apple's thread-local apartment ref.
+    CO_MTA_USAGE_COOKIE mtaUsageCookie_{};
 
     std::atomic<WasapiSinkState> state_{WasapiSinkState::Closed};
     std::atomic<std::uint64_t> submittedFrames_{};

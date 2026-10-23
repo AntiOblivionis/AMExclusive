@@ -9,6 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <utility>
 
 namespace ammod::audio_v2 {
 namespace {
@@ -77,9 +78,8 @@ HRESULT WasapiExclusiveSink::Open(const WasapiSinkConfig& config) noexcept {
         }
     }
 
-    const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (SUCCEEDED(apartment)) comInitialized_ = true;
-    else if (apartment != RPC_E_CHANGED_MODE) {
+    const HRESULT apartment = CoIncrementMTAUsage(&mtaUsageCookie_);
+    if (FAILED(apartment)) {
         RecordError(apartment);
         NotifyLifecycle(WasapiSinkLifecycleEvent::OpenExit, apartment);
         return apartment;
@@ -100,10 +100,7 @@ HRESULT WasapiExclusiveSink::Open(const WasapiSinkConfig& config) noexcept {
     if (FAILED(hr)) {
         RecordError(hr);
         ReleaseInterfaces();
-        if (comInitialized_) {
-            CoUninitialize();
-            comInitialized_ = false;
-        }
+        ReleaseComInitialization();
         NotifyLifecycle(WasapiSinkLifecycleEvent::OpenExit, hr);
         return hr;
     }
@@ -241,37 +238,49 @@ HRESULT WasapiExclusiveSink::InitializeClient() noexcept {
     hr = client_->GetService(__uuidof(IAudioRenderClient),
                             reinterpret_cast<void**>(&render_));
     if (FAILED(hr)) return finish(hr);
-    // Only transformed PCM uses staging and needs the conversion drain contract.
-    // Native lossless output (including the disabled option) keeps its old path.
-    if (RequiresPcmConversion(sourceFormat, config_.format)) {
-        hr = client_->GetService(__uuidof(IAudioClock), reinterpret_cast<void**>(&clock_));
-        if (FAILED(hr)) return finish(hr);
-        UINT64 frequency{};
-        hr = clock_->GetFrequency(&frequency);
-        if (FAILED(hr) || frequency == 0) return finish(FAILED(hr) ? hr : E_UNEXPECTED);
-        REFERENCE_TIME latency{};
-        hr = client_->GetStreamLatency(&latency);
-        if (FAILED(hr) || latency < 0) return finish(FAILED(hr) ? hr : E_UNEXPECTED);
-        // Exclusive event-driven WASAPI has two equal ping-pong buffers.
-        // After terminal ReleaseBuffer, advancing the device clock by both
-        // buffers' capacity plus the reported stream latency is a conservative
-        // drain bound, even after a source wait/underrun. Cumulative frames count silence
-        // played during an earlier wait as consumption of the terminal media.
-        // https://learn.microsoft.com/windows/win32/api/audioclient/nf-audioclient-iaudioclient-initialize
-        const auto rate = config_.format.sampleRate;
-        const auto latencyFrames = static_cast<std::uint64_t>(latency / kReferenceTimePerSecond) * rate +
-            (static_cast<std::uint64_t>(latency % kReferenceTimePerSecond) * rate +
-             kReferenceTimePerSecond - 1) / kReferenceTimePerSecond;
-        const auto frames = std::uint64_t{2} * bufferFrames_ + latencyFrames;
-        const auto limit = std::numeric_limits<std::uint64_t>::max();
-        if (frequency % rate != 0 && frames > (limit - rate + 1) / (frequency % rate))
-            return finish(E_INVALIDARG);
-        const auto remainder = (frequency % rate * frames + rate - 1) / rate;
-        if (frequency / rate > (limit - remainder) / frames) return finish(E_INVALIDARG);
-        drainClockTicks_ = frequency / rate * frames + remainder;
-        drainMaxWaitMs_ = 2000u + frames / rate * 1000u +
-            (frames % rate * 1000u + rate - 1) / rate;
-    }
+    // Every output format uses the device-clock drain contract. Without the
+    // clock, native (bit-perfect) output declared end of stream complete the
+    // moment the terminal buffer was submitted, and the Stop/Reset that
+    // followed discarded up to two device periods of audio at every track
+    // end; Pause likewise dropped the frames already handed to the device.
+    // The staging/conversion path proved the clock-based drain and the
+    // preserved-buffer pause; the native path now shares them.
+    hr = client_->GetService(__uuidof(IAudioClock), reinterpret_cast<void**>(&clock_));
+    if (FAILED(hr)) return finish(hr);
+    UINT64 frequency{};
+    hr = clock_->GetFrequency(&frequency);
+    if (FAILED(hr) || frequency == 0) return finish(FAILED(hr) ? hr : E_UNEXPECTED);
+    clockFrequency_.store(frequency, std::memory_order_relaxed);
+    ResetClockTimeline();
+    REFERENCE_TIME latency{};
+    hr = client_->GetStreamLatency(&latency);
+    if (FAILED(hr) || latency < 0) return finish(FAILED(hr) ? hr : E_UNEXPECTED);
+    // Exclusive event-driven WASAPI has two equal ping-pong buffers.
+    // This bound is used only for the watchdog and a conservative timeline
+    // reanchor after an observed underrun. Normal EOS compares the device
+    // position with the actual committed end of this stream, not with a new
+    // two-buffer interval starting at the first EOS clock read.
+    // https://learn.microsoft.com/windows/win32/api/audioclient/nf-audioclient-iaudioclient-initialize
+    const auto rate = config_.format.sampleRate;
+    const auto latencyFrames = static_cast<std::uint64_t>(latency / kReferenceTimePerSecond) * rate +
+        (static_cast<std::uint64_t>(latency % kReferenceTimePerSecond) * rate +
+         kReferenceTimePerSecond - 1) / kReferenceTimePerSecond;
+    const auto frames = std::uint64_t{2} * bufferFrames_ + latencyFrames;
+    const auto limit = std::numeric_limits<std::uint64_t>::max();
+    if (frequency % rate != 0 && frames > (limit - rate + 1) / (frequency % rate))
+        return finish(E_INVALIDARG);
+    const auto remainder = (frequency % rate * frames + rate - 1) / rate;
+    if (frequency / rate > (limit - remainder) / frames) return finish(E_INVALIDARG);
+    drainClockTicks_ = frequency / rate * frames + remainder;
+    drainMaxWaitMs_ = 2000u + frames / rate * 1000u +
+        (frames % rate * 1000u + rate - 1) / rate;
+    // A running exclusive client raises the audio event once per device
+    // period. Several silent periods are how an unplugged or invalidated
+    // endpoint presents itself when the engine stops signalling, so the render
+    // thread probes the client after this many milliseconds instead of waiting
+    // forever in the Running state.
+    const auto periodMs = (std::uint64_t{bufferFrames_} * 1000u + rate - 1) / rate;
+    renderWatchdogMs_ = static_cast<DWORD>(std::clamp<std::uint64_t>(periodMs * 4u, 100u, 1000u));
     return finish(S_OK);
 }
 
@@ -293,16 +302,21 @@ HRESULT WasapiExclusiveSink::Start(IIntegerPcmSource& source) noexcept {
     source_ = &source;
     stopRequested_.store(false, std::memory_order_release);
     drainWaitStartedTick_ = 0;
+    drainElapsedMs_.store(0, std::memory_order_relaxed);
     if (!pausedWithBuffer_) {
         waitingForSource_.store(false, std::memory_order_release);
         endOfStreamSubmitted_.store(false, std::memory_order_release);
         endOfStreamComplete_.store(false, std::memory_order_release);
         drainPositionValid_ = false;
 
-        // Prime once per stream. SRC pause preserves the submitted buffer and
+        // Prime once per stream. Pause preserves the submitted buffer and
         // clock epoch, so resume must not consume or prime another source block.
+        // An empty source is not a fault here: RenderOneBuffer has already
+        // published waitingForSource_, and the render thread fills and starts
+        // the client when the producer signals. Treating would-block as a
+        // failure retired the whole generation on resume after a network stall.
         const HRESULT prime = RenderOneBuffer();
-        if (FAILED(prime)) {
+        if (FAILED(prime) && prime != kAudioSourceWouldBlock) {
             RecordError(prime);
             source_ = nullptr;
             state_.store(WasapiSinkState::Faulted, std::memory_order_release);
@@ -385,8 +399,41 @@ HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
         RecordError(prepared);
         return prepared;
     }
+    if (prepared == S_FALSE) {
+        // The last media period may already be in the device when the producer
+        // seal arrives. Software-queue emptiness is not device consumption.
+        waitingForSource_.store(false, std::memory_order_release);
+        endOfStreamSubmitted_.store(true, std::memory_order_release);
+        if (submittedFrames_.load(std::memory_order_acquire) == 0) {
+            endOfStreamComplete_.store(true, std::memory_order_release);
+            stopRequested_.store(true, std::memory_order_release);
+            return S_OK;
+        }
+        return CheckEndOfStreamDrain();
+    }
+    std::uint64_t position{};
+    HRESULT hr = ReadClockPosition(position);
+    if (FAILED(hr)) return hr;
+    const auto limit = std::numeric_limits<std::uint64_t>::max();
+    if (clockSubmittedFrames_ > limit - bufferFrames_) return E_INVALIDARG;
+    const auto committedFrames = clockSubmittedFrames_ + bufferFrames_;
+    auto gap = clockGapTicks_;
+    const auto previousEnd = clockTarget_.load(std::memory_order_relaxed);
+    if (position > previousEnd) {
+        // A free-running clock may have advanced through an earlier underrun.
+        // That silence cannot count as playback of the packet being submitted.
+        const auto advance = position - previousEnd;
+        if (gap > limit - advance || gap + advance > limit - drainClockTicks_)
+            return E_INVALIDARG;
+        gap += advance + drainClockTicks_;
+    }
+    std::uint64_t target{};
+    if (!FramesToClockTicks(committedFrames, target) || target > limit - gap)
+        return E_INVALIDARG;
+    target += gap;
+
     BYTE* data = nullptr;
-    HRESULT hr = render_->GetBuffer(bufferFrames_, &data);
+    hr = render_->GetBuffer(bufferFrames_, &data);
     if (FAILED(hr)) {
         getBufferFailures_.fetch_add(1, std::memory_order_relaxed);
         RecordError(hr);
@@ -443,6 +490,9 @@ HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
     }
     submittedFrames_.fetch_add(bufferFrames_, std::memory_order_relaxed);
     submittedBuffers_.fetch_add(1, std::memory_order_relaxed);
+    clockSubmittedFrames_ = committedFrames;
+    clockGapTicks_ = gap;
+    clockTarget_.store(target, std::memory_order_release);
     if (endOfStream) endOfStreamSubmitted_.store(true, std::memory_order_release);
     // EOS belongs to the buffer just released. Stop requesting another buffer
     // after this full submission; otherwise a source that ends exactly on a
@@ -462,19 +512,70 @@ HRESULT WasapiExclusiveSink::CheckEndOfStreamDrain() noexcept {
     // An unavailable/stalled clock must not hold a generation forever. This
     // deadline can only fault, never certify playback. Pause/resume restarts
     // the watchdog while retaining the device-clock drain boundary.
-    if (now - drainWaitStartedTick_ > drainMaxWaitMs_) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
-    UINT64 position{};
-    const HRESULT hr = clock_->GetPosition(&position, nullptr);
-    if (hr != S_OK) return FAILED(hr) ? hr : S_OK; // Retry imprecise readings on a later wake.
+    const auto elapsed = now - drainWaitStartedTick_;
+    drainElapsedMs_.store(elapsed, std::memory_order_relaxed);
+    std::uint64_t position{};
+    const HRESULT hr = ReadClockPosition(position);
+    if (FAILED(hr)) return hr;
     if (!drainPositionValid_) {
         drainStartPosition_ = position;
         drainPositionValid_ = true;
-    } else if (position < drainStartPosition_) {
-        return E_UNEXPECTED; // A reset/replaced clock cannot complete this stream.
-    } else if (position - drainStartPosition_ >= drainClockTicks_) {
-        endOfStreamComplete_.store(true, std::memory_order_release);
     }
+    if (position >= clockTarget_.load(std::memory_order_acquire)) {
+        endOfStreamComplete_.store(true, std::memory_order_release);
+        return S_OK;
+    }
+    // A late scheduler wake must still accept already-proven consumption.
+    // Time can fault an incomplete drain; it can never prove completion.
+    if (elapsed > drainMaxWaitMs_) return ammod::audio::kEndpointDrainTimeout;
     return S_OK;
+}
+
+HRESULT WasapiExclusiveSink::ReadClockPosition(std::uint64_t& position) noexcept {
+    if (!clock_) return E_UNEXPECTED;
+    const HRESULT hr = clock_->GetPosition(&position, nullptr);
+    clockReadResult_.store(hr, std::memory_order_relaxed);
+    if (FAILED(hr)) return hr;
+    if (hr != S_OK && hr != S_FALSE) return E_UNEXPECTED;
+    // S_FALSE is a successful sample with a less precise observation time.
+    // Use its returned position, without QPC/wall-time extrapolation. It is
+    // still a sample actually played; requiring S_OK forever rejects devices
+    // whose position reads consistently take longer than the precision limit.
+    if (clockPositionValid_ && position < clockPosition_.load(std::memory_order_relaxed))
+        return E_UNEXPECTED;
+    clockPosition_.store(position, std::memory_order_relaxed);
+    clockPositionValid_ = true;
+    return S_OK;
+}
+
+bool WasapiExclusiveSink::FramesToClockTicks(std::uint64_t frames,
+                                           std::uint64_t& ticks) const noexcept {
+    const auto rate = config_.format.sampleRate;
+    const auto frequency = clockFrequency_.load(std::memory_order_relaxed);
+    if (!rate || !frequency) return false;
+    const auto limit = std::numeric_limits<std::uint64_t>::max();
+    const auto whole = frames / rate;
+    const auto partial = frames % rate;
+    if (whole > limit / frequency ||
+        (partial && frequency > (limit - rate + 1u) / partial)) return false;
+    const auto remainder = (partial * frequency + rate - 1u) / rate;
+    const auto base = whole * frequency;
+    if (base > limit - remainder) return false;
+    ticks = base + remainder;
+    return true;
+}
+
+void WasapiExclusiveSink::ResetClockTimeline() noexcept {
+    clockSubmittedFrames_ = 0;
+    clockGapTicks_ = 0;
+    clockPositionValid_ = false;
+    clockPosition_.store(0, std::memory_order_relaxed);
+    clockTarget_.store(0, std::memory_order_relaxed);
+    clockReadResult_.store(S_OK, std::memory_order_relaxed);
+    drainElapsedMs_.store(0, std::memory_order_relaxed);
+    drainPositionValid_ = false;
+    drainStartPosition_ = 0;
+    drainWaitStartedTick_ = 0;
 }
 
 DWORD WINAPI WasapiExclusiveSink::RenderThreadThunk(void* context) noexcept {
@@ -502,7 +603,7 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
             const bool draining = clock_ && EndOfStreamSubmitted();
             const DWORD waitTimeout = draining ? 20u : waitingForSource_.load(std::memory_order_acquire)
                 ? 50u
-                : (config_.sourceReadyEvent ? INFINITE : 20u);
+                : (config_.sourceReadyEvent ? renderWatchdogMs_ : 20u);
             const DWORD wait = WaitForMultipleObjects(
                 handleCount, handles, FALSE, waitTimeout);
             if (wait == WAIT_OBJECT_0 || stopRequested_.load(std::memory_order_acquire)) break;
@@ -550,7 +651,21 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
             // wake while the sink is already running. It is only meaningful
             // in the waiting state; consume and ignore it here.
             if (config_.sourceReadyEvent && wait == WAIT_OBJECT_0 + 2) continue;
-            if (wait == WAIT_TIMEOUT) continue;
+            if (wait == WAIT_TIMEOUT) {
+                if (config_.sourceReadyEvent && client_) {
+                    // Watchdog: no audio event for several device periods while
+                    // Running. Ask the client whether the endpoint still exists;
+                    // an invalidated device answers with a failure HRESULT, which
+                    // faults this generation instead of freezing it silently.
+                    UINT32 padding{};
+                    const HRESULT probe = client_->GetCurrentPadding(&padding);
+                    if (FAILED(probe)) {
+                        threadFailure = probe;
+                        break;
+                    }
+                }
+                continue;
+            }
             if (wait != WAIT_OBJECT_0 + 1) {
                 threadFailure = wait == WAIT_FAILED
                     ? HRESULT_FROM_WIN32(GetLastError()) : E_UNEXPECTED;
@@ -594,7 +709,7 @@ void WasapiExclusiveSink::StopInternal(bool preserveBuffer) noexcept {
     stopRequested_.store(true, std::memory_order_release);
     if (shutdownEvent_) SetEvent(shutdownEvent_);
     if (clock_ && renderThread_) {
-        // Quiesce SRC before Stop/Reset so an in-flight source wake cannot
+        // Quiesce the render thread before Stop/Reset so an in-flight source wake cannot
         // restart the endpoint after the control thread has stopped it.
         WaitForSingleObject(renderThread_, INFINITE);
         CloseHandle(renderThread_);
@@ -623,6 +738,8 @@ void WasapiExclusiveSink::StopInternal(bool preserveBuffer) noexcept {
         if (FAILED(reset) && reset != AUDCLNT_E_NOT_INITIALIZED) {
             RecordError(reset);
             if (SUCCEEDED(lifecycleResult)) lifecycleResult = reset;
+        } else if (SUCCEEDED(reset)) {
+            ResetClockTimeline();
         }
     }
     pausedWithBuffer_ = preserveBuffer && !faulted && SUCCEEDED(lifecycleResult);
@@ -637,7 +754,7 @@ void WasapiExclusiveSink::StopInternal(bool preserveBuffer) noexcept {
 void WasapiExclusiveSink::Close() noexcept {
     if (state_.load(std::memory_order_acquire) == WasapiSinkState::Closed &&
         !renderThread_ && !client_ && !render_ && !device_ && !enumerator_ &&
-        !shutdownEvent_ && !audioEvent_ && !comInitialized_) {
+        !shutdownEvent_ && !audioEvent_ && !mtaUsageCookie_) {
         return;
     }
     NotifyLifecycle(WasapiSinkLifecycleEvent::CloseEnter, S_OK);
@@ -645,12 +762,19 @@ void WasapiExclusiveSink::Close() noexcept {
     ReleaseInterfaces();
     source_ = nullptr;
     state_.store(WasapiSinkState::Closed, std::memory_order_release);
-    if (comInitialized_) {
-        CoUninitialize();
-        comInitialized_ = false;
-    }
+    ReleaseComInitialization();
     NotifyLifecycle(WasapiSinkLifecycleEvent::CloseExit,
                     static_cast<HRESULT>(lastError_.load(std::memory_order_acquire)));
+}
+
+void WasapiExclusiveSink::ReleaseComInitialization() noexcept {
+    const auto cookie = std::exchange(mtaUsageCookie_, nullptr);
+    if (!cookie || ammod::ProcessExiting()) return;
+    // Microsoft explicitly permits Increment on one thread and Decrement on
+    // another. Unlike a CoInitializeEx count, the lease follows the endpoint
+    // lifetime and remains balanced through foreign-thread Close and failure.
+    const HRESULT release = CoDecrementMTAUsage(cookie);
+    if (FAILED(release)) RecordError(release);
 }
 
 void WasapiExclusiveSink::SetResumeBlocked(bool blocked) noexcept {
@@ -660,6 +784,8 @@ void WasapiExclusiveSink::SetResumeBlocked(bool blocked) noexcept {
 
 void WasapiExclusiveSink::ReleaseInterfaces() noexcept {
     Release(clock_);
+    ResetClockTimeline();
+    clockFrequency_.store(0, std::memory_order_relaxed);
     drainClockTicks_ = 0;
     drainMaxWaitMs_ = 0;
     drainStartPosition_ = 0;
@@ -702,6 +828,11 @@ WasapiSinkStats WasapiExclusiveSink::Stats() const noexcept {
         getBufferFailures_.load(std::memory_order_acquire),
         releaseBufferFailures_.load(std::memory_order_acquire),
         static_cast<HRESULT>(lastError_.load(std::memory_order_acquire)),
+        clockPosition_.load(std::memory_order_relaxed),
+        clockTarget_.load(std::memory_order_relaxed),
+        clockFrequency_.load(std::memory_order_relaxed),
+        drainElapsedMs_.load(std::memory_order_relaxed),
+        static_cast<HRESULT>(clockReadResult_.load(std::memory_order_relaxed)),
     };
 }
 

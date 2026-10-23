@@ -26,7 +26,9 @@ public:
 
     // Called before acquiring an endpoint buffer. Streaming converters may
     // consume input and stage output here, preserving partial work on a wait.
-    // S_OK promises a full period or an explicit EOS tail for Fill().
+    // S_OK promises a full period or an explicit EOS tail for Fill(). S_FALSE
+    // means sealed EOF with no samples left: drain the last submitted device
+    // buffer without acquiring or fabricating another all-silence buffer.
     virtual HRESULT Prepare(std::uint32_t capacityFrames) noexcept {
         return CanProvide(capacityFrames) ? S_OK : kAudioSourceWouldBlock;
     }
