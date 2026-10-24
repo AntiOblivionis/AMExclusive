@@ -141,6 +141,13 @@ private:
     std::uint64_t clockSubmittedFrames_{};
     std::uint64_t clockGapTicks_{};
     bool clockPositionValid_{};
+    // IAudioClock position is only meaningful for a started stream, and a
+    // driver may reset it at IAudioClient::Start (observed: stale nonzero
+    // pre-Start reads that drop after Start on a vendor USB driver). Reads
+    // are skipped until the first Start, and the monotonicity guard in
+    // ReadClockPosition resets across every Start boundary.
+    std::atomic<std::uint32_t> clockStartGeneration_{};
+    std::uint32_t clockSeenStartGeneration_{};
     std::atomic<std::uint64_t> clockFrequency_{};
     std::atomic<std::uint64_t> clockPosition_{};
     std::atomic<std::uint64_t> clockTarget_{};
