@@ -9,6 +9,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# Explicit build/run only: this probe acquires the default audio endpoint.
+add_executable(am_exclusive_drain_probe EXCLUDE_FROM_ALL
+  tests/WasapiDrainProbe.cpp src/audio_v2/WasapiExclusiveSink.cpp)
+target_include_directories(am_exclusive_drain_probe PRIVATE src)
+target_compile_definitions(am_exclusive_drain_probe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(am_exclusive_drain_probe PRIVATE ole32 uuid avrt)
+
 include(FetchContent)
 FetchContent_Declare(
   minhook
