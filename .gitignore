@@ -4,7 +4,9 @@
 /report/
 /artifacts/
 /scripts/
-/mod/tests/
+/mod/tests/*
+!/mod/tests/WasapiDrainProbe.cpp
+!/mod/tests/README.md
 /mod/src/Controller.cpp
 /mod/src/PcmProbeDll.cpp
 /mod/src/audio_v2/FinalPcmDump.cpp

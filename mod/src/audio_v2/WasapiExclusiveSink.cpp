@@ -629,9 +629,25 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
                 if (!sourceSignal) continue;
                 if (!source_) continue;
 
-                // Fill the stopped client before restarting it. This preserves
-                // the exact source stream across a network wait and avoids a
-                // restart into an empty endpoint buffer.
+                // Restart the preserved endpoint queue before releasing a new
+                // packet. Some USB event-driven exclusive endpoints (observed on
+                // a C-Media device) lose their event/clock cycle when a packet
+                // is released into a stopped, previously run stream: IAudioClock
+                // parks and the later EOS drain target becomes unreachable.
+                // Prepare() confirms a full packet is available first, so the
+                // restarted stream is filled on the same wake and the source
+                // stream is preserved exactly as before.
+                const HRESULT ready = source_->Prepare(bufferFrames_);
+                if (ready == kAudioSourceWouldBlock) continue;
+                if (FAILED(ready)) {
+                    threadFailure = ready;
+                    break;
+                }
+                const HRESULT resume = client_ ? client_->Start() : E_UNEXPECTED;
+                if (FAILED(resume)) {
+                    threadFailure = resume;
+                    break;
+                }
                 waitingForSource_.store(false, std::memory_order_release);
                 const HRESULT fill = RenderOneBuffer();
                 if (fill == kAudioSourceWouldBlock) continue;
@@ -640,11 +656,6 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
                     break;
                 }
                 if (stopRequested_.load(std::memory_order_acquire)) break;
-                const HRESULT resume = client_ ? client_->Start() : E_UNEXPECTED;
-                if (FAILED(resume)) {
-                    threadFailure = resume;
-                    break;
-                }
                 continue;
             }
             // A producer notification may race with a normal audio-event
