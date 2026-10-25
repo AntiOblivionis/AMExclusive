@@ -762,6 +762,15 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
         (graphBound_ || pendingGraphBind_.converter)) {
         return;
     }
+    // Pause-teardown resume shape 1: Apple re-initializes the paused graph's AudioUnit
+    // formatless and reuses the still-registered converter. Restore the saved
+    // identity instead of clobbering the graph with a formatless one; on
+    // failure fall through to the historical behavior.
+    if (!candidateConverter && sampleRate == 0 && channels == 0 &&
+        TryRestorePausedGraphLocked(unit)) {
+        Wake();
+        return;
+    }
     const bool graphIdentityChanged =
         graphUnit_ != unit || graphConverter_ != candidateConverter;
     pendingGraphBind_ = {};
@@ -798,6 +807,10 @@ void AudioCoreRuntime::OnAudioUnitStarted(void* unit) noexcept {
     graphPaused_ = false;
     graphControlPending_ = false;
     coordinator_.SetSinkResumeBlocked(false);
+    // Pause-teardown resume shape 2: Apple starts the surviving parent/output unit
+    // directly, with no re-initialize at all. Restore the paused identity so
+    // the parent-start branch below sees a bound graph and marks it started.
+    (void)TryRestorePausedGraphLocked(unit);
     if (graphUnit_ == unit) {
         graphStarted_ = true;
         TryBindGraphLocked();
@@ -865,12 +878,32 @@ void AudioCoreRuntime::OnAudioUnitUninitialized(void* unit) noexcept {
     ControlScope lock(*this);
     ExtendSeekQuietPeriodLocked();
     if (graphUnit_ != unit) return;
+    // Apple's pause teardown (a few seconds after play_pause)
+    // uninitializes the graph it will later resume with the SAME AudioUnit
+    // handles and the SAME still-registered converter, supplying no new
+    // format observation. Capture the identity before it is cleared so the
+    // resume edges (formatless re-initialize, or a bare parent Start) can
+    // restore and rebind it. RetireCaptureLocked below clears the slot, so
+    // it is written afterwards; any other retirement path invalidates it.
+    const bool pausedTeardown =
+        (userPauseIntent_ || graphPaused_) && graphConverter_ &&
+        !endOfStreamDrainPending_ && !streamingProducerDrainPending_;
+    const PausedGraphIdentity savedIdentity{
+        graphUnit_, graphOutputUnit_, graphConverter_, graphRate_,
+        graphChannels_, graphSourceBits_, graphObservationId_};
     pendingGraphBind_ = {};
     ClearPendingCaptureLocked();
     graphPaused_ = false;
     graphControlPending_ = false;
     if (!endOfStreamDrainPending_ && !streamingProducerDrainPending_) {
         RetireCaptureLocked(false);
+    }
+    if (pausedTeardown) {
+        pausedGraphIdentity_ = savedIdentity;
+        if (callbacks_.logMessage) {
+            callbacks_.logMessage(callbacks_.context,
+                                  L"v2 paused graph identity saved across teardown");
+        }
     }
     graphUnit_ = nullptr;
     graphOutputUnit_ = nullptr;
@@ -1579,6 +1612,7 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     boundConverter_.store(graphConverter_, std::memory_order_release);
     boundMediaGeneration_.store(generation, std::memory_order_release);
     graphBound_ = true;
+    pausedGraphIdentity_ = {};
     if (!PromotePendingPcmLocked(graphConverter_)) {
         const HRESULT error = E_OUTOFMEMORY;
         Emit(AudioCoreRuntimeEvent::Faulted, error);
@@ -1597,6 +1631,35 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
         std::memory_order_release);
     if (callbacks_.onConverterBound) callbacks_.onConverterBound(callbacks_.context, graphConverter_);
     Emit(AudioCoreRuntimeEvent::Bound, S_OK);
+}
+
+bool AudioCoreRuntime::TryRestorePausedGraphLocked(void* unit) noexcept {
+    // One-shot pause-teardown recovery: resume edges arrive with no fresh converter
+    // observation, so restore the identity the pause teardown retired. The
+    // slot is consumed regardless of outcome; TryBindGraphLocked re-validates
+    // the converter against the live registry before anything binds.
+    if (graphBound_ || pendingGraphBind_.converter || graphUnit_) return false;
+    if (!unit || !pausedGraphIdentity_.unit || !pausedGraphIdentity_.converter) return false;
+    if (unit != pausedGraphIdentity_.unit && unit != pausedGraphIdentity_.outputUnit) {
+        return false;
+    }
+    const PausedGraphIdentity saved = pausedGraphIdentity_;
+    pausedGraphIdentity_ = {};
+    ConverterRegistrationSnapshot snapshot{};
+    if (!registry_.Snapshot(saved.converter, snapshot)) return false;
+    graphUnit_ = saved.unit;
+    graphOutputUnit_ = saved.outputUnit;
+    graphConverter_ = saved.converter;
+    graphRate_ = saved.rate;
+    graphChannels_ = saved.channels;
+    graphSourceBits_ = saved.sourceBits;
+    graphObservationId_ = saved.observationId;
+    if (callbacks_.logMessage) {
+        callbacks_.logMessage(callbacks_.context,
+                              L"v2 paused graph identity restored on resume; rebinding");
+    }
+    TryBindGraphLocked();
+    return graphBound_;
 }
 
 void AudioCoreRuntime::ExtendSeekQuietPeriodLocked() noexcept {
@@ -1814,6 +1877,9 @@ void AudioCoreRuntime::TryBindPendingGraphLocked() noexcept {
 }
 
 void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph, bool keepPendingCapture) noexcept {
+    // Any generation retirement invalidates a saved paused-graph identity;
+    // OnAudioUnitUninitialized re-saves it after this call on the pause path.
+    pausedGraphIdentity_ = {};
     pendingGraphBind_ = {};
     if (!keepPendingCapture) ClearPendingCaptureLocked();
     graphPaused_ = false;

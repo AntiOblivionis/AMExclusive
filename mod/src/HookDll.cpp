@@ -3330,6 +3330,10 @@ HRESULT V2ResumeNativeGraphAfterFailedHandoff(void*, void* unit) noexcept {
     return result;
 }
 
+void V2RuntimeLogMessage(void*, const wchar_t* message) noexcept {
+    if (message) Log(message);
+}
+
 ammod::audio_v2::NativeAudioCallbacks V2NativeCallbacks() noexcept {
     return {&g_audioCoreRuntime, &V2OnNativeInitialize, &V2OnNativeStart,
             &V2BeforeNativeStop, &V2OnNativeStop, &V2OnNativeReset, &V2ShouldSuppress,
@@ -3669,7 +3673,7 @@ DWORD WINAPI InitializeHooks(void*) {
     // software render pump while ACv2 owns only the P0 mirror and physical
     // exclusive endpoint. The runtime must therefore preserve native/graph
     // started bookkeeping across the endpoint handoff.
-    const ammod::audio_v2::AudioCoreRuntimeCallbacks runtimeCallbacks{
+    ammod::audio_v2::AudioCoreRuntimeCallbacks runtimeCallbacks{
         &g_audioCoreRuntime, nullptr, &V2OnSinkLifecycle,
         &V2PrepareNativeHandoff, &V2FinalizeNativeHandoff,
         &V2ResumeNativeAfterFailedHandoff, &V2PrepareNativeGraphHandoff,
@@ -3677,6 +3681,7 @@ DWORD WINAPI InitializeHooks(void*) {
         g_nativeTraceEnabled.load(std::memory_order_acquire),
         &AudioCoreRuntimeEventCallback, &CaptureRuntimeEventContext, &PublishRuntimeEventBoundary,
         &TryAcquirePcmProducer, &ReleasePcmProducer, &PromoteBoundLocalConverter};
+    runtimeCallbacks.logMessage = &V2RuntimeLogMessage;
     if (!g_audioCoreRuntime.Start(runtimeCallbacks)) {
         Log(L"audio core v2 runtime worker failed to start; core remains fail-closed");
     }

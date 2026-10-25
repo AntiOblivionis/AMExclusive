@@ -54,6 +54,11 @@ struct AudioCoreRuntimeCallbacks final {
     bool (*tryAcquireProducer)(void*) noexcept{};
     void (*releaseProducer)(void*) noexcept{};
     void (*onConverterBound)(void*, void*) noexcept{};
+    // Optional plain-text diagnostics channel. The runtime invokes it rarely
+    // (pause-teardown identity save/restore, faulted-gate reap), under
+    // controlMutex_; the callee must not re-enter the runtime or take
+    // runtime/fill locks.
+    void (*logMessage)(void* context, const wchar_t* message) noexcept{};
 };
 
 struct AudioCorePcmFillStats final {
@@ -280,6 +285,7 @@ private:
         std::unique_lock<std::mutex> lock_;
     };
     void TryBindGraphLocked() noexcept;
+    bool TryRestorePausedGraphLocked(void* unit) noexcept;
     void TryActivateLocked() noexcept;
     void TryResumePausedSinkLocked() noexcept;
     void ExtendSeekQuietPeriodLocked() noexcept;
@@ -359,6 +365,19 @@ private:
         std::uint64_t observationId{};
         std::uint64_t registrationId{};
     } pendingGraphBind_{};
+    // Apple's pause teardown uninitializes the graph it later resumes
+    // with the same AudioUnit handles and the same still-registered converter,
+    // with no fresh format observation. This slot preserves that identity so
+    // the resume edge can rebind; any generation retirement invalidates it.
+    struct PausedGraphIdentity final {
+        void* unit{};
+        void* outputUnit{};
+        void* converter{};
+        std::uint32_t rate{};
+        std::uint32_t channels{};
+        std::uint32_t sourceBits{};
+        std::uint64_t observationId{};
+    } pausedGraphIdentity_{};
     // Streaming native Stop is not decoder EOF. Hold the current generation
     // across AudioUnit Stop/Uninitialize while HookDll synchronously flushes
     // the still-live P0 converter to producedPackets==0.
