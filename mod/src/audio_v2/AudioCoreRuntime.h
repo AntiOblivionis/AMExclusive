@@ -283,6 +283,8 @@ private:
     void TryActivateLocked() noexcept;
     void TryResumePausedSinkLocked() noexcept;
     void ExtendSeekQuietPeriodLocked() noexcept;
+    bool DirectSelectionPending() const noexcept;
+    bool RetireDirectSelectionLocked() noexcept;
     bool BeginEndOfStreamDrainLocked(void* converter, bool requireShortTail) noexcept;
     void FinalizeEndOfStreamDrainLocked() noexcept;
     void RetireCompletedCaptureLocked(void* converter) noexcept;

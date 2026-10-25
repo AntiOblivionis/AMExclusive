@@ -286,14 +286,45 @@ void AudioCoreRuntime::OnTransportSkip(std::uint64_t epoch) noexcept {
             Wake();
             return;
         }
+        // The row pointer gesture is only an intent. Apple can reject it or
+        // leave the old item selected, so keep that item's output until an
+        // owning native Stop/Dispose or a replacement graph actually arrives.
+        // A Stop may already have crossed IPC before the confirmation did.
+        if ((!nativeStarted_ || !graphStarted_ || streamingProducerDrainPending_ ||
+             endOfStreamDrainPending_) &&
+            !graphControlPending_ && !graphPaused_) {
+            (void)RetireDirectSelectionLocked();
+        }
+        Wake();
+        return;
     }
-    // Previous/Next, or a direct-selection confirmation that still owns the
-    // armed generation, is an explicit retirement rather than natural EOS.
+    // Previous/Next retains its explicit cancellation contract.
     AdvanceEventEpochLocked();
     RetireCaptureLocked(true);
     seekFence_ = true;
     seekFenceReleaseTick_ = GetTickCount64() + 500;
     Wake();
+}
+
+bool AudioCoreRuntime::DirectSelectionPending() const noexcept {
+    const auto epoch = directSelectionArmEpoch_.load(std::memory_order_acquire);
+    const auto generation = boundMediaGeneration_.load(std::memory_order_acquire);
+    return epoch != 0 && generation != 0 &&
+        directSelectionSkipEpoch_.load(std::memory_order_acquire) == epoch &&
+        directSelectionArmGeneration_.load(std::memory_order_acquire) == generation &&
+        GetTickCount64() <= directSelectionArmDeadlineTick_.load(std::memory_order_acquire);
+}
+
+bool AudioCoreRuntime::RetireDirectSelectionLocked() noexcept {
+    if (!DirectSelectionPending()) return false;
+    AdvanceEventEpochLocked();
+    const auto converter = boundConverter_.load(std::memory_order_acquire);
+    // Preserve only an already selected, identity-checked successor. Never
+    // poll/rebind the retained old graph after retiring it.
+    RetireCompletedCaptureLocked(converter);
+    seekFence_ = true;
+    seekFenceReleaseTick_ = GetTickCount64() + 500;
+    return true;
 }
 
 void AudioCoreRuntime::OnTransportSeekBegin(std::uint64_t epoch) noexcept {
@@ -593,6 +624,11 @@ void AudioCoreRuntime::OnConverterDisposed(void* converter) noexcept {
     if (!UiEnabled() || !converter) return;
     ControlScope lock(*this);
     registry_.Retire(converter);
+    if (boundConverter_.load(std::memory_order_acquire) == converter &&
+        RetireDirectSelectionLocked()) {
+        Wake();
+        return;
+    }
     // A prefetched successor can itself be disposed before becoming bound.
     // Cancel it even in that case, before this address can be reused.
     if (pendingGraphBind_.converter == converter) {
@@ -764,6 +800,7 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
     }
     const bool graphIdentityChanged =
         graphUnit_ != unit || graphConverter_ != candidateConverter;
+    if (graphIdentityChanged) (void)RetireDirectSelectionLocked();
     pendingGraphBind_ = {};
     if (pendingDeferredConverter_.load(std::memory_order_acquire) &&
         pendingDeferredConverter_.load(std::memory_order_acquire) != candidateConverter) {
@@ -829,6 +866,13 @@ void AudioCoreRuntime::OnAudioUnitStopped(void* unit) noexcept {
         return;
     }
 
+    if (RetireDirectSelectionLocked()) {
+        graphStarted_ = false;
+        if (graphOutputUnit_ == unit) graphOutputUnit_ = nullptr;
+        Wake();
+        return;
+    }
+
     const auto converter = boundConverter_.load(std::memory_order_acquire);
     if (!endOfStreamDrainPending_ && !streamingProducerDrainPending_ &&
         !seekFence_ && converter && IsP0Converter(converter)) {
@@ -865,6 +909,7 @@ void AudioCoreRuntime::OnAudioUnitUninitialized(void* unit) noexcept {
     ControlScope lock(*this);
     ExtendSeekQuietPeriodLocked();
     if (graphUnit_ != unit) return;
+    (void)RetireDirectSelectionLocked();
     pendingGraphBind_ = {};
     ClearPendingCaptureLocked();
     graphPaused_ = false;
@@ -916,6 +961,7 @@ bool AudioCoreRuntime::BeforeNativeClientStop(void* client) noexcept {
     {
         ControlScope lock(*this);
         if (nativeClient_.load(std::memory_order_acquire) != client) return false;
+        if (DirectSelectionPending()) return false;
         if (graphControlPending_ || graphPaused_ || userPauseIntent_ || seekFence_ ||
             endOfStreamDrainPending_ || coordinator_.Phase() != AudioCoreGatePhase::Active) {
             return false;
@@ -937,7 +983,8 @@ bool AudioCoreRuntime::BeforeNativeClientStop(void* client) noexcept {
     const auto deadline = GetTickCount64() + kProducerEofWaitMs;
     while (GetTickCount64() < deadline) {
         if (!UiEnabled() ||
-            boundConverter_.load(std::memory_order_acquire) != converter) {
+            boundConverter_.load(std::memory_order_acquire) != converter ||
+            DirectSelectionPending()) {
             return false;
         }
         if (streamingEofCandidateConverter_.load(std::memory_order_acquire) == converter) {
@@ -959,6 +1006,10 @@ void* AudioCoreRuntime::OnNativeClientStopped(void* client, HRESULT result) noex
         // Stopping the Apple AudioUnit can synchronously stop its native
         // client as well. Keep the v2 generation alive until the matching
         // graph resume or a real lifecycle retirement arrives.
+        return nullptr;
+    }
+    if (RetireDirectSelectionLocked()) {
+        Wake();
         return nullptr;
     }
     if (endOfStreamDrainPending_) return nullptr;

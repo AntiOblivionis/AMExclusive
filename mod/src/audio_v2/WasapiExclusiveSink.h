@@ -62,6 +62,12 @@ struct WasapiSinkStats final {
     std::uint64_t clockFrequency{};
     std::uint64_t drainElapsedMs{};
     HRESULT clockReadResult{S_OK};
+    // Successful IAudioClient::Start calls this stream, and how many of them
+    // happened before any frame was in the endpoint buffer. The second value
+    // must stay 0: the first Start of a stream follows priming, and a sealed
+    // empty stream never starts the endpoint at all.
+    std::uint64_t clientStarts{};
+    std::uint64_t startsBeforeFirstBuffer{};
 };
 
 enum class WasapiSinkState : std::uint8_t {
@@ -114,6 +120,7 @@ private:
     HRESULT CheckEndOfStreamDrain() noexcept;
     HRESULT ReadClockPosition(std::uint64_t& position) noexcept;
     bool FramesToClockTicks(std::uint64_t frames, std::uint64_t& ticks) const noexcept;
+    void NoteClientStarted() noexcept;
     void ResetClockTimeline() noexcept;
     void StopInternal(bool preserveBuffer) noexcept;
     void RecordError(HRESULT error) noexcept;
@@ -141,6 +148,17 @@ private:
     std::uint64_t clockSubmittedFrames_{};
     std::uint64_t clockGapTicks_{};
     bool clockPositionValid_{};
+    // IAudioClock position is only meaningful for a started stream, and a
+    // driver may reset it at IAudioClient::Start (observed: stale nonzero
+    // pre-Start reads that drop after Start on a vendor USB driver). Reads
+    // are skipped until the first Start, and the monotonicity guard in
+    // ReadClockPosition resets across every Start boundary.
+    std::atomic<std::uint32_t> clockStartGeneration_{};
+    std::uint32_t clockSeenStartGeneration_{};
+    // Stream-lifetime Start accounting for Stats(); unlike the clock
+    // generation these survive Stop and reset only in Open.
+    std::atomic<std::uint64_t> clientStarts_{};
+    std::atomic<std::uint64_t> startsBeforeFirstBuffer_{};
     std::atomic<std::uint64_t> clockFrequency_{};
     std::atomic<std::uint64_t> clockPosition_{};
     std::atomic<std::uint64_t> clockTarget_{};
