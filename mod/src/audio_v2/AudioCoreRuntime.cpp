@@ -1321,6 +1321,25 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
                 registry_.RetireAll();
                 continue;
             }
+            if (coordinator_.Phase() == AudioCoreGatePhase::Faulted &&
+                coordinator_.SinkState() != WasapiSinkState::Faulted) {
+                // A producer-side gate fault (P0 queue overflow while
+                // the sink is paused and not draining, e.g. the transport
+                // auto-pause at system sleep while Apple keeps rendering)
+                // leaves a dead generation nothing reaps: the sink is Open,
+                // the faulted gate still suppresses Apple, and both resume
+                // and activation are permanently blocked. Retire it; the
+                // graph identity is kept so Apple's next Start/initialize
+                // rebinds through the normal path. Disable() moves the gate
+                // phase off Faulted, so this runs once per fault.
+                if (callbacks_.logMessage) {
+                    callbacks_.logMessage(
+                        callbacks_.context,
+                        L"v2 faulted gate reaped; generation retired, graph identity kept");
+                }
+                RetireCaptureLocked(true);
+                continue;
+            }
             FinalizeEndOfStreamDrainLocked();
             TryBindPendingGraphLocked();
             if (!graphBound_) {
