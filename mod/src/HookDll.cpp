@@ -17,6 +17,7 @@
 #include "ApplePrivateOffsets.h"
 #include "LosslessQualityLock.h"
 #include "LosslessQualityPolicy.h"
+#include "UiPlaybackState.h"
 #include "audio_v2/AudioCoreGate.h"
 #include "audio_v2/AudioCoreRuntime.h"
 #include "audio_v2/NativeRenderGateProxy.h"
@@ -3609,8 +3610,17 @@ DWORD WINAPI PipeClientLoop(void*) {
                     L" allowResampling=" + std::to_wstring(incoming.allowResampling));
             } else if (incoming.type == MessageType::TransportIntent) {
                 if (wcscmp(incoming.detail, L"play_pause") == 0) {
-                    g_audioCoreRuntime.OnTransportPlayPause();
+                    g_audioCoreRuntime.OnTransportPlayPause(incoming.generation);
                     Log(L"transport intent play_pause");
+                } else if (wcscmp(incoming.detail, L"playback_unavailable") == 0) {
+                    g_audioCoreRuntime.OnTransportPlaybackUnavailable(incoming.generation);
+                    Log(L"transport intent playback_unavailable revision=" +
+                        std::to_wstring(incoming.generation));
+                } else if (const auto playback = ammod::ui::ParsePlaybackSnapshot(incoming.detail)) {
+                    g_audioCoreRuntime.OnTransportPlaybackState(incoming.generation,
+                        playback->playing, playback->queueItem);
+                    Log(L"transport intent " + std::wstring(incoming.detail) + L" revision=" +
+                        std::to_wstring(incoming.generation));
                 } else if (wcscmp(incoming.detail, L"selection_arm") == 0) {
                     g_audioCoreRuntime.OnTransportSelectionArm(incoming.generation);
                     Log(L"transport intent selection_arm epoch=" +

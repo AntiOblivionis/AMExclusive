@@ -461,18 +461,26 @@ HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
 
     std::uint32_t written = 0;
     bool endOfStream = false;
+    const bool silencePrime = silencePrimePending_;
+    DWORD flags = 0;
     const bool directInteger32 = config_.format.containerBits == 32 &&
         config_.format.encoding == PcmEncoding::SignedInteger;
     auto* canonical = directInteger32
         ? reinterpret_cast<std::int32_t*>(data) : canonicalBuffer_.data();
-    hr = source_->Fill(canonical, bufferFrames_, written, endOfStream);
-    if (SUCCEEDED(hr) && written <= bufferFrames_ && !directInteger32) {
+    if (silencePrime) {
+        std::memset(data, 0, static_cast<std::size_t>(bufferFrames_) *
+                             waveFormat_.Format.nBlockAlign);
+        written = bufferFrames_;
+        flags = AUDCLNT_BUFFERFLAGS_SILENT;
+    } else {
+        hr = source_->Fill(canonical, bufferFrames_, written, endOfStream);
+    }
+    if (!silencePrime && SUCCEEDED(hr) && written <= bufferFrames_ && !directInteger32) {
         const auto sampleCount = static_cast<std::size_t>(written) * config_.format.channels;
         if (!PackEndpointPcm32(canonical, data, sampleCount, config_.format)) {
             hr = E_INVALIDARG;
         }
     }
-    DWORD flags = 0;
     // Prepare() is checked before GetBuffer, and the queue is single
     // consumer. A second would-block here therefore indicates a broken source
     // contract rather than a network wait; let the normal fail-closed branch
@@ -509,6 +517,10 @@ HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
     }
     submittedFrames_.fetch_add(bufferFrames_, std::memory_order_relaxed);
     submittedBuffers_.fetch_add(1, std::memory_order_relaxed);
+    if (silencePrime) {
+        controlledSilenceFrames_.fetch_add(bufferFrames_, std::memory_order_relaxed);
+        silencePrimePending_ = false;
+    }
     clockSubmittedFrames_ = committedFrames;
     clockGapTicks_ = gap;
     clockTarget_.store(target, std::memory_order_release);
@@ -622,6 +634,7 @@ bool WasapiExclusiveSink::FramesToClockTicks(std::uint64_t frames,
 }
 
 void WasapiExclusiveSink::ResetClockTimeline() noexcept {
+    silencePrimePending_ = config_.primeWithSilence;
     clockSubmittedFrames_ = 0;
     clockGapTicks_ = 0;
     clockPositionValid_ = false;

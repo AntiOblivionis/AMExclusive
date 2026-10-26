@@ -2,6 +2,7 @@
 #include "IpcProtocol.h"
 #include "IpcTransport.h"
 #include "UiRefreshState.h"
+#include "UiPlaybackState.h"
 
 #include <windows.h>
 
@@ -18,7 +19,10 @@
 #include <winrt/Microsoft.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Microsoft.UI.Xaml.Input.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
+#include <winrt/Microsoft.UI.Xaml.Data.h>
 #include <winrt/Microsoft.UI.Dispatching.h>
+#include <winrt/AMP.Services.h>
+#include <winrt/AMP.Services.CommonModels.h>
 
 #include <algorithm>
 #include <atomic>
@@ -103,6 +107,7 @@ void AttachTransportObservers(const Xaml::Window& window, const std::wstring& wi
 bool AttachOrRefreshToggle(const Xaml::DependencyObject& page);
 void ScheduleTransportObserverAttach();
 void ScheduleUiDiscovery();
+void SchedulePlaybackStateSync();
 
 void CALLBACK WindowLifecycleEvent(HWINEVENTHOOK, DWORD event, HWND window,
                                    LONG objectId, LONG childId, DWORD, DWORD) {
@@ -794,7 +799,17 @@ struct UiWindowContext {
     ammod::UiRefreshState requests;
     std::atomic<bool> closed{};
     std::atomic<bool> routesDirty{true}, transportDirty{true};
+    std::atomic<bool> playbackDirty{true};
     // Everything below is confined to dispatcher, including weak resolution.
+    AMP::Services::Player player{nullptr};
+    AMP::Services::CommonModels::PlayerState playerState{nullptr};
+    AMP::Services::CommonModels::NowPlayingItem playingItem{nullptr};
+    event_token playerChanged{}, playerStateChanged{};
+    event_token playingItemChanged{};
+    ammod::ui::PlaybackState lastPlaybackState{ammod::ui::PlaybackState::Unknown};
+    std::uint64_t playbackSync{};
+    std::uint64_t lastPlaybackItem{};
+    std::int32_t playbackError{};
     ObserverRef root, page;
     std::uint64_t rootRevision{};
     ULONGLONG pageObservedTick{};
@@ -812,6 +827,10 @@ struct UiWindowContext {
 std::mutex g_uiWindowsMutex;
 std::vector<std::shared_ptr<UiWindowContext>> g_uiWindows;
 thread_local std::vector<std::weak_ptr<UiWindowContext>> g_threadUiWindows;
+// Only the current MainWindow observes Apple's process-wide Player. A closing
+// predecessor may revoke its own observation, never its replacement's.
+std::atomic<UiWindowContext*> g_playbackObserverOwner{};
+std::atomic<std::uint64_t> g_playbackSync{};
 void RefreshUiWindow(const std::shared_ptr<UiWindowContext>& context);
 
 void QueueUiRefresh(const std::shared_ptr<UiWindowContext>& context) {
@@ -834,6 +853,135 @@ void QueueUiRefresh(const std::shared_ptr<UiWindowContext>& context) {
         // A dispatcher may be shutting down while a WinEvent requests work.
     }
     (void)context->requests.Take(ticket);
+}
+
+void QueuePlaybackState(const std::weak_ptr<UiWindowContext>& weak) noexcept {
+    try {
+        if (auto context = weak.lock(); context && !context->closed.load()) {
+            context->playbackDirty.store(true);
+            QueueUiRefresh(context);
+        }
+    } catch (...) {}
+}
+
+std::uint64_t PlaybackRevision() noexcept {
+    LARGE_INTEGER revision{};
+    return QueryPerformanceCounter(&revision) && revision.QuadPart > 0
+        ? static_cast<std::uint64_t>(revision.QuadPart) : 0;
+}
+
+void RevokePlaybackObserver(const std::shared_ptr<UiWindowContext>& context) noexcept {
+    auto owner = context.get();
+    if (g_playbackObserverOwner.compare_exchange_strong(owner, nullptr)) {
+        try {
+            if (const auto revision = PlaybackRevision())
+                QueueTransport(L"playback_unavailable", revision);
+        } catch (...) {}
+    }
+    context->lastPlaybackState = ammod::ui::PlaybackState::Unknown;
+}
+
+void ClearPlaybackObserver(const std::shared_ptr<UiWindowContext>& context) noexcept {
+    RevokePlaybackObserver(context);
+    try {
+        if (context->playerState) context->playerState.PropertyChanged(context->playerStateChanged);
+    } catch (...) {}
+    try {
+        if (context->player) context->player.PropertyChanged(context->playerChanged);
+    } catch (...) {}
+    try {
+        if (context->playingItem) context->playingItem.PropertyChanged(context->playingItemChanged);
+    } catch (...) {}
+    context->playingItem = nullptr;
+    context->playerState = nullptr;
+    context->player = nullptr;
+}
+
+void RefreshPlaybackState(const std::shared_ptr<UiWindowContext>& context) noexcept {
+    try {
+        // Never construct another Player or call Play/Pause. Read Apple's
+        // existing logical player on this Window's owning dispatcher.
+        auto player = AMP::Services::Player::Current();
+        if (!player) { ClearPlaybackObserver(context); return; }
+        const std::weak_ptr<UiWindowContext> weak = context;
+        if (player != context->player) {
+            ClearPlaybackObserver(context);
+            context->player = player;
+            context->playerChanged = player.PropertyChanged(
+                [weak](auto&&, Xaml::Data::PropertyChangedEventArgs const& args) noexcept {
+                    try {
+                        if (args.PropertyName().empty() || args.PropertyName() == L"PlayerState" ||
+                            args.PropertyName() == L"NowPlayingItem")
+                            QueuePlaybackState(weak);
+                    } catch (...) {}
+                });
+        }
+        auto state = player.PlayerState();
+        if (state != context->playerState) {
+            if (context->playerState)
+                context->playerState.PropertyChanged(context->playerStateChanged);
+            context->playerState = state;
+            if (state) {
+                context->playerStateChanged = state.PropertyChanged(
+                    [weak](auto&&, auto&&) noexcept { QueuePlaybackState(weak); });
+            }
+        }
+        if (!state) {
+            RevokePlaybackObserver(context);
+            return;
+        }
+        auto item = player.NowPlayingItem();
+        if (item != context->playingItem) {
+            if (context->playingItem)
+                context->playingItem.PropertyChanged(context->playingItemChanged);
+            context->playingItem = item;
+            if (item) {
+                context->playingItemChanged = item.PropertyChanged(
+                    [weak](auto&&, Xaml::Data::PropertyChangedEventArgs const& args) noexcept {
+                        try {
+                            if (args.PropertyName().empty() || args.PropertyName() == L"PlayQueueItemID")
+                                QueuePlaybackState(weak);
+                        } catch (...) {}
+                    });
+            }
+        }
+        const auto queueItem = item ? item.PlayQueueItemID() : 0;
+        const bool playing = state.IsPlaying(), paused = state.IsPaused();
+        const auto observed = ammod::ui::ClassifyPlaybackState(playing, paused);
+        g_playbackObserverOwner.store(context.get());
+        context->playbackError = 0;
+        const auto sync = g_playbackSync.load();
+        if (observed == ammod::ui::PlaybackState::Unknown ||
+            (observed == context->lastPlaybackState && queueItem == context->lastPlaybackItem &&
+             sync == context->playbackSync)) return;
+        // QPC is monotonic across processes in the same boot, so a new UI
+        // process cannot reset revisions below those retained by a live Agent.
+        const auto revision = PlaybackRevision();
+        if (!revision) return;
+        QueueTransport(std::wstring(observed == ammod::ui::PlaybackState::Playing
+            ? L"playback_playing:" : L"playback_paused:") + std::to_wstring(queueItem),
+            revision);
+        context->lastPlaybackState = observed;
+        context->lastPlaybackItem = queueItem;
+        context->playbackSync = sync;
+    } catch (const hresult_error& error) {
+        ClearPlaybackObserver(context);
+        if (context->playbackError != error.code().value) {
+            context->playbackError = error.code().value;
+            Log(L"Apple player observation failed hr=" +
+                std::to_wstring(static_cast<std::uint32_t>(error.code())));
+        }
+    } catch (...) {
+        ClearPlaybackObserver(context);
+    }
+}
+
+void SchedulePlaybackStateSync() {
+    ++g_playbackSync;
+    std::lock_guard lock(g_uiWindowsMutex);
+    for (const auto& context : g_uiWindows) {
+        if (context->propertyName == L"MainWindow") QueuePlaybackState(context);
+    }
 }
 
 void WakeUiWindow(const std::weak_ptr<UiWindowContext>& weak,
@@ -959,6 +1107,7 @@ void RefreshUiWindow(const std::shared_ptr<UiWindowContext>& context) {
     auto window = context->window.get();
     if (!window || !window.DispatcherQueue().HasThreadAccess()) return;
     if (GetXamlWindowProperty(context->propertyName) != window) {
+        ClearPlaybackObserver(context);
         ClearUiRoot(context);
         return; // A queued callback may belong to a replaced Window property.
     }
@@ -981,6 +1130,7 @@ void RefreshUiWindow(const std::shared_ptr<UiWindowContext>& context) {
             if (auto live = weak.lock()) {
                 live->closed.store(true);
                 live->requests.Close();
+                ClearPlaybackObserver(live);
                 try { ClearUiRoot(live); } catch (...) {}
                 try {
                     if (live->propertyName == L"MainWindow") {
@@ -1001,6 +1151,9 @@ void RefreshUiWindow(const std::shared_ptr<UiWindowContext>& context) {
         Log(L"UI dispatcher bound window=" + context->propertyName);
     }
     const bool main = context->propertyName == L"MainWindow";
+    if (main && (context->playbackDirty.exchange(false) || discover ||
+                 g_playbackObserverOwner.load() != context.get()))
+        RefreshPlaybackState(context);
     if (main) {
         Microsoft::UI::Dispatching::DispatcherQueue oldDispatcher{nullptr};
         Microsoft::UI::Dispatching::DispatcherQueueTimer oldTimer{nullptr};
@@ -1343,7 +1496,10 @@ void AttachTransportObservers(const Xaml::Window& window, const std::wstring& wi
             for (const auto& node : playPauseNodes) {
                 if (auto button = node.try_as<Primitives::ButtonBase>();
                     button && RememberObserver(g_transportButtonObservers, button)) {
-                    button.Click([](auto&&, auto&&) { QueueTransport(L"play_pause"); });
+                    button.Click([](auto&&, auto&&) {
+                        if (!g_playbackObserverOwner.load())
+                            QueueTransport(L"play_pause", PlaybackRevision());
+                    });
                 }
             }
 
@@ -2015,6 +2171,7 @@ DWORD WINAPI PipeThread(void*) {
             g_connected.store(true);
         }
         Log(L"UI broker IPC connected");
+        SchedulePlaybackStateSync();
         // Broker broadcasts fan out on independent threads, so an older status
         // can arrive after a newer one. Broker generations only ever increase
         // within one broker lifetime; the counter resets per connection.
@@ -2134,10 +2291,13 @@ DWORD WINAPI PipeThread(void*) {
                     continue;
                 }
                 lastStatusGeneration = incoming.generation;
+                bool resyncPlayback{};
                 {
                     std::lock_guard lock(g_statusMutex);
+                    resyncPlayback = !IsEqualGUID(g_status.requestId, incoming.requestId);
                     g_status = incoming;
                 }
+                if (resyncPlayback) SchedulePlaybackStateSync();
                 const int requested = g_requestedHardwareBufferMs.load();
                 if (requested >= 0 &&
                     incoming.hardwareBufferMs == static_cast<std::uint32_t>(requested)) {

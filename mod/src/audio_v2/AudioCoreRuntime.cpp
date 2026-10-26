@@ -23,6 +23,10 @@ constexpr std::uint32_t kReferenceTimePerSecond = 10000000u;
 // observed cold-start burst without making the decoder callback wait.
 constexpr std::size_t kProductionQueueCapacity = 256;
 
+constexpr std::uint64_t NativePumpLowWaterFrames(std::uint32_t sampleRate) noexcept {
+    return (static_cast<std::uint64_t>(sampleRate) * 3u) / 10u;
+}
+
 bool IsLossyAacFormat(std::uint32_t formatId) noexcept {
     return formatId == kQaac;
 }
@@ -71,6 +75,14 @@ bool AudioCoreRuntime::Start(const AudioCoreRuntimeCallbacks& callbacks) noexcep
     nativePumpSampleRate_.store(0, std::memory_order_release);
     nativePumpBufferedFrames_.store(0, std::memory_order_release);
     userPauseIntent_ = false;
+    resumePrebufferPending_ = false;
+    resumeProducerPending_ = false;
+    resumeProducerFrames_ = 0;
+    nativeStartedAfterUserPause_ = false;
+    latestPlaybackStateRevision_ = 0;
+    playbackStateAvailable_ = false;
+    observedPlaybackPlaying_ = false;
+    observedPlaybackItem_ = pausedPlaybackItem_ = pausedPlaybackGeneration_ = 0;
     seekFence_ = false;
     latestSeekEpoch_ = 0;
     seekFenceReleaseTick_ = 0;
@@ -147,6 +159,10 @@ void AudioCoreRuntime::SetUiEnabled(bool enabled) noexcept {
     if (enabled) {
         if (!wasEnabled) {
             AdvanceEventEpochLocked();
+            // State is observed even while AME is Off. Enabling exclusive
+            // output must not turn a known paused Apple player into Play.
+            if (playbackStateAvailable_)
+                userPauseIntent_ = !observedPlaybackPlaying_;
         }
         Wake();
         return;
@@ -177,6 +193,7 @@ void AudioCoreRuntime::SetUiEnabled(bool enabled) noexcept {
     graphObservationId_ = 0;
     graphStarted_ = false;
     userPauseIntent_ = false;
+    nativeStartedAfterUserPause_ = false;
     seekFence_ = false;
     streamingProducerDrainPending_ = false;
     streamingProducerDrainConverter_ = nullptr;
@@ -215,18 +232,95 @@ void AudioCoreRuntime::SetAllowResampling(bool enabled) noexcept {
     allowResampling_.store(enabled, std::memory_order_release);
 }
 
-void AudioCoreRuntime::OnTransportPlayPause() noexcept {
+void AudioCoreRuntime::OnTransportPlayPause(std::uint64_t revision) noexcept {
     if (!UiEnabled()) return;
     ControlScope lock(*this);
+    // A delayed legacy click must not toggle a newer declarative snapshot.
+    if (playbackStateAvailable_) return;
+    if (latestPlaybackStateRevision_ != 0 &&
+        (revision == 0 || revision <= latestPlaybackStateRevision_)) return;
+    if (revision != 0) latestPlaybackStateRevision_ = revision;
     if (coordinator_.Phase() == AudioCoreGatePhase::Active &&
-        coordinator_.SinkState() == WasapiSinkState::Running) {
+        (coordinator_.SinkState() == WasapiSinkState::Running || resumePrebufferPending_)) {
         userPauseIntent_ = true;
+        resumePrebufferPending_ = false;
+        resumeProducerPending_ = false;
+        nativeStartedAfterUserPause_ = false;
         coordinator_.PauseEndpoint();
         return;
     }
 
     userPauseIntent_ = false;
-    TryResumePausedSinkLocked();
+    nativeStartedAfterUserPause_ = false;
+    TryResumePausedSinkLocked(true);
+    Wake();
+}
+
+void AudioCoreRuntime::OnTransportPlaybackUnavailable(std::uint64_t revision) noexcept {
+    if (revision == 0) return;
+    ControlScope lock(*this);
+    if (revision <= latestPlaybackStateRevision_) return;
+    latestPlaybackStateRevision_ = revision;
+    playbackStateAvailable_ = false;
+}
+
+void AudioCoreRuntime::OnTransportPlaybackState(std::uint64_t revision, bool playing,
+                                               std::uint64_t queueItem) noexcept {
+    if (revision == 0) return;
+    ControlScope lock(*this);
+    if (revision <= latestPlaybackStateRevision_) return;
+    latestPlaybackStateRevision_ = revision;
+    playbackStateAvailable_ = true;
+    observedPlaybackPlaying_ = playing;
+    observedPlaybackItem_ = queueItem;
+    if (!playing) {
+        if (queueItem != 0 || !userPauseIntent_) pausedPlaybackItem_ = queueItem;
+        pausedPlaybackGeneration_ = boundMediaGeneration_.load(std::memory_order_acquire);
+    }
+    if (!UiEnabled()) return;
+    if (!playing) {
+        if (!userPauseIntent_) nativeStartedAfterUserPause_ = false;
+        userPauseIntent_ = true;
+        resumePrebufferPending_ = false;
+        resumeProducerPending_ = false;
+        coordinator_.PauseEndpoint();
+        return;
+    }
+    // Apple's logical state covers every playback entry point. Native graph
+    // creation/Start/seek alone still cannot revoke an outstanding pause.
+    const bool sameItem = queueItem != 0 && queueItem == pausedPlaybackItem_;
+    const bool freshNativeStart = nativeStartedAfterUserPause_;
+    const bool resumeExisting = userPauseIntent_ && (freshNativeStart || sameItem);
+    const auto generation = boundMediaGeneration_.load(std::memory_order_acquire);
+    const bool changedPausedItem = pausedPlaybackGeneration_ != 0 &&
+        pausedPlaybackGeneration_ == generation && pausedPlaybackItem_ != 0 &&
+        queueItem != 0 && queueItem != pausedPlaybackItem_;
+    if (changedPausedItem && coordinator_.Phase() == AudioCoreGatePhase::Active &&
+        (userPauseIntent_ || (!nativeStarted_ && streamingProducerDrainPending_)) &&
+        !endOfStreamDrainPending_) {
+        // Play can cross IPC before Apple's old Stop/Uninitialize. Use the
+        // existing generation-scoped selection window so that Stop abandons
+        // the paused item instead of waiting for its natural producer EOF.
+        // A replacement already Capturing is never armed as the old item.
+        directSelectionArmGeneration_.store(
+            generation, std::memory_order_release);
+        directSelectionArmEpoch_.store(revision, std::memory_order_release);
+        directSelectionSkipEpoch_.store(revision, std::memory_order_release);
+        directSelectionArmDeadlineTick_.store(GetTickCount64() + 750,
+                                              std::memory_order_release);
+        // The item notification can cross IPC after the old native Stop.
+        if (!nativeStarted_ && !graphControlPending_ && !graphPaused_)
+            (void)RetireDirectSelectionLocked();
+    }
+    userPauseIntent_ = false;
+    // A short same-item pause retains Apple's running native graph and emits
+    // no new Start on Play. Request its resume here. Other item transitions
+    // still need the owning native Start; TryResume checks graph/client state
+    // and rejects the old paused generation after a queue-item change.
+    if (resumeExisting) TryResumePausedSinkLocked(true);
+    if (freshNativeStart && sameItem &&
+        coordinator_.SinkState() == WasapiSinkState::Running)
+        pausedPlaybackGeneration_ = 0;
     Wake();
 }
 
@@ -274,7 +368,12 @@ void AudioCoreRuntime::OnTransportSkip(std::uint64_t epoch) noexcept {
         // item was paused. Pause intent is generation-scoped; carrying the old
         // true value into the new graph leaves the target permanently Bound
         // while Apple's own timeline is already advancing.
-        userPauseIntent_ = false;
+        // With a canonical Player observer, a row gesture is not authority to
+        // override an actual Paused snapshot. Keep legacy behavior otherwise.
+        if (!playbackStateAvailable_) {
+            userPauseIntent_ = false;
+            nativeStartedAfterUserPause_ = false;
+        }
         // A target graph can bind before the confirming double-click crosses
         // UI -> Broker -> Agent. The skip belongs to the generation that was
         // active on the first press, never to a newly bound target generation.
@@ -948,8 +1047,13 @@ void AudioCoreRuntime::OnNativeClientStarted(void* client, HRESULT result) noexc
     nativeClient_.store(client, std::memory_order_release);
     nativeInitialized_ = true;
     nativeStarted_ = true;
+    if (userPauseIntent_ || resumeProducerPending_) nativeStartedAfterUserPause_ = true;
     TryBindGraphLocked();
     if (!userPauseIntent_) TryResumePausedSinkLocked();
+    if (!userPauseIntent_ && playbackStateAvailable_ && observedPlaybackItem_ != 0 &&
+        observedPlaybackItem_ == pausedPlaybackItem_ &&
+        coordinator_.SinkState() == WasapiSinkState::Running)
+        pausedPlaybackGeneration_ = 0;
     Wake();
 }
 
@@ -1081,6 +1185,10 @@ bool AudioCoreRuntime::OnStreamingProducerEndOfStream(void* converter) noexcept 
         coordinator_.Phase() != AudioCoreGatePhase::Active) {
         return false;
     }
+
+    // A confirmed decoder EOF is a natural tail, not a delayed selection of
+    // the formerly paused item. Do not let a later queue-item update cancel it.
+    pausedPlaybackGeneration_ = 0;
 
     // Zero packets alone are not enough to distinguish a natural track end
     // from Repeat One. If the native scheduler already stopped, this is a late
@@ -1361,6 +1469,7 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
                     }
                 }
             }
+            if (resumePrebufferPending_) TryResumePausedSinkLocked();
             TryActivateLocked();
             nativePumpBufferedFrames_.store(
                 graphBound_ ? static_cast<std::uint64_t>(coordinator_.BufferedFrames()) : 0,
@@ -1587,6 +1696,11 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     AudioCoreCoordinatorConfig config{};
     config.sink.format = format;
     config.sink.allowResampling = allowConversion;
+    // A new generation after a known pause reopens the physical stream. Keep
+    // its first period silent before submitting the unchanged music samples;
+    // same-graph Pause/Start and ordinary EOF handoffs do not use this path.
+    config.sink.primeWithSilence = pausedPlaybackGeneration_ != 0 &&
+        pausedPlaybackGeneration_ != generation;
     const bool localFloat32 = snapshot.registration.encodedFormat == kAppleLinearPcm &&
         (snapshot.registration.appleFormatFlags & kAppleFormatFlagIsFloat) != 0 &&
         snapshot.registration.sourceBitDepth == 32;
@@ -1655,16 +1769,54 @@ void AudioCoreRuntime::ExtendSeekQuietPeriodLocked() noexcept {
     seekFenceReleaseTick_ = GetTickCount64() + 500;
 }
 
-void AudioCoreRuntime::TryResumePausedSinkLocked() noexcept {
-    if (userPauseIntent_ || seekFence_ || !graphStarted_ || !nativeStarted_ ||
+void AudioCoreRuntime::TryResumePausedSinkLocked(bool requireFreshProducer) noexcept {
+    if (userPauseIntent_ || seekFence_ ||
         coordinator_.Phase() != AudioCoreGatePhase::Active ||
         coordinator_.SinkState() != WasapiSinkState::Open) {
         return;
     }
+    const auto generation = boundMediaGeneration_.load(std::memory_order_acquire);
+    if (playbackStateAvailable_ && generation != 0 && generation == pausedPlaybackGeneration_ &&
+        observedPlaybackItem_ != 0 && pausedPlaybackItem_ != 0 &&
+        observedPlaybackItem_ != pausedPlaybackItem_) {
+        resumePrebufferPending_ = false;
+        resumeProducerPending_ = false;
+        return;
+    }
+    if (requireFreshProducer) {
+        // Apple's graph can stay Started while the paused media producer is
+        // idle. Cached PCM alone must not start the device before that source
+        // actually resumes. The tap counter advances only for the bound source;
+        // it needs no new callback work or timing estimate. Local eager PCM
+        // may have no later callback and does not use this compressed-P0 fence.
+        resumeProducerPending_ = IsP0Converter(boundConverter_.load(std::memory_order_acquire));
+        resumeProducerFrames_ = tap_.Stats().acceptedFrames;
+    }
+    const bool terminal = endOfStreamDrainPending_ || coordinator_.EndOfStreamSubmitted();
+    if (!terminal && (!graphStarted_ || !nativeStarted_)) return;
+    const auto reserve = std::max<std::uint64_t>(requiredPrebufferFrames_,
+        NativePumpLowWaterFrames(graphRate_));
+    // A known producer tail must still run without waiting for more media;
+    // the provisional streaming EOF can precede the native Stop that seals it.
+    if (!terminal &&
+        streamingEofCandidateConverter_.load(std::memory_order_acquire) !=
+            boundConverter_.load(std::memory_order_acquire) &&
+        ((resumeProducerPending_ && tap_.Stats().acceptedFrames == resumeProducerFrames_) ||
+         coordinator_.PendingSourceFrames() < reserve)) {
+        resumePrebufferPending_ = true;
+        return;
+    }
+    resumePrebufferPending_ = false;
+    resumeProducerPending_ = false;
     const HRESULT resume = coordinator_.ResumeEndpoint();
     if (FAILED(resume)) {
         Emit(AudioCoreRuntimeEvent::Faulted, resume);
         RetireCaptureLocked(false);
+    } else {
+        if (nativeStartedAfterUserPause_ && playbackStateAvailable_ &&
+            observedPlaybackItem_ != 0 && observedPlaybackItem_ == pausedPlaybackItem_)
+            pausedPlaybackGeneration_ = 0;
+        nativeStartedAfterUserPause_ = false;
     }
 }
 
@@ -1865,6 +2017,10 @@ void AudioCoreRuntime::TryBindPendingGraphLocked() noexcept {
 }
 
 void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph, bool keepPendingCapture) noexcept {
+    resumePrebufferPending_ = false;
+    resumeProducerPending_ = false;
+    resumeProducerFrames_ = 0;
+    nativeStartedAfterUserPause_ = false;
     pendingGraphBind_ = {};
     if (!keepPendingCapture) ClearPendingCaptureLocked();
     graphPaused_ = false;
@@ -1933,8 +2089,7 @@ std::uint32_t AudioCoreRuntime::NativePumpPeriodMs() const noexcept {
     // Keep a modest load-jitter reservoir without returning to the old 1+ s
     // pause-latency buffer. 300-500 ms gives the producer substantially more
     // scheduling headroom while the 9/10/11 ms loop still corrects clock drift.
-    const std::uint64_t lowWaterFrames =
-        (static_cast<std::uint64_t>(sampleRate) * 3u) / 10u;
+    const std::uint64_t lowWaterFrames = NativePumpLowWaterFrames(sampleRate);
     const std::uint64_t highWaterFrames = sampleRate / 2u;
     if (bufferedFrames < lowWaterFrames) return kCatchUpMs;
     if (bufferedFrames > highWaterFrames) return kBackOffMs;

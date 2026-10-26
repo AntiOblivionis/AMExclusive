@@ -41,6 +41,9 @@ struct WasapiSinkConfig final {
     std::uint32_t periodFrames{};
     std::uint32_t alignmentRetries{2};
     bool allowResampling{};
+    // One zero-filled device period before the first media packet. Opt-in
+    // for an endpoint rebuilt after pause; never consume/drop source frames.
+    bool primeWithSilence{};
     // Non-owning producer notification. The coordinator owns this handle and
     // keeps it valid until the sink has stopped and closed.
     HANDLE sourceReadyEvent{};
@@ -143,6 +146,7 @@ private:
     std::uint64_t drainWaitStartedTick_{};
     bool drainPositionValid_{};
     bool pausedWithBuffer_{};
+    bool silencePrimePending_{};
     // Device position and committed PCM share the same stream-relative origin.
     // Keep this ledger across Pause; reset it only with the actual client Reset.
     std::uint64_t clockSubmittedFrames_{};

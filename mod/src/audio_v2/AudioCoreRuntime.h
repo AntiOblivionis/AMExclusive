@@ -138,7 +138,10 @@ public:
 
     // UI transport intents are control-plane only. They gate when the exact
     // endpoint stream may run; they never modify or synthesize PCM samples.
-    void OnTransportPlayPause() noexcept;
+    void OnTransportPlayPause(std::uint64_t revision = 0) noexcept;
+    void OnTransportPlaybackState(std::uint64_t revision, bool playing,
+                                  std::uint64_t queueItem) noexcept;
+    void OnTransportPlaybackUnavailable(std::uint64_t revision) noexcept;
     void OnTransportSelectionArm(std::uint64_t epoch) noexcept;
     void OnTransportSkipArm(std::uint64_t epoch) noexcept;
     void OnTransportSkip(std::uint64_t epoch = 0) noexcept;
@@ -281,7 +284,7 @@ private:
     };
     void TryBindGraphLocked() noexcept;
     void TryActivateLocked() noexcept;
-    void TryResumePausedSinkLocked() noexcept;
+    void TryResumePausedSinkLocked(bool requireFreshProducer = false) noexcept;
     void ExtendSeekQuietPeriodLocked() noexcept;
     bool DirectSelectionPending() const noexcept;
     bool RetireDirectSelectionLocked() noexcept;
@@ -346,6 +349,14 @@ private:
     bool graphPaused_{};
     bool graphControlPending_{};
     bool userPauseIntent_{};
+    bool resumePrebufferPending_{};
+    bool resumeProducerPending_{};
+    std::uint64_t resumeProducerFrames_{};
+    bool nativeStartedAfterUserPause_{};
+    std::uint64_t latestPlaybackStateRevision_{};
+    bool playbackStateAvailable_{};
+    bool observedPlaybackPlaying_{};
+    std::uint64_t observedPlaybackItem_{}, pausedPlaybackItem_{}, pausedPlaybackGeneration_{};
     bool seekFence_{};
     std::uint64_t latestSeekEpoch_{};
     ULONGLONG seekFenceReleaseTick_{};
