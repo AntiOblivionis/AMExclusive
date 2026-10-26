@@ -21,8 +21,7 @@
 #include <winrt/Microsoft.UI.Xaml.Media.h>
 #include <winrt/Microsoft.UI.Xaml.Data.h>
 #include <winrt/Microsoft.UI.Dispatching.h>
-#include <winrt/AMP.Services.h>
-#include <winrt/AMP.Services.CommonModels.h>
+#include "ApplePlayback.h"
 
 #include <algorithm>
 #include <atomic>
@@ -51,6 +50,7 @@ namespace Automation = Microsoft::UI::Xaml::Automation;
 using namespace ammod::ipc;
 using ObserverRef = winrt::weak_ref<Xaml::DependencyObject>;
 using WindowObserverRef = winrt::weak_ref<Xaml::Window>;
+namespace ApplePlayback = ammod::apple_private::playback;
 
 HMODULE g_module{};
 std::filesystem::path g_logPath;
@@ -801,9 +801,9 @@ struct UiWindowContext {
     std::atomic<bool> routesDirty{true}, transportDirty{true};
     std::atomic<bool> playbackDirty{true};
     // Everything below is confined to dispatcher, including weak resolution.
-    AMP::Services::Player player{nullptr};
-    AMP::Services::CommonModels::PlayerState playerState{nullptr};
-    AMP::Services::CommonModels::NowPlayingItem playingItem{nullptr};
+    ApplePlayback::Player player{nullptr};
+    ApplePlayback::PlayerState playerState{nullptr};
+    ApplePlayback::NowPlayingItem playingItem{nullptr};
     event_token playerChanged{}, playerStateChanged{};
     event_token playingItemChanged{};
     ammod::ui::PlaybackState lastPlaybackState{ammod::ui::PlaybackState::Unknown};
@@ -901,7 +901,7 @@ void RefreshPlaybackState(const std::shared_ptr<UiWindowContext>& context) noexc
     try {
         // Never construct another Player or call Play/Pause. Read Apple's
         // existing logical player on this Window's owning dispatcher.
-        auto player = AMP::Services::Player::Current();
+        auto player = ApplePlayback::Player::Current();
         if (!player) { ClearPlaybackObserver(context); return; }
         const std::weak_ptr<UiWindowContext> weak = context;
         if (player != context->player) {
