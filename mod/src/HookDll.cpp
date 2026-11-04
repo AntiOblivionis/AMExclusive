@@ -51,6 +51,7 @@ HMODULE g_module{};
 std::filesystem::path g_iniPath;
 std::filesystem::path g_logPath;
 std::mutex g_logMutex;
+std::mutex g_faultLogMutex;
 
 using CoCreateInstanceFn = HRESULT(WINAPI*)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
 using EnumAudioEndpointsFn = HRESULT(STDMETHODCALLTYPE*)(IMMDeviceEnumerator*, EDataFlow, DWORD, IMMDeviceCollection**);
@@ -905,6 +906,183 @@ void Log(const std::wstring& message) {
          << std::setw(3) << now.wMilliseconds << L" pid=" << GetCurrentProcessId()
          << L" tid=" << GetCurrentThreadId() << L" " << message;
     ammod::logging::AppendWideLine(g_logPath, g_logMutex, line.str(), 8ull * 1024ull * 1024ull, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Fault dump support. Written only from the rare Faulted publication, into a
+// separately rotated file, so a single user log is enough to classify a
+// teardown/EOF race without asking for a second reproduction. The dump is a
+// bounded, self-contained snapshot: build/host identity, fault stack, sink and
+// runtime state, plus the main log tail as local context.
+std::filesystem::path FaultLogPath() {
+    return g_logPath.parent_path() / L"am-exclusive-faults.log";
+}
+
+std::wstring WidenAnsi(std::string_view text) {
+    if (text.empty()) return {};
+    const int bytes = static_cast<int>(text.size());
+    const int chars = MultiByteToWideChar(CP_ACP, 0, text.data(), bytes, nullptr, 0);
+    if (chars <= 0) return {};
+    std::wstring result(static_cast<std::size_t>(chars), L'\0');
+    MultiByteToWideChar(CP_ACP, 0, text.data(), bytes, result.data(), chars);
+    return result;
+}
+
+std::wstring Utf8ToWide(std::string_view text) {
+    if (text.empty()) return {};
+    const int bytes = static_cast<int>(text.size());
+    const int chars = MultiByteToWideChar(CP_UTF8, 0, text.data(), bytes, nullptr, 0);
+    if (chars <= 0) return {};
+    std::wstring result(static_cast<std::size_t>(chars), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), bytes, result.data(), chars);
+    return result;
+}
+
+std::wstring LocalTimestampText() {
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t text[40]{};
+    std::swprintf(text, std::size(text), L"%04u-%02u-%02uT%02u:%02u:%02u.%03u",
+                  now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
+                  now.wMilliseconds);
+    return text;
+}
+
+std::wstring HexText(std::uint64_t value) {
+    wchar_t text[32]{};
+    std::swprintf(text, std::size(text), L"0x%llX", static_cast<unsigned long long>(value));
+    return text;
+}
+
+std::wstring FaultStackText() {
+    std::array<void*, 12> frames{};
+    const auto count = CaptureStackBackTrace(2, static_cast<DWORD>(frames.size()),
+                                             frames.data(), nullptr);
+    std::wstring text;
+    for (USHORT index = 0; index < count; ++index) {
+        if (!text.empty()) text += L" <- ";
+        text += AddressLocation(frames[index]);
+    }
+    return text;
+}
+
+std::wstring MainLogTailText(std::size_t maxBytes) {
+    std::ifstream stream(g_logPath, std::ios::binary);
+    if (!stream) return {};
+    stream.seekg(0, std::ios::end);
+    const auto end = stream.tellg();
+    if (end < 0) return {};
+    const auto size = static_cast<std::size_t>(end);
+    if (size == 0) return {};
+    const auto length = std::min(maxBytes, size);
+    stream.seekg(static_cast<std::streamoff>(size - length));
+    std::string bytes(length, '\0');
+    stream.read(bytes.data(), static_cast<std::streamsize>(length));
+    bytes.resize(static_cast<std::size_t>(stream.gcount()));
+    return Utf8ToWide(bytes);
+}
+
+bool WriteFaultDump(const ammod::audio_v2::AudioCoreRuntimeEventSnapshot& snapshot) {
+    // One full dump per media generation, and at most eight dumps per process:
+    // repeated faults must not turn into a log storm. Oversized dumps can never
+    // happen because the dump is bounded and the target log is rotated.
+    static std::atomic<std::uint64_t> lastGeneration{~0ull};
+    static std::atomic<std::uint32_t> dumpCount{};
+    if (dumpCount.load(std::memory_order_acquire) >= 8) return false;
+    auto previous = lastGeneration.load(std::memory_order_acquire);
+    if (previous == snapshot.mediaGeneration) return false;
+    if (!lastGeneration.compare_exchange_strong(previous, snapshot.mediaGeneration)) return false;
+    dumpCount.fetch_add(1, std::memory_order_acq_rel);
+
+    try {
+    const auto& sink = snapshot.stats.sink;
+    const auto* diagnostics = &snapshot.diagnostics;
+    const auto describeFormat = [](const ammod::audio_v2::PcmFormat& format) {
+        wchar_t text[160]{};
+        std::swprintf(text, std::size(text),
+                      L"{rate=%u channels=%u validBits=%u containerBits=%u}"
+                      L"{float=%d}",
+                      format.sampleRate, format.channels, format.validBits,
+                      format.containerBits,
+                      format.encoding == ammod::audio_v2::PcmEncoding::IeeeFloat ? 1 : 0);
+        return std::wstring(text);
+    };
+
+    wchar_t image[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, image, static_cast<DWORD>(std::size(image)));
+
+    std::wostringstream text;
+    text << L"=== AMExclusive fault dump ===\n";
+    text << L"time=" << LocalTimestampText()
+         << L" pid=" << GetCurrentProcessId()
+         << L" tid=" << GetCurrentThreadId() << L"\n";
+    text << L"build=" << WidenAnsi(__DATE__ " " __TIME__)
+         << L" hook=am-exclusive-hook.dll\n";
+    text << L"host=" << image << L"\n";
+    text << L"fault result=" << HResultText(snapshot.result)
+         << L" eventEpoch=" << snapshot.epoch
+         << L" contextToken=" << snapshot.contextToken
+         << L" mediaGeneration=" << snapshot.mediaGeneration
+         << L" converter=" << HexText(reinterpret_cast<std::uintptr_t>(snapshot.converter)) << L"\n";
+    text << L"format output=" << describeFormat(snapshot.outputFormat)
+         << L" source=" << describeFormat(snapshot.sourceFormat)
+         << L" resampled=" << snapshot.resampled
+         << L" reducingBitDepth=" << snapshot.reducingBitDepth
+         << L" sourceMappingExact=" << snapshot.sourceMappingExact
+         << L" converting=" << snapshot.converting << L"\n";
+    text << L"sink submittedFrames=" << sink.submittedFrames
+         << L" submittedBuffers=" << sink.submittedBuffers
+         << L" controlledSilenceFrames=" << sink.controlledSilenceFrames
+         << L" sourceWaits=" << sink.sourceWaits
+         << L" underruns=" << sink.underruns
+         << L" getBufferFailures=" << sink.getBufferFailures
+         << L" releaseBufferFailures=" << sink.releaseBufferFailures << L"\n";
+    text << L"sink lastError=" << HResultText(sink.lastError)
+         << L" clockPosition=" << sink.clockPosition
+         << L" clockTarget=" << sink.clockTarget
+         << L" clockFrequency=" << sink.clockFrequency
+         << L" drainElapsedMs=" << sink.drainElapsedMs
+         << L" clockRead=" << HResultText(sink.clockReadResult)
+         << L" clientStarts=" << sink.clientStarts
+         << L" startsBeforeFirstBuffer=" << sink.startsBeforeFirstBuffer
+         << L" eosSubmitted=" << sink.endOfStreamSubmitted
+         << L" eosComplete=" << sink.endOfStreamComplete << L"\n";
+    text << L"runtime boundConverter=" << HexText(reinterpret_cast<std::uintptr_t>(diagnostics->boundConverter))
+         << L" graphConverter=" << HexText(reinterpret_cast<std::uintptr_t>(diagnostics->graphConverter))
+         << L" graphUnit=" << HexText(reinterpret_cast<std::uintptr_t>(diagnostics->graphUnit))
+         << L" graphOutputUnit=" << HexText(reinterpret_cast<std::uintptr_t>(diagnostics->graphOutputUnit))
+         << L" nativeClient=" << HexText(reinterpret_cast<std::uintptr_t>(diagnostics->nativeClient)) << L"\n";
+    text << L"runtime graphBound=" << diagnostics->graphBound
+         << L" graphStarted=" << diagnostics->graphStarted
+         << L" graphPaused=" << diagnostics->graphPaused
+         << L" graphControlPending=" << diagnostics->graphControlPending
+         << L" userPauseIntent=" << diagnostics->userPauseIntent
+         << L" resumePrebufferPending=" << diagnostics->resumePrebufferPending
+         << L" resumeProducerPending=" << diagnostics->resumeProducerPending
+         << L" nativeInitialized=" << diagnostics->nativeInitialized
+         << L" nativeStarted=" << diagnostics->nativeStarted << L"\n";
+    text << L"runtime playbackStateAvailable=" << diagnostics->playbackStateAvailable
+         << L" observedPlaybackPlaying=" << diagnostics->observedPlaybackPlaying
+         << L" observedPlaybackItem=" << diagnostics->observedPlaybackItem
+         << L" seekFence=" << diagnostics->seekFence
+         << L" latestSeekEpoch=" << diagnostics->latestSeekEpoch
+         << L" callbackDepth=" << diagnostics->callbackDepth << L"\n";
+    text << L"runtime streamingDrainPending=" << diagnostics->streamingProducerDrainPending
+         << L" streamingDrainConverter=" << HexText(reinterpret_cast<std::uintptr_t>(diagnostics->streamingProducerDrainConverter))
+         << L" eosDrainPending=" << diagnostics->endOfStreamDrainPending
+         << L" eosDrainConverter=" << HexText(reinterpret_cast<std::uintptr_t>(diagnostics->endOfStreamDrainConverter)) << L"\n";
+    text << L"stack " << FaultStackText() << L"\n";
+    text << L"--- context tail (last 8 KiB of am-exclusive.log) ---\n";
+    text << MainLogTailText(8u * 1024u);
+    text << L"\n--- end fault dump ---\n";
+
+    ammod::logging::AppendWideLine(FaultLogPath(), g_faultLogMutex, text.str(),
+                                   1ull * 1024ull * 1024ull, 2);
+    return true;
+    } catch (...) {
+        // Diagnostics must never turn a recovered audio fault into a crash.
+        return false;
+    }
 }
 
 std::wstring ReadSetting(const wchar_t* key, const wchar_t* fallback) {
@@ -1888,6 +2066,12 @@ void AudioCoreRuntimeEventCallback(void*, const ammod::audio_v2::AudioCoreRuntim
                 L" clockFrequency=" + std::to_wstring(snapshot.stats.sink.clockFrequency) +
                 L" clockRead=" + HResultText(snapshot.stats.sink.clockReadResult) +
                 L" drainElapsedMs=" + std::to_wstring(snapshot.stats.sink.drainElapsedMs));
+            // Self-contained one-shot diagnostics for this rare failure. Normal
+            // playback never reaches this branch, so the extra capture and write
+            // cost nothing on the success path.
+            if (WriteFaultDump(snapshot)) {
+                Log(L"fault dump written to am-exclusive-faults.log");
+            }
         } else {
             Log(L"audio core v2 rejected current playback; AME remains armed result=" +
                 HResultText(result));
@@ -2680,10 +2864,8 @@ AppleOSStatus __cdecl HookV2AudioConverterReset(void* converter) {
             return agentBase && value >= agentBase ? value - agentBase : 0;
         };
         localSeekReset = count >= 3 &&
-            rva(resetStack[0]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame0 &&
-            rva(resetStack[1]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame1 &&
-            (rva(resetStack[2]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame2[0] ||
-             rva(resetStack[2]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame2[1]);
+            ammod::apple_private::agent_stack::MatchesLocalSeekReset(
+                rva(resetStack[0]), rva(resetStack[1]), rva(resetStack[2]));
     }
     const bool trackedP0 = g_nativeP0Puller.Tracks(converter);
     if (trackedP0) g_nativeP0Puller.PauseForReset(converter);

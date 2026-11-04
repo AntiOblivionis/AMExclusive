@@ -71,6 +71,9 @@ struct WasapiSinkStats final {
     // empty stream never starts the endpoint at all.
     std::uint64_t clientStarts{};
     std::uint64_t startsBeforeFirstBuffer{};
+    // Diagnostic-only snapshot of the end-of-stream contract at fault time.
+    bool endOfStreamSubmitted{};
+    bool endOfStreamComplete{};
 };
 
 enum class WasapiSinkState : std::uint8_t {

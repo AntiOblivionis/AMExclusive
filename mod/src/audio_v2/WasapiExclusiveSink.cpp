@@ -951,6 +951,8 @@ WasapiSinkStats WasapiExclusiveSink::Stats() const noexcept {
         static_cast<HRESULT>(clockReadResult_.load(std::memory_order_relaxed)),
         clientStarts_.load(std::memory_order_acquire),
         startsBeforeFirstBuffer_.load(std::memory_order_acquire),
+        endOfStreamSubmitted_.load(std::memory_order_acquire),
+        endOfStreamComplete_.load(std::memory_order_acquire),
     };
 }
 

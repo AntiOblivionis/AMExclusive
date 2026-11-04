@@ -948,6 +948,13 @@ void RefreshPlaybackState(const std::shared_ptr<UiWindowContext>& context) noexc
         const auto queueItem = item ? item.PlayQueueItemID() : 0;
         const bool playing = state.IsPlaying(), paused = state.IsPaused();
         const auto observed = ammod::ui::ClassifyPlaybackState(playing, paused);
+        if (!g_playbackObserverOwner.load()) {
+            // One line per attach: identifies which private ABI generation the
+            // live Apple Music build exposes (1.6.x legacy vs 1.7+ re-IID'd).
+            Log(L"Apple player observation attached abi=" +
+                std::wstring(ApplePlayback::PlayerAbiName(
+                    ApplePlayback::DetectPlayerAbi(player))));
+        }
         g_playbackObserverOwner.store(context.get());
         context->playbackError = 0;
         const auto sync = g_playbackSync.load();

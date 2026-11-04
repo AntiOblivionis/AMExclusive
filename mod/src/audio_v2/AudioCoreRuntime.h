@@ -101,6 +101,30 @@ struct AudioCoreRuntimeStats final {
     AudioCorePcmFillStats pcmFill{};
 };
 
+// Immutable diagnostic state captured with a Faulted event. Only read from the
+// already-published snapshot, so the fault dump never touches live runtime state
+// from another thread. This is the context needed to classify a teardown/EOF
+// race without asking the user to reproduce it.
+struct AudioCoreRuntimeDiagnostics final {
+    std::uint64_t eventEpoch{};
+    std::uint64_t mediaGeneration{};
+    void* boundConverter{};
+    void* graphConverter{};
+    void* graphUnit{};
+    void* graphOutputUnit{};
+    void* nativeClient{};
+    std::uint64_t latestSeekEpoch{};
+    std::uint32_t callbackDepth{};
+    bool graphBound{}, graphStarted{}, graphPaused{}, graphControlPending{};
+    bool userPauseIntent{}, resumePrebufferPending{}, resumeProducerPending{};
+    bool nativeInitialized{}, nativeStarted{};
+    bool playbackStateAvailable{}, observedPlaybackPlaying{}, seekFence{};
+    std::uint64_t observedPlaybackItem{};
+    bool streamingProducerDrainPending{}, endOfStreamDrainPending{};
+    void* streamingProducerDrainConverter{};
+    void* endOfStreamDrainConverter{};
+};
+
 struct AudioCoreRuntimeEventSnapshot final {
     AudioCoreRuntimeEvent event{};
     HRESULT result{S_OK};
@@ -111,6 +135,7 @@ struct AudioCoreRuntimeEventSnapshot final {
     PcmFormat outputFormat{}, sourceFormat{};
     bool resampled{}, reducingBitDepth{}, sourceMappingExact{}, converting{};
     AudioCoreRuntimeStats stats{};
+    AudioCoreRuntimeDiagnostics diagnostics{};
 };
 
 // Production bridge for the v2 core. Hook entry points call the converter and

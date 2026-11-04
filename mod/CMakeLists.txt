@@ -25,9 +25,24 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
-set(APPLE_MUSIC_PACKAGE_DIR
-    "C:/Program Files/WindowsApps/AppleInc.AppleMusicWin_1.1540.23042.0_x64__nzyj5cx40ttqa"
-    CACHE PATH "Supported Apple Music package used to generate WinUI projections")
+# Apple Music package that supplies the WinUI metadata used for the UI projection.
+# Apple regenerates the package directory with every release, so a pinned path
+# goes stale as soon as the user updates Apple Music; auto-detect the newest
+# installed package unless the caller pins one explicitly.
+set(APPLE_MUSIC_PACKAGE_DIR "" CACHE PATH "Apple Music package used to generate WinUI projections (auto-detected when empty)")
+if(NOT APPLE_MUSIC_PACKAGE_DIR)
+  file(GLOB _apple_music_package_dirs
+    "$ENV{ProgramW6432}/WindowsApps/AppleInc.AppleMusicWin_1.*_x64__nzyj5cx40ttqa"
+    "$ENV{ProgramFiles}/WindowsApps/AppleInc.AppleMusicWin_1.*_x64__nzyj5cx40ttqa")
+  if(_apple_music_package_dirs)
+    list(SORT _apple_music_package_dirs COMPARE NATURAL ORDER DESCENDING)
+    list(GET _apple_music_package_dirs 0 APPLE_MUSIC_PACKAGE_DIR)
+    message(STATUS "Auto-detected Apple Music package: ${APPLE_MUSIC_PACKAGE_DIR}")
+  endif()
+endif()
+if(NOT APPLE_MUSIC_PACKAGE_DIR)
+  message(FATAL_ERROR "Apple Music package not found; pass -DAPPLE_MUSIC_PACKAGE_DIR=<package directory>")
+endif()
 find_program(CPPWINRT_EXECUTABLE cppwinrt.exe)
 if(NOT CPPWINRT_EXECUTABLE)
   file(GLOB CPPWINRT_CANDIDATES
