@@ -7,6 +7,7 @@
 /mod/tests/*
 !/mod/tests/WasapiDrainProbe.cpp
 !/mod/tests/README.md
+!/mod/tests/DlnaSelfTest.cpp
 /mod/src/Controller.cpp
 /mod/src/PcmProbeDll.cpp
 /mod/src/audio_v2/FinalPcmDump.cpp
@@ -133,3 +134,16 @@ __pycache__/
 Thumbs.db
 Desktop.ini
 nul
+
+# Fork-specific: local research data, personal device configuration and
+# publication staging. Never commit real UDNs, LAN addresses or audio samples.
+.workbuddy-ai/
+/123.wav
+/hifi-relay.exe
+/tools/testdata/
+/tools/*.bak
+*.ini.bak
+/release-src/
+/publish/
+/dist/*.exe
+/dist/*.zip

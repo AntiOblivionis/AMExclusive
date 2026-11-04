@@ -1,0 +1,93 @@
+name: Bug report
+description: Report a playback, quality-lock, or DLNA problem
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        Please check [Known limitations](https://github.com/dxdxdxlm123/AMExclusive-Openhome#known-limitations)
+        first: renderer-side seeking, the 3-second progress-bar tail, and the
+        first-track SMTC fallback are known behaviour.
+
+        **Redact personal data** (renderer UDN, LAN IP addresses, account names)
+        before pasting logs or configuration.
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Release tag or commit SHA you are running
+      placeholder: "v0.2.0 or abc1234"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11 24H2 (build 26100.x)"
+    validations:
+      required: true
+  - type: input
+    id: applemusic
+    attributes:
+      label: Apple Music version
+      placeholder: "1.1792.39682.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: output
+    attributes:
+      label: Output mode
+      options:
+        - dlna
+        - wasapi
+        - both / unsure
+    validations:
+      required: true
+  - type: input
+    id: renderer
+    attributes:
+      label: Renderer / DAC
+      description: Model and firmware for network renderers
+      placeholder: "AURALiC VEGA G2.2 / LightningPlayer"
+    validations:
+      required: false
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Set output=dlna
+        2. Play a 96 kHz ALAC track
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs
+      description: |
+        Attach or paste the relevant tail of %PUBLIC%\AMExclusive\am-exclusive.log,
+        am-exclusive-dlna.log and am-exclusive-broker.log.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I have redacted device UDNs and LAN IP addresses.
+          required: true
+        - label: I tried with force_hires=0 and noted the result.
+          required: false
+        - label: I restarted Apple Music completely after installing/upgrading.
+          required: true

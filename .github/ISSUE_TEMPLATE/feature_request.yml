@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest an improvement or new renderer support
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: If you have one; otherwise describe the desired behaviour.
+    validations:
+      required: false
+  - type: input
+    id: device
+    attributes:
+      label: Device / renderer involved
+      placeholder: "AURALiC VEGA G2.2, BubbleUPnP, foobar2000 ..."
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: This is not a request to bypass DRM or extract decrypted media.
+          required: true
+        - label: I checked the Known limitations section in the README.
+          required: true
