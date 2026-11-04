@@ -1,21 +1,80 @@
 #pragma once
 
 #include "PcmTypes.h"
+#include "MemoryLock.h"
 
 #include <rigtorp/SPSCQueue.h>
 
+#include <windows.h>
+
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 namespace ammod::audio_v2 {
+
+// The queue allocates one contiguous block of PcmBlocks. Recording that
+// allocation lets the owner pin those pages so the real-time producer thread
+// can never take a page fault on them.
+struct PcmBlockPool final {
+    PcmBlock* base{};
+    std::size_t count{};
+};
+
+// Minimal allocator that only exists to observe the queue's allocation.
+// std::allocator_traits needs value_type/allocate/deallocate and nothing else
+// here, because SPSCQueue only ever allocates PcmBlock.
+struct PcmBlockAllocator final {
+    using value_type = PcmBlock;
+
+    PcmBlockPool* pool{};
+
+    PcmBlockAllocator() noexcept = default;
+    explicit PcmBlockAllocator(PcmBlockPool* target) noexcept : pool(target) {}
+    PcmBlockAllocator(const PcmBlockAllocator&) noexcept = default;
+    PcmBlockAllocator& operator=(const PcmBlockAllocator&) noexcept = default;
+
+    PcmBlock* allocate(std::size_t count) {
+        PcmBlock* memory = std::allocator<PcmBlock>{}.allocate(count);
+        if (pool) {
+            pool->base = memory;
+            pool->count = count;
+        }
+        return memory;
+    }
+    void deallocate(PcmBlock* memory, std::size_t count) noexcept {
+        std::allocator<PcmBlock>{}.deallocate(memory, count);
+    }
+    bool operator==(const PcmBlockAllocator& other) const noexcept {
+        return pool == other.pool;
+    }
+    bool operator!=(const PcmBlockAllocator& other) const noexcept {
+        return pool != other.pool;
+    }
+};
 
 class PcmQueue final {
 public:
     explicit PcmQueue(std::size_t capacity)
-        : queue_(capacity) {}
+        : queue_(capacity, PcmBlockAllocator{&pool_}) {}
 
     PcmQueue(const PcmQueue&) = delete;
     PcmQueue& operator=(const PcmQueue&) = delete;
+
+    // Pin the queue's pages. Best effort: VirtualLock fails only when the
+    // process working-set quota is exhausted, and the queue works either way -
+    // a trimmed page just costs a page fault on the callback thread.
+    bool LockMemory() noexcept {
+        if (!pool_.base || pool_.count == 0) return false;
+        return LockBuffer(pool_.base, pool_.count * sizeof(PcmBlock));
+    }
+    void UnlockMemory() noexcept {
+        if (!pool_.base || pool_.count == 0) return;
+        UnlockBuffer(pool_.base, pool_.count * sizeof(PcmBlock));
+    }
+    std::size_t LockableBytes() const noexcept {
+        return pool_.count * sizeof(PcmBlock);
+    }
 
     bool TryPush(const PcmFormat& format,
                  std::uint64_t mediaGeneration,
@@ -123,7 +182,10 @@ public:
     }
 
 private:
-    rigtorp::SPSCQueue<PcmBlock> queue_;
+    // Declared before the queue so the allocator can record into it during
+    // construction.
+    PcmBlockPool pool_{};
+    rigtorp::SPSCQueue<PcmBlock, PcmBlockAllocator> queue_;
     std::atomic<std::size_t> queuedFrames_{};
     std::atomic<bool> endOfStreamSealed_{};
 };
