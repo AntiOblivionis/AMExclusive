@@ -2,7 +2,10 @@
 
 ### 让 Windows 版 Apple Music 输出到 WASAPI 独占设备 / OpenHome 网播
 
-[English](README.md) · [上游项目](https://github.com/AntiOblivionis/AMExclusive) · [更新日志](CHANGELOG.md) · [署名声明](NOTICE.md)
+[English](README.md) · [上游项目](https://github.com/AntiOblivionis/AMExclusive) · [更新日志](CHANGELOG.md) · [署名声明](NOTICE.md) · [贡献者](CONTRIBUTORS.md)
+
+**本分支由 [@dxdxdxlm123](https://github.com/dxdxdxlm123) 维护。** 上游与本分支的作者信息见
+[CONTRIBUTORS.md](CONTRIBUTORS.md)。
 
 > **非官方分支。** 本仓库是 [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclusive)
 > （MIT License）的派生项目，由本仓库维护者独立维护，与 Apple Inc. 及上游作者均无关联，

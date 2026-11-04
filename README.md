@@ -2,7 +2,10 @@
 
 ### Apple Music on Windows → WASAPI Exclusive / OpenHome network renderers
 
-[中文](README.zh-CN.md) · [Upstream project](https://github.com/AntiOblivionis/AMExclusive) · [Changelog](CHANGELOG.md) · [Notice](NOTICE.md)
+[中文](README.zh-CN.md) · [Upstream project](https://github.com/AntiOblivionis/AMExclusive) · [Changelog](CHANGELOG.md) · [Notice](NOTICE.md) · [Contributors](CONTRIBUTORS.md)
+
+**Maintained by [@dxdxdxlm123](https://github.com/dxdxdxlm123).** See
+[CONTRIBUTORS.md](CONTRIBUTORS.md) for upstream and fork authorship.
 
 > **Unofficial fork.** This repository is a derivative of
 > [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclusive) (MIT License).
