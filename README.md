@@ -17,10 +17,10 @@ AMExclusive (AME) is an open-source project designed specifically for Apple Musi
 ## Development and Test Environment
 
 - Windows 11 x64
-- Apple Music for Windows file version `1.6.4.90`
-- Verified package/framework build `1.1540.23042.0` x64
+- Apple Music for Windows file version `1.7.0.155` (package/framework `1.1792.39682.0` x64) — validated 2026-11-04: private player-state ABI, highest-ALAC quality lock, exclusive output formats (96 kHz/24-bit, 44.1 kHz/16-bit, 48 kHz/32-bit paths), and local-file seek reset
+- Apple Music for Windows file version `1.6.4.90` (package/framework `1.1540.23042.0` x64) — previously verified build; kept supported through the multi-build ABI and fingerprint tables (not re-run in the 1.7 validation cycle)
 
-This project has only been validated with the development and test versions listed above. Its behavior on other Apple Music versions is not guaranteed.
+The private interfaces, CoreMedia quality-lock fingerprints and local-seek stack fingerprints are selected at runtime from the installed build. An unknown build keeps the quality lock disabled and skips the local seek reset instead of patching unknown code.
 
 ## Features
 
