@@ -173,6 +173,8 @@ Write-ProgressMilestone 32 'stop_runtime'
 $preservedMode = $null
 $preservedPeriod100ns = $null
 $preservedAllowResampling = $null
+$preservedOutput = $null
+$preservedDlna = @{}
 foreach ($existingIni in @(
     (Join-Path $install 'am-exclusive.ini')
 )) {
@@ -190,6 +192,12 @@ foreach ($existingIni in @(
                 $candidatePeriod -ge 10000 -and $candidatePeriod -le 1000000) {
                 $preservedPeriod100ns = $candidatePeriod
             }
+        }
+        if ($line -match '^\s*output\s*=\s*(wasapi|dlna)\s*$') {
+            $preservedOutput = $Matches[1].ToLowerInvariant()
+        }
+        if ($line -match '^\s*(device_udn|device_name|location|buffer_ms|format_pref|max_bits|manual_urls)\s*=\s*(.*?)\s*$') {
+            $preservedDlna[$Matches[1]] = $Matches[2]
         }
     }
     if ($preservedMode -and $preservedPeriod100ns -and
@@ -238,6 +246,30 @@ if ($null -ne $preservedAllowResampling) {
     $iniText = [IO.File]::ReadAllText($iniPath)
     $iniText = [Text.RegularExpressions.Regex]::Replace(
         $iniText, '(?m)^\s*allow_resampling\s*=.*$', "allow_resampling=$preservedAllowResampling")
+    $utf8NoBom = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
+}
+if ($preservedOutput -or $preservedDlna.Count -gt 0) {
+    $iniPath = Join-Path $install 'am-exclusive.ini'
+    $iniText = [IO.File]::ReadAllText($iniPath)
+    if ($preservedOutput) {
+        $iniText = [Text.RegularExpressions.Regex]::Replace(
+            $iniText, '(?m)^\s*output\s*=.*$', "output=$preservedOutput")
+    }
+    foreach ($key in $preservedDlna.Keys) {
+        $value = $preservedDlna[$key]
+        if ($key -eq 'buffer_ms') {
+            [int]$buffer = 1500
+            if ([int]::TryParse($value, [ref]$buffer)) {
+                $buffer = [Math]::Min([Math]::Max($buffer, 300), 3000)
+                $value = "$buffer"
+            } else {
+                $value = '1500'
+            }
+        }
+        $iniText = [Text.RegularExpressions.Regex]::Replace(
+            $iniText, "(?m)^\s*$key\s*=.*$", "$key=$value")
+    }
     $utf8NoBom = New-Object Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
 }

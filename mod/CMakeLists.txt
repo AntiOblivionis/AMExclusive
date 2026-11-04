@@ -16,6 +16,20 @@ target_include_directories(am_exclusive_drain_probe PRIVATE src)
 target_compile_definitions(am_exclusive_drain_probe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(am_exclusive_drain_probe PRIVATE ole32 uuid avrt)
 
+# Explicit build/run only: drives DlnaSink + a synthetic PCM source against a
+# local OpenHome renderer (tools/oh_test_renderer.py) to validate the whole
+# control-point + stream-server chain without Apple Music / broker / UI.
+add_executable(am_exclusive_dlna_selftest EXCLUDE_FROM_ALL
+  tests/DlnaSelfTest.cpp
+  src/audio_v2/DlnaControlClient.cpp
+  src/audio_v2/DlnaLog.cpp
+  src/audio_v2/DlnaSink.cpp
+  src/audio_v2/DlnaStreamServer.cpp
+  src/UpnpXml.cpp)
+target_include_directories(am_exclusive_dlna_selftest PRIVATE src)
+target_compile_definitions(am_exclusive_dlna_selftest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(am_exclusive_dlna_selftest PRIVATE ole32 oleaut32 uuid ws2_32 winhttp msxml6)
+
 include(FetchContent)
 FetchContent_Declare(
   minhook
@@ -60,13 +74,19 @@ add_library(am_exclusive_hook SHARED
   src/LosslessQualityLock.cpp
   src/audio_v2/AudioCoreCoordinator.cpp
   src/audio_v2/AudioCoreRuntime.cpp
+  src/audio_v2/DlnaControlClient.cpp
+  src/audio_v2/DlnaLog.cpp
+  src/audio_v2/DlnaSink.cpp
+  src/audio_v2/DlnaStreamServer.cpp
   src/audio_v2/NativeRenderGateProxy.cpp
   src/audio_v2/ResampledPcmSource.cpp
-  src/audio_v2/WasapiExclusiveSink.cpp)
+  src/audio_v2/WasapiExclusiveSink.cpp
+  src/UpnpXml.cpp)
 target_include_directories(am_exclusive_hook PRIVATE
   src "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/rigtorp-SPSCQueue/include")
 target_compile_definitions(am_exclusive_hook PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(am_exclusive_hook PRIVATE minhook ole32 uuid advapi32 avrt)
+target_link_libraries(am_exclusive_hook PRIVATE minhook ole32 oleaut32 uuid advapi32 avrt
+  ws2_32 winhttp msxml6 bcrypt)
 set_target_properties(am_exclusive_hook PROPERTIES OUTPUT_NAME "am-exclusive-hook")
 
 add_library(am_exclusive_ui SHARED src/UiAdapter.cpp src/IpcTransport.cpp)
@@ -80,10 +100,15 @@ add_executable(am_exclusive_media_control src/MediaSessionControl.cpp)
 target_compile_definitions(am_exclusive_media_control PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(am_exclusive_media_control PRIVATE ole32 runtimeobject windowsapp)
 
-add_executable(am_exclusive_broker src/Broker.cpp src/IpcTransport.cpp)
+add_executable(am_exclusive_broker
+  src/Broker.cpp
+  src/DlnaDiscovery.cpp
+  src/IpcTransport.cpp
+  src/UpnpXml.cpp)
 target_include_directories(am_exclusive_broker PRIVATE src)
 target_compile_definitions(am_exclusive_broker PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(am_exclusive_broker PRIVATE advapi32 ole32 comctl32)
+target_link_libraries(am_exclusive_broker PRIVATE advapi32 ole32 oleaut32 comctl32
+  ws2_32 winhttp iphlpapi msxml6)
 set_target_properties(am_exclusive_broker PROPERTIES OUTPUT_NAME "am-exclusive-broker")
 add_custom_command(TARGET am_exclusive_broker POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
