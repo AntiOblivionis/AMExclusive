@@ -4,9 +4,11 @@
 #include "ProcessLifetime.h"
 
 #include <windows.h>
+#include <bcrypt.h>
 
 #include <MinHook.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -36,6 +38,10 @@ SimpleFactory originalCreate{};
 using TreeApply = std::int32_t(__cdecl*)(void*, void*, void**, void*);
 TreeApply originalTreeApply{};
 std::uintptr_t mediaBase{};
+// Selected from the verified build profile at install time; the structural
+// offsets above are shared by every profile, only the two RVAs move.
+std::uintptr_t simpleApplyRva{};
+std::uintptr_t treeApplyRva{};
 double(__cdecl* maxSampleRate)(void*){};
 void*(__cdecl* arrayCreate)(void*, const void**, std::int64_t, const void*){};
 const void*(__cdecl* arrayValue)(const void*, std::int64_t){};
@@ -215,6 +221,19 @@ std::int32_t __cdecl Create(void* allocator, void* name, std::uint32_t priority,
     if (!output || !context || !callbacks ||
         priority != ammod::apple_private::core_media_filter::kStrictConstructorPriority ||
         callbacks->reset || callbacks->visit || !callbacks->accept || callbacks->fallbackCompare) {
+        // A changed constructor priority or callback shape means the private ABI
+        // drifted. Fail closed, but say so once: without this line a mismatch
+        // looks exactly like "the lock installed and did nothing".
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true, std::memory_order_acq_rel) && writeLog) {
+            writeLog(L"Strict ALAC filter rejected: constructor shape mismatch priority=0x" +
+                     std::to_wstring(priority) + L" expected=0x" +
+                     std::to_wstring(ammod::apple_private::core_media_filter::kStrictConstructorPriority) +
+                     L" reset=" + std::to_wstring(callbacks && callbacks->reset) +
+                     L" visit=" + std::to_wstring(callbacks && callbacks->visit) +
+                     L" accept=" + std::to_wstring(callbacks && callbacks->accept) +
+                     L" fallback=" + std::to_wstring(callbacks && callbacks->fallbackCompare));
+        }
         return -1;
     }
     if (creatingStrictTier != 15 && creatingStrictTier != 20) return -1;
@@ -319,11 +338,11 @@ bool CollectStrict(void* filter, std::vector<void*>& strict, unsigned depth = 0)
         !TryReadWord(methods, offsets::kTreeApplySlot, treeApply)) {
         return false;
     }
-    if (simpleApply == mediaBase + offsets::kSimpleApplyRva) {
+    if (simpleApply == mediaBase + simpleApplyRva) {
         std::uintptr_t predicate{};
         if (!TryReadWord(filter, offsets::kSimplePredicate, predicate)) return false;
         if (predicate == reinterpret_cast<std::uintptr_t>(&Accept)) strict.push_back(filter);
-    } else if (treeApply == mediaBase + offsets::kTreeApplyRva) {
+    } else if (treeApply == mediaBase + treeApplyRva) {
         std::uintptr_t childrenWord{};
         std::uintptr_t fallbackWord{};
         if (!TryReadWord(filter, offsets::kTreeChildren, childrenWord) ||
@@ -432,7 +451,33 @@ std::int32_t __cdecl ApplyTree(void* tree, void* input, void** output, void* inf
 // permanently unavailable in this process instead of detouring unknown code.
 std::atomic<bool> imageRejected{};
 
-bool ImageMatchesVerifiedBuild(HMODULE media) {
+// Hash a short byte sequence with Windows CNG. The verified-build check only
+// runs once per process, so opening and closing the algorithm provider here is
+// cheap and keeps the hook free of a persistent crypto handle.
+bool DigestSha256(const std::uint8_t* data, std::size_t size,
+                  std::array<std::uint8_t, 32>& digest) noexcept {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(
+            &algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0))) {
+        return false;
+    }
+    bool ok = false;
+    if (BCRYPT_SUCCESS(BCryptCreateHash(algorithm, &hash, nullptr, 0,
+                                        nullptr, 0, 0))) {
+        if (BCRYPT_SUCCESS(BCryptHashData(hash, const_cast<PUCHAR>(data),
+                                          static_cast<ULONG>(size), 0))) {
+            ok = BCRYPT_SUCCESS(BCryptFinishHash(
+                hash, digest.data(), static_cast<ULONG>(digest.size()), 0));
+        }
+        BCryptDestroyHash(hash);
+    }
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    return ok;
+}
+
+bool ImageMatchesVerifiedBuild(HMODULE media, std::uintptr_t& simpleRva,
+                               std::uintptr_t& treeRva) {
     namespace offsets = ammod::apple_private::core_media_filter;
     const auto* base = reinterpret_cast<const std::uint8_t*>(media);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
@@ -443,22 +488,40 @@ bool ImageMatchesVerifiedBuild(HMODULE media) {
         return false;
     }
     const std::uintptr_t imageSize = nt->OptionalHeader.SizeOfImage;
-    const auto matches = [&](std::uintptr_t rva, const auto& prologue) {
-        return rva + prologue.size() <= imageSize &&
-               std::memcmp(base + rva, prologue.data(), prologue.size()) == 0;
+    // Compare digests, never literal instruction bytes: this source tree must
+    // not carry fragments of a proprietary binary.
+    const auto matches = [&](std::uintptr_t rva, const auto& expected) {
+        if (rva + offsets::kPrologueBytes > imageSize) return false;
+        std::array<std::uint8_t, 32> actual{};
+        return DigestSha256(base + rva, offsets::kPrologueBytes, actual) &&
+               actual == expected;
     };
-    const bool ok = matches(offsets::kSimpleApplyRva, offsets::kSimpleApplyPrologue) &&
-                    matches(offsets::kTreeApplyRva, offsets::kTreeApplyPrologue);
-    if (!ok && writeLog) {
+    // Try every verified profile. The simple-apply prologue is unique in the
+    // image, so a profile only matches the build it was recorded from.
+    for (const auto& profile : offsets::kBuildProfiles) {
+        if (matches(profile.simpleApplyRva, offsets::kSimpleApplyDigest) &&
+            matches(profile.treeApplyRva, offsets::kTreeApplyDigest)) {
+            simpleRva = profile.simpleApplyRva;
+            treeRva = profile.treeApplyRva;
+            if (writeLog) {
+                writeLog(L"Highest ALAC quality filter matched build profile: " +
+                         std::wstring(profile.label ? profile.label : L"?") +
+                         L" simpleRva=0x" + std::to_wstring(profile.simpleApplyRva) +
+                         L" treeRva=0x" + std::to_wstring(profile.treeApplyRva));
+            }
+            return true;
+        }
+    }
+    if (writeLog) {
         wchar_t text[192]{};
         std::swprintf(text, std::size(text),
                       L"Highest ALAC quality filter hook disabled: CoreMedia image does not "
-                      L"match the verified build (timestamp=0x%08X sizeOfImage=0x%08X)",
+                      L"match a verified build (timestamp=0x%08X sizeOfImage=0x%08X)",
                       static_cast<unsigned>(nt->FileHeader.TimeDateStamp),
                       static_cast<unsigned>(nt->OptionalHeader.SizeOfImage));
         writeLog(text);
     }
-    return ok;
+    return false;
 }
 
 } // namespace
@@ -472,7 +535,7 @@ bool Install(HMODULE media, HMODULE foundation, LogFunction log) {
     if (installed) return true;
     if (imageRejected.load(std::memory_order_acquire)) return false;
     writeLog = log;
-    if (!ImageMatchesVerifiedBuild(media)) {
+    if (!ImageMatchesVerifiedBuild(media, simpleApplyRva, treeApplyRva)) {
         imageRejected.store(true, std::memory_order_release);
         return false;
     }
@@ -499,8 +562,7 @@ bool Install(HMODULE media, HMODULE foundation, LogFunction log) {
     const auto status = MH_EnableHook(target);
     if (status != MH_OK && status != MH_ERROR_ENABLED) return false;
     mediaBase = reinterpret_cast<std::uintptr_t>(media);
-    auto* treeTarget = reinterpret_cast<void*>(mediaBase +
-        ammod::apple_private::core_media_filter::kTreeApplyRva);
+    auto* treeTarget = reinterpret_cast<void*>(mediaBase + treeApplyRva);
     if (!originalTreeApply && MH_CreateHook(treeTarget, reinterpret_cast<void*>(ApplyTree),
         reinterpret_cast<void**>(&originalTreeApply)) != MH_OK) return false;
     const auto treeStatus = MH_EnableHook(treeTarget);

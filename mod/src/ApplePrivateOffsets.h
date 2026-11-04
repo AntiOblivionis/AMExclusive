@@ -30,20 +30,41 @@ inline constexpr std::size_t kStrictContext = 0x68;
 // A different priority/callback shape means the private ABI has drifted.
 inline constexpr std::uint32_t kStrictConstructorPriority = 0x375;
 // Fingerprint: the method-table slots above must resolve to these CoreMedia RVAs.
-inline constexpr std::uintptr_t kSimpleApplyRva = 0x006CA8E0;
-inline constexpr std::uintptr_t kTreeApplyRva = 0x006E2F10;
-// Image fingerprint: the first 16 bytes at each RVA in the verified
-// CoreMedia.dll (file version 1.2 (3310.2), shipped in Apple Music 1.6.4.90).
-// The quality lock refuses to patch kTreeApplyRva unless both sequences match
-// the loaded image, so a CoreMedia update degrades to "quality lock
-// unavailable" instead of detouring whatever code now lives at that address.
+// Each verified CoreMedia build gets one profile. The quality lock refuses to
+// patch an image whose prologues do not match a profile at the recorded RVAs,
+// so an Apple update degrades to "quality lock unavailable" instead of
+// detouring whatever code now lives at those addresses.
+struct BuildProfile final {
+    const wchar_t* label;
+    std::uintptr_t simpleApplyRva;
+    std::uintptr_t treeApplyRva;
+};
+inline constexpr BuildProfile kBuildProfiles[] = {
+    // Apple Music 1.6.4.90 / package 1.1540.23042.0
+    {L"CoreMedia 1.2 (3310.2) / AM 1.6.4.90", 0x006CA8E0, 0x006E2F10},
+    // Apple Music 1.1792.39682.0 / package 1.1792.39682.0
+    // simple apply is the unique 16-byte prologue match; the tree apply was
+    // identified by its own string references (ftreefilter_applyReturningInfo,
+    // ftreefilter_appendAndReleaseLeafInfo) inside the verified function body.
+    {L"CoreMedia 1.2 (3365.13) / AM 1.1792.39682.0", 0x007DC3A0, 0x007F4A60},
+};
+// Image fingerprint. Both verified CoreMedia builds share the same function
+// prologues. Only SHA-256 digests of those short instruction sequences are kept
+// here: the check in LosslessQualityLock.cpp hashes kPrologueBytes of the loaded
+// image and compares digests. This preserves fail-closed version verification
+// without embedding any fragment of Apple's machine code in the source tree.
 inline constexpr std::size_t kPrologueBytes = 16;
-inline constexpr std::array<std::uint8_t, kPrologueBytes> kSimpleApplyPrologue{
-    0x48, 0x8B, 0xC4, 0x55, 0x56, 0x57, 0x48, 0x8D,
-    0x68, 0xA1, 0x48, 0x81, 0xEC, 0xB0, 0x00, 0x00};
-inline constexpr std::array<std::uint8_t, kPrologueBytes> kTreeApplyPrologue{
-    0x4C, 0x89, 0x4C, 0x24, 0x20, 0x4C, 0x89, 0x44,
-    0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10, 0x48};
+inline constexpr std::size_t kPrologueDigestBytes = 32;
+inline constexpr std::array<std::uint8_t, kPrologueDigestBytes> kSimpleApplyDigest{
+    0x3D, 0x0F, 0x1C, 0x98, 0xD2, 0x19, 0x08, 0xA5,
+    0x1D, 0xBA, 0xCA, 0xF9, 0xDD, 0x3F, 0xDC, 0x70,
+    0x6F, 0xDC, 0x11, 0x2F, 0xC8, 0xD8, 0x33, 0xC1,
+    0x15, 0x1E, 0xA5, 0x78, 0x77, 0xD5, 0x6D, 0xD3};
+inline constexpr std::array<std::uint8_t, kPrologueDigestBytes> kTreeApplyDigest{
+    0xC7, 0xAA, 0xC4, 0xF2, 0x21, 0x3A, 0xF2, 0xF3,
+    0xA9, 0xB2, 0xC1, 0x0E, 0x76, 0x8A, 0x80, 0x4D,
+    0x20, 0xE2, 0x4C, 0x60, 0x63, 0x7E, 0xDF, 0x2D,
+    0xDB, 0x08, 0xE6, 0x79, 0xE7, 0x05, 0xA9, 0x20};
 } // namespace core_media_filter
 
 namespace agent_stack {
