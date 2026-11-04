@@ -1814,6 +1814,16 @@ std::vector<OutputDeviceEntry> CopyOutputDevices() {
     return g_outputDevices;
 }
 
+// Path of the shared configuration that the hook and broker also read.
+std::wstring StreamFormatIniPath() {
+    wchar_t buffer[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"PUBLIC", buffer, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return {};
+    std::wstring path(buffer, length);
+    path += L"\\AMExclusive\\am-exclusive.ini";
+    return path;
+}
+
 void CommitOutputSelection(const Controls::ComboBox& combo) {
     if (!combo || g_suppressOutputSelection.load()) return;
     // A ComboBox raises SelectionChanged for programmatic SelectedIndex changes
@@ -2092,6 +2102,62 @@ Controls::Border CreateOutputTargetCard(
     manualRow.Children().Append(manualAdd);
     manualRow.Children().Append(restartButton);
     labels.Children().Append(manualRow);
+
+    // Stream format. Persisted straight into the shared ini: the hook reads it
+    // when the next track opens, so a change needs no restart and no IPC round
+    // trip. WAV keeps the existing file-shaped behaviour.
+    Controls::StackPanel shapeRow;
+    shapeRow.Orientation(Controls::Orientation::Horizontal);
+    shapeRow.Spacing(8.0);
+    shapeRow.Margin(Xaml::Thickness{0, 4, 0, 0});
+    Controls::TextBlock shapeLabel;
+    shapeLabel.Text(Localized(L"\u6d41\u683c\u5f0f", L"Stream format"));
+    shapeLabel.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    shapeLabel.MinWidth(120.0);
+    Controls::ComboBox shapeCombo;
+    shapeCombo.Name(L"AMExclusiveStreamFormatCombo");
+    shapeCombo.MinWidth(200.0);
+    shapeCombo.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    {
+        // Only the two file shapes are exposed. The chunked shapes remain in
+        // the code (settable through the ini) but no renderer tested here
+        // accepts them, so offering them in the panel only invites a silent
+        // "no sound" that looks like a bug in this app.
+        const std::wstring names[2] = {
+            Localized(L"WAV\uff08\u6587\u4ef6\u5f62\u6001\uff09", L"WAV (file)"),
+            Localized(L"FLAC\uff08\u6587\u4ef6\u5f62\u6001\uff09", L"FLAC (file)")};
+        for (const auto& name : names) {
+            Controls::ComboBoxItem item;
+            item.Content(box_value(name));
+            shapeCombo.Items().Append(item);
+        }
+    }
+    {
+        wchar_t value[16]{};
+        const auto path = StreamFormatIniPath();
+        GetPrivateProfileStringW(L"dlna", L"stream_format", L"wav", value,
+                                 static_cast<DWORD>(std::size(value)), path.c_str());
+        const bool flacFile = _wcsicmp(value, L"flac-file") == 0 ||
+                              _wcsicmp(value, L"flac") == 0;
+        shapeCombo.SelectedIndex(flacFile ? 1 : 0);
+    }
+    shapeCombo.SelectionChanged([](auto&& sender, auto&&) {
+        try {
+            const int index = sender.as<Controls::ComboBox>().SelectedIndex();
+            const wchar_t* value = index == 1 ? L"flac-file" : L"wav";
+            const auto path = StreamFormatIniPath();
+            if (path.empty()) return;
+            WritePrivateProfileStringW(L"dlna", L"stream_format", value, path.c_str());
+            (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+            Log(std::wstring(L"ui stream format saved=") + value);
+        } catch (...) {
+        }
+    });
+    Automation::AutomationProperties::SetName(
+        shapeCombo, Localized(L"\u6d41\u683c\u5f0f", L"Stream format"));
+    shapeRow.Children().Append(shapeLabel);
+    shapeRow.Children().Append(shapeCombo);
+    labels.Children().Append(shapeRow);
 
     Controls::ComboBox combo;
     combo.Name(L"AMExclusiveOutputTargetCombo");

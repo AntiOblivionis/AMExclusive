@@ -3,6 +3,7 @@
 #include "AudioSink.h"
 #include "DlnaControlClient.h"
 #include "DlnaStreamServer.h"
+#include "FlacEncoder.h"
 #include "IntegerPcmSource.h"
 #include "PcmTypes.h"
 
@@ -61,15 +62,23 @@ private:
     std::wstring AdvertiseAddress(const std::wstring& deviceHost) const noexcept;
     void ProducerMain() noexcept;
     bool PackChunk(const std::int32_t* samples, std::uint32_t frames,
-                   bool endOfStream, std::vector<BYTE>& output) const noexcept;
+                   bool endOfStream, std::vector<BYTE>& output) noexcept;
     bool SendStreamToDevice() noexcept;
+    // Emits the encoder's final partial block. A FLAC stream that ends without
+    // this loses up to one block (4096 frames) of audio, and a decoder that
+    // checks frame continuity may reject the tail outright.
+    void FlushEncoderTail() noexcept;
     void JoinProducer() noexcept;
     void RecordError(HRESULT error) noexcept;
 
     AudioSinkOpenParams params_{};
     DlnaTarget target_{};
     PcmFormat format_{};
+    DlnaStreamShape shape_{DlnaStreamShape::WavFile};
+    // Derived: true for both WAV shapes (file and live), false for FLAC.
     bool wav_{true};
+    // FLAC frame encoder; unused unless shape_ is FlacFile.
+    FlacEncoder flac_{};
     bool converted_{false};
     std::uint32_t chunkFrames_{1024};
     std::uint32_t bufferMs_{1500};

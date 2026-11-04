@@ -555,7 +555,8 @@ bool DlnaControlClient::OpenHomeInfo(const DlnaTarget& target,
     return Call(target.openHomeInfo, kOhInfo, L"Track", {}, values, error);
 }
 
-std::wstring DlnaControlClient::ProtocolInfoFor(bool wav, const PcmFormat& format,
+std::wstring DlnaControlClient::ProtocolInfoFor(DlnaStreamShape shape,
+                                                const PcmFormat& format,
                                                 bool converted) {
     const std::wstring ci = converted ? L"1" : L"0";
     // 0x01700000 flags: streaming mode, no interactive control, no background
@@ -563,24 +564,22 @@ std::wstring DlnaControlClient::ProtocolInfoFor(bool wav, const PcmFormat& forma
     const std::wstring flags =
         L"DLNA.ORG_CI=" + ci +
         L";DLNA.ORG_FLAGS=01700000000000000000000000000000";
-    if (wav) {
+    switch (shape) {
+    case DlnaStreamShape::FlacFile:
+        // File-shaped FLAC: a declared length and byte ranges are offered, so
+        // OP=01 is truthful. The "x-" spelling is what renderers advertise;
+        // the registered audio/flac is dropped by a VEGA G2.2.
+        return L"http-get:*:audio/x-flac:DLNA.ORG_OP=01;" + flags;
+    case DlnaStreamShape::WavFile:
+    default:
         // WAV is served file-shaped with a declared length and byte ranges
         // (AURALiC-class renderers re-request the payload as "Range: bytes=44-"),
         // so OP=01 - byte seek supported, time seek not - matches the server.
         return L"http-get:*:audio/wav:DLNA.ORG_OP=01;" + flags;
     }
-    // L16 only addresses 16-bit PCM; 24-bit must be declared as L24 or the
-    // renderer will read the stream at the wrong depth. DLNA defines a profile
-    // name for 16-bit LPCM only, so the L24 form carries no DLNA.ORG_PN.
-    // The additional-info field is a single colon-separated ProtocolInfo slot
-    // whose internal pairs are ';'-separated. Using ':' between PN and OP
-    // would split the 4th field in two and make strict parsers see a 5-field
-    // ProtocolInfo, which is exactly the shape that gets the item rejected.
-    const bool wide = format.containerBits > 16;
-    return std::wstring(L"http-get:*:audio/") + (wide ? L"L24" : L"L16") +
-           L";rate=" + std::to_wstring(format.sampleRate) +
-           L";channels=" + std::to_wstring(format.channels) +
-           (wide ? L":" : L":DLNA.ORG_PN=LPCM;") + flags;
+    // Unreachable: every shape above returns. Kept so the compiler still
+    // checks the return type if a shape is ever added without a case.
+    return L"http-get:*:audio/wav:DLNA.ORG_OP=01;" + flags;
 }
 
 bool DlnaControlClient::ProtocolAllows(const std::wstring& sinkProtocolInfo,

@@ -62,6 +62,9 @@ std::wstring BuildDidlLite(const std::wstring& id,
                            const std::wstring& protocolInfo,
                            const std::wstring& duration,
                            bool broadcast = false,
-                           std::uint64_t sizeBytes = 0);
+                           std::uint64_t sizeBytes = 0,
+                           std::uint32_t sampleRate = 0,
+                           std::uint32_t bitsPerSample = 0,
+                           std::uint32_t channels = 0);
 
 } // namespace ammod::upnp

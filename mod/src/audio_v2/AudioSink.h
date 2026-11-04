@@ -23,6 +23,35 @@ enum class AudioSinkState : std::uint8_t {
     Faulted,
 };
 
+// How the DLNA stream is shaped on the wire. Both shapes are *file* shaped:
+// a declared Content-Length plus byte ranges, because that is the only thing
+// every renderer tested here accepts. They differ only in the container.
+enum class DlnaStreamShape : std::uint8_t {
+    // RIFF/WAVE with a declared length, Accept-Ranges and 206 replies.
+    WavFile = 0,
+    // FLAC with a declared length. Verbatim subframes give every frame an
+    // identical size, so the total byte count is computable before the first
+    // sample exists. No compression (bandwidth within 1% of WAV), but it plays
+    // on renderers that refuse WAV while still demanding a known length.
+    FlacFile = 1,
+};
+
+// True when the wire body is a RIFF/WAVE container.
+inline bool DlnaStreamShapeUsesWavContainer(DlnaStreamShape shape) noexcept {
+    return shape == DlnaStreamShape::WavFile;
+}
+
+inline const wchar_t* DlnaStreamShapeName(DlnaStreamShape shape) noexcept {
+    return shape == DlnaStreamShape::FlacFile ? L"flac-file" : L"wav";
+}
+
+inline DlnaStreamShape DlnaStreamShapeFromText(const wchar_t* text) noexcept {
+    if (text && (_wcsicmp(text, L"flac-file") == 0 || _wcsicmp(text, L"flac") == 0)) {
+        return DlnaStreamShape::FlacFile;
+    }
+    return DlnaStreamShape::WavFile;
+}
+
 // Lifecycle notifications are diagnostic-only. They are invoked on the thread
 // that performs the corresponding sink operation.
 enum class AudioSinkLifecycleEvent : std::uint8_t {
@@ -78,6 +107,10 @@ struct AudioSinkOpenParams final {
     void* lifecycleContext{};
     AudioSinkLifecycleCallback onLifecycle{};
     std::uint32_t streamBufferMs{1500};
+    // Declared entity length for the file shapes, in seconds. 0 means "derive
+    // it from the ini / SMTC the way production does".
+    std::uint32_t streamSeconds{};
+    DlnaStreamShape streamShape{DlnaStreamShape::WavFile};
     DlnaTarget dlna{};
 };
 

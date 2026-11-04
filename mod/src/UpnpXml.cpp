@@ -288,7 +288,10 @@ std::wstring BuildDidlLite(const std::wstring& id,
                            const std::wstring& protocolInfo,
                            const std::wstring& duration,
                            bool broadcast,
-                           std::uint64_t sizeBytes) {
+                           std::uint64_t sizeBytes,
+                           std::uint32_t sampleRate,
+                           std::uint32_t bitsPerSample,
+                           std::uint32_t channels) {
     std::wstring xml;
     xml.reserve(512);
     xml += L"<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" ";
@@ -319,6 +322,23 @@ std::wstring BuildDidlLite(const std::wstring& id,
     if (!broadcast && sizeBytes != 0) {
         xml += L" size=\"";
         xml += std::to_wstring(sizeBytes);
+        xml += L"\"";
+    }
+    // Strict renderers (Lumin) cross-check these against the container header
+    // and the HTTP Content-Type before they will start playback.
+    if (sampleRate != 0) {
+        xml += L" sampleFrequency=\"";
+        xml += std::to_wstring(sampleRate);
+        xml += L"\"";
+    }
+    if (bitsPerSample != 0) {
+        xml += L" bitsPerSample=\"";
+        xml += std::to_wstring(bitsPerSample);
+        xml += L"\"";
+    }
+    if (channels != 0) {
+        xml += L" nrAudioChannels=\"";
+        xml += std::to_wstring(channels);
         xml += L"\"";
     }
     xml += L">";

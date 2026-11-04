@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AudioSink.h"
 #include "PcmTypes.h"
 
 #include <windows.h>
@@ -26,7 +27,7 @@ namespace ammod::audio_v2 {
 // actually playing, and neither one is terminated when the other appears.
 class DlnaStreamSession final {
 public:
-    DlnaStreamSession(std::wstring token, PcmFormat format, bool wav,
+    DlnaStreamSession(std::wstring token, PcmFormat format, DlnaStreamShape shape,
                       std::uint32_t capacityBytes, std::wstring contentFeatures,
                       std::uint64_t totalBytes) noexcept;
     ~DlnaStreamSession();
@@ -36,7 +37,15 @@ public:
 
     const std::wstring& Token() const noexcept { return token_; }
     const PcmFormat& Format() const noexcept { return format_; }
-    bool Wav() const noexcept { return wav_; }
+    DlnaStreamShape Shape() const noexcept { return shape_; }
+    // Content-Type actually written on the wire. Empty means "derive it from
+    // the shape"; the sink overrides it when the renderer advertises a
+    // different spelling (audio/x-wav instead of audio/wav).
+    const std::wstring& Mime() const noexcept { return mime_; }
+    void SetMime(std::wstring mime) noexcept { mime_ = std::move(mime); }
+    // True when the body is a WAV container (file-shaped or unbounded). Both
+    // FLAC shapes carry no RIFF header.
+    bool Wav() const noexcept { return DlnaStreamShapeUsesWavContainer(shape_); }
     const std::wstring& ContentFeatures() const noexcept { return contentFeatures_; }
 
     // Declared length of the whole entity, WAV header included. AURALiC-class
@@ -78,7 +87,6 @@ public:
         std::uint64_t cursor_{};
     };
 
-    Reader NewReader() noexcept;
     // A reader positioned at an absolute entity offset (WAV header included).
     // Renderers re-request the payload with "Range: bytes=44-" after probing,
     // so the server must be able to attach at an offset that is behind the
@@ -140,7 +148,8 @@ private:
 
     std::wstring token_;
     PcmFormat format_{};
-    bool wav_{};
+    DlnaStreamShape shape_{DlnaStreamShape::WavFile};
+    std::wstring mime_;
     std::wstring contentFeatures_;
     std::uint64_t totalBytes_{};
     std::uint32_t bytesPerFrame_{};
@@ -190,7 +199,7 @@ public:
 
     static std::vector<BYTE> WavHeader(const PcmFormat& format,
                                        std::uint64_t totalBytes);
-    static std::wstring ContentType(const PcmFormat& format, bool wav);
+    static std::wstring ContentType(const PcmFormat& format, DlnaStreamShape shape);
 
 private:
     struct State;

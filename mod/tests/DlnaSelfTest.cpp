@@ -31,8 +31,9 @@ namespace {
 // left-justified into int32).
 class SineSource final : public IIntegerPcmSource {
 public:
-    SineSource(std::uint32_t rate, std::uint32_t seconds)
-        : rate_(rate), total_(static_cast<std::uint64_t>(rate) * seconds) {}
+    SineSource(std::uint32_t rate, std::uint32_t seconds, std::uint32_t bits)
+        : rate_(rate), total_(static_cast<std::uint64_t>(rate) * seconds),
+          shift_(32u - bits) {}
 
     HRESULT Prepare(std::uint32_t capacityFrames) noexcept override {
         (void)capacityFrames;
@@ -52,7 +53,7 @@ public:
             const auto sample = static_cast<std::int32_t>(
                 12000.0 * std::sin(2.0 * 3.14159265358979 * 440.0 *
                                    static_cast<double>(index) / static_cast<double>(rate_)));
-            const std::int32_t canonical = sample << 16;
+            const std::int32_t canonical = sample << shift_;
             destination[frame * 2u] = canonical;
             destination[frame * 2u + 1u] = canonical;
         }
@@ -65,6 +66,7 @@ public:
 private:
     std::uint32_t rate_{};
     std::uint64_t total_{};
+    std::uint32_t shift_{16};
     std::uint64_t produced_{};
 };
 
@@ -88,23 +90,31 @@ int wmain(int argc, wchar_t** argv) {
     // A longer run is what shows whether a renderer keeps pulling at its own
     // pace instead of reading a fixed probe amount and giving up.
     const int seconds = argc > 2 ? std::max(4, _wtoi(argv[2])) : 8;
-    SineSource source(44100, static_cast<std::uint32_t>(seconds));
+    const std::wstring shapeText = argc > 3 ? argv[3] : L"wav";
+    const std::uint32_t rate = argc > 4 ? static_cast<std::uint32_t>(_wtoi(argv[4])) : 44100u;
+    const std::uint32_t bits = argc > 5 ? static_cast<std::uint32_t>(_wtoi(argv[5])) : 16u;
+    SineSource source(rate, static_cast<std::uint32_t>(seconds), bits);
     DlnaSink sink;
 
     AudioSinkOpenParams params{};
-    params.format.sampleRate = 44100;
+    params.format.sampleRate = rate;
     params.format.channels = 2;
-    params.format.validBits = 16;
-    params.format.containerBits = 16;
+    params.format.validBits = static_cast<std::uint16_t>(bits);
+    params.format.containerBits = static_cast<std::uint16_t>(bits);
     params.format.encoding = PcmEncoding::SignedInteger;
     params.format.interleaved = true;
-    params.format.sourceValidBits = 16;
+    params.format.sourceValidBits = static_cast<std::uint16_t>(bits);
+    params.streamShape = DlnaStreamShapeFromText(shapeText.c_str());
+    // Without Apple Music there is no SMTC timeline, so the declared length has
+    // to come from the test itself or the file shape would advertise a guess.
+    params.streamSeconds = static_cast<std::uint32_t>(seconds);
     params.streamBufferMs = 1500;
     params.allowResampling = false;
     params.dlna.location = location;
 
     const HRESULT opened = sink.Open(params);
-    std::wprintf(L"[selftest] Open(%ls) -> 0x%08lX\n", location.c_str(), opened);
+    std::wprintf(L"[selftest] shape=%ls rate=%u bits=%u Open(%ls) -> 0x%08lX\n",
+                 shapeText.c_str(), rate, bits, location.c_str(), opened);
     if (FAILED(opened)) {
         std::wprintf(L"[selftest] FAIL: Open returned 0x%08lX\n", opened);
         return 1;

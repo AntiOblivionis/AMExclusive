@@ -6,6 +6,81 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2] - 2026-11-04
+
+### Added
+
+- **A second wire shape for the DLNA stream**, selectable from the AME panel
+  and persisted as `[dlna] stream_format`. `wav` stays the default and is
+  byte-for-byte unchanged. Only the two shapes that actually play on tested
+  hardware are offered: WAV file and FLAC file.
+  The chunked variants that were tried first (`flac`, `live`) were removed
+  outright: a VEGA G2.2 reads one chunk, drops the connection, retries, and
+  gives up, and offering them in the panel produced a silent "no sound" that
+  looked like a fault in this app rather than a renderer limitation.
+  - `flac-file` — file-shaped FLAC (the one offered in the panel).
+
+  New `mod/src/audio_v2/FlacEncoder.{h,cpp}`: fixed block size 4096,
+  independent channels, fixed predictors order 0–4, RICE2 residuals,
+  CRC-8/CRC-16, 16/20/24-bit, plus a verbatim mode with constant frame size.
+  Verified against ffmpeg: decoded output is bit-identical to the source at
+  24/48k, 24/96k and 16/44.1k; compressed ratio 21–37% of raw PCM.
+- DIDL `<res>` now also carries `sampleFrequency`, `bitsPerSample` and
+  `nrAudioChannels`, which strict renderers cross-check against the container
+  and the HTTP `Content-Type`.
+- `DLNA.ORG_OP` now follows the shape: `01` only for the seekable file shape,
+  `00` for FLAC and live, so a renderer is never promised byte ranges that the
+  server will not honour.
+- **`flac-file` — FLAC served as an ordinary file.** Verbatim subframes give
+  every frame an identical size, so `FlacEncoder::VerbatimSize()` can compute
+  the exact entity length before the first sample exists; the response then
+  carries a real `Content-Length`, `Accept-Ranges: bytes` and `206` replies.
+  No compression (bandwidth is within 1% of WAV), but it is the only way to
+  satisfy a renderer that refuses an unbounded body while also refusing WAV.
+  Verified on a VEGA G2.2: `state=Playing`, `filetype=FLAC`, `48000`, `24-bit`,
+  position advancing. The same device rejects the chunked FLAC shape outright.
+- DIDL `<res>` gained `sampleFrequency`, `bitsPerSample` and `nrAudioChannels`.
+- HTTP responses now carry `Date` (required by RFC 7231 for 1.1) and a
+  `Server` banner; `contentFeatures.dlna.org` gained `DLNA.ORG_PN=WAV`; the
+  `transferMode.dlna.org` header uses the conventional lower-case spelling.
+- The WAV MIME follows the renderer: when it advertises `audio/x-wav` or
+  `audio/wave` but not `audio/wav`, that spelling is used instead.
+
+### Fixed
+
+- Chunked shapes now start every HTTP connection at the **oldest retained
+  byte** instead of the newest. `NewReader` began at `produced_` because the
+  file shape always reconnects with a byte range; a chunked stream has no
+  ranges, so a renderer that probes and then opens a second connection read
+  zero bytes and stopped. Measured: probe drained 60 KB, playback connection
+  got an immediate end-of-stream.
+- `FlushEncoderTail` emits the encoder's final partial block. Without it the
+  last up-to-4096 frames of every FLAC track were dropped and the stream ended
+  mid-frame.
+- FLAC STREAMINFO declares `min_block = max_block = 4096`. Reporting a smaller
+  minimum made renderers treat the stream as variable-block.
+- FLAC advertises `audio/x-flac`, not the registered `audio/flac`. Measured on
+  a VEGA G2.2: its ConnectionManager lists exactly `http-get:*:audio/x-flac:*`
+  and drops a stream that announces the standard spelling.
+- Chunked bodies go out in 8 KB pieces rather than 64 KB: a renderer that
+  decodes while receiving stalls on a full 64 KB burst.
+
+### Verified
+
+Measured against a physical AURALiC VEGA G2.2 (`LightningPlayer`, OpenHome):
+
+| shape | result |
+|---|---|
+| `wav` | plays, 24-bit/48 kHz, device pulls the whole entity |
+| `flac` | **rejected** — device reads one chunk, drops the connection, retries, gives up |
+| `live` | **rejected** — same behaviour |
+
+The renderer itself does support FLAC: the same 10 s 24-bit FLAC served as a
+**file** (Content-Length + Range) plays with `state=Playing`, `48000`, `24`.
+So the limitation is that this device only accepts file-shaped bodies, not the
+codec. FLAC and live remain available for renderers that accept chunked
+transfer (Lumin and most software stacks); the VEGA G2.2 stays on `wav`.
+
 ## [0.2.1] - 2026-11-04
 
 ### Fixed

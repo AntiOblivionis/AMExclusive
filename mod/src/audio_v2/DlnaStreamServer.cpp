@@ -58,30 +58,29 @@ bool SendAll(SOCKET socket, const void* data, std::size_t bytes) {
 }
 
 // One HTTP/1.1 chunk: hex length, CRLF, payload, CRLF.
-bool SendChunk(SOCKET socket, const void* data, std::size_t bytes) {
-    // The length prefix is built by hand. printf's "%z" size modifier is not
-    // uniformly supported by MSVC's runtime, and a mis-encoded prefix would
-    // corrupt every chunk boundary and make the renderer reject the stream as
-    // a damaged file.
-    char prefix[24]{};
-    std::size_t digits = 0;
-    std::size_t value = bytes;
-    do {
-        const std::size_t digit = value & 0xFu;
-        prefix[digits++] = static_cast<char>(digit < 10 ? '0' + digit : 'a' + (digit - 10));
-        value >>= 4u;
-    } while (value != 0);
-    // Digits were produced least-significant first; reverse them.
-    for (std::size_t i = 0; i < digits / 2; ++i) {
-        const char tmp = prefix[i];
-        prefix[i] = prefix[digits - 1 - i];
-        prefix[digits - 1 - i] = tmp;
-    }
-    prefix[digits++] = '\r';
-    prefix[digits++] = '\n';
-    if (!SendAll(socket, prefix, digits)) return false;
-    if (bytes != 0 && !SendAll(socket, data, bytes)) return false;
-    return SendAll(socket, "\r\n", 2);
+
+std::string HttpDate() {
+    SYSTEMTIME st{};
+    GetSystemTime(&st);
+    static const char* const days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char* const months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    char buffer[64]{};
+    (void)std::snprintf(buffer, sizeof(buffer), "%s, %02u %s %04u %02u:%02u:%02u GMT",
+                        days[st.wDayOfWeek % 7], st.wDay, months[(st.wMonth + 11) % 12],
+                        st.wYear, st.wHour, st.wMinute, st.wSecond);
+    return buffer;
+}
+
+std::wstring CommonHeaders() {
+    std::wstring headers;
+    headers += L"Date: ";
+    const std::string date = HttpDate();
+    headers.append(date.begin(), date.end());
+    headers += L"\r\n";
+    // Some renderers use the Server banner to pick a compatibility profile.
+    headers += L"Server: AMExclusive/0.2.2 UPnP/1.0 DLNADOC/1.50\r\n";
+    return headers;
 }
 
 void WriteLE16(std::vector<BYTE>& bytes, std::uint16_t value) {
@@ -98,13 +97,16 @@ void WriteLE32(std::vector<BYTE>& bytes, std::uint32_t value) {
 
 } // namespace
 
-DlnaStreamSession::DlnaStreamSession(std::wstring token, PcmFormat format, bool wav,
+DlnaStreamSession::DlnaStreamSession(std::wstring token, PcmFormat format,
+                                     DlnaStreamShape shape,
                                      std::uint32_t capacityBytes,
                                      std::wstring contentFeatures,
                                      std::uint64_t totalBytes) noexcept
-    : token_(std::move(token)), format_(format), wav_(wav),
+    : token_(std::move(token)), format_(format), shape_(shape),
       contentFeatures_(std::move(contentFeatures)),
-      totalBytes_(wav ? std::max<std::uint64_t>(totalBytes, kWavHeaderBytes + 4) : totalBytes),
+      totalBytes_(shape == DlnaStreamShape::WavFile
+                      ? std::max<std::uint64_t>(totalBytes, kWavHeaderBytes + 4)
+                      : totalBytes),
       bytesPerFrame_(static_cast<std::uint32_t>(format.channels) *
                      (static_cast<std::uint32_t>(format.containerBits) / 8u)),
       capacityBytes_(std::max<std::uint32_t>(256u * 1024u,
@@ -222,7 +224,10 @@ void DlnaStreamSession::ReclaimLocked() noexcept {
     if (size_ == 0) return;
     // File-shaped sessions keep byte 0 addressable until a reader actually
     // asks for a byte range; see NewReaderAt.
-    if (!rangeRequested_ && wav_ && totalBytes_ > kWavHeaderBytes) return;
+    if (!rangeRequested_ && shape_ == DlnaStreamShape::WavFile &&
+        totalBytes_ > kWavHeaderBytes) {
+        return;
+    }
     const std::uint64_t oldest = produced_ - size_;
     const std::uint64_t now = GetTickCount64();
     // A reader that has not advanced for kReaderStallMs is a candidate for
@@ -332,27 +337,6 @@ bool DlnaStreamSession::Reader::Read(BYTE* destination, std::size_t maxBytes,
     return ok;
 }
 
-DlnaStreamSession::Reader DlnaStreamSession::NewReader() noexcept {
-    std::lock_guard lock(mutex_);
-    const std::uint64_t cursor = produced_;
-    const std::uint64_t readerId = nextReaderId_++;
-    try {
-        readers_.emplace(readerId, ReaderState{cursor, GetTickCount64()});
-    } catch (...) {
-        return Reader(*this, 0, cursor);
-    }
-    // Bump the connection counter even before any bytes flow. DlnaSink's
-    // startup gate reads this to tell "renderer connected" from "renderer
-    // is draining", which BytesServed cannot distinguish in WAV mode (the
-    // RIFF header goes out via SendChunk and never touches bytesServed_).
-    readersCreated_.fetch_add(1, std::memory_order_release);
-    // This is a live stream, not a seekable file: do not replay the reservoir
-    // accumulated before the HTTP connection arrived. Reclaim immediately so
-    // a producer blocked on that old reservoir can write the reader's first
-    // byte and wake dataReady_.
-    ReclaimLocked();
-    return Reader(*this, readerId, cursor);
-}
 
 DlnaStreamSession::Reader DlnaStreamSession::NewReaderAt(std::uint64_t entityOffset,
                                                          bool& reachable) noexcept {
@@ -360,8 +344,11 @@ DlnaStreamSession::Reader DlnaStreamSession::NewReaderAt(std::uint64_t entityOff
     // Entity offset -> payload cursor. Bytes [0, 44) are the RIFF header, which
     // the HTTP layer synthesises itself, so every offset below the header maps
     // to the first payload byte.
-    const std::uint64_t cursor = entityOffset > kWavHeaderBytes
-        ? entityOffset - kWavHeaderBytes : 0;
+    // Only a WAV entity carries the synthesised 44-byte header; a FLAC file
+    // shape streams its own container bytes, so offsets map one to one.
+    const std::uint64_t cursor = shape_ == DlnaStreamShape::WavFile
+        ? (entityOffset > kWavHeaderBytes ? entityOffset - kWavHeaderBytes : 0)
+        : entityOffset;
     // A renderer that asks for a byte offset has committed to the real pull;
     // only from that moment may the ring discard the head of the stream. Until
     // then the entity must stay addressable from byte 0, because the probe
@@ -445,14 +432,12 @@ std::vector<BYTE> DlnaStreamServer::WavHeader(const PcmFormat& format,
     return header;
 }
 
-std::wstring DlnaStreamServer::ContentType(const PcmFormat& format, bool wav) {
-    if (wav) return L"audio/wav";
-    // The Content-Type must agree with the protocolInfo in the DIDL, including
-    // the depth: declaring audio/L16 for 24-bit bytes makes the renderer read
-    // the payload at the wrong sample width.
-    const std::wstring subtype = format.containerBits > 16 ? L"L24" : L"L16";
-    return L"audio/" + subtype + L";rate=" + std::to_wstring(format.sampleRate) +
-           L";channels=" + std::to_wstring(format.channels);
+std::wstring DlnaStreamServer::ContentType(const PcmFormat& format,
+                                           DlnaStreamShape shape) {
+    (void)format;
+    // Must agree with the protocolInfo in the DIDL. Renderers advertise and
+    // accept the "x-" spelling of FLAC; the registered audio/flac is dropped.
+    return shape == DlnaStreamShape::FlacFile ? L"audio/x-flac" : L"audio/wav";
 }
 
 bool DlnaStreamServer::Start(const std::wstring& bindAddress, std::uint16_t& port,
@@ -673,8 +658,9 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
         return;
     }
 
-    const std::wstring contentType = DlnaStreamServer::ContentType(session->Format(),
-                                                                    session->Wav());
+    const std::wstring contentType = session->Mime().empty()
+        ? DlnaStreamServer::ContentType(session->Format(), session->Shape())
+        : session->Mime();
     // ---------------------------------------------------------------------
     // File-shaped response: WAV with a declared total length and byte ranges.
     //
@@ -686,8 +672,12 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
     // -- and played in real time as it arrives. The total therefore has to be
     // declared up front even though the producer is still generating it.
     // ---------------------------------------------------------------------
-    const bool fileShape = session->Wav() &&
-        session->TotalBytes() > DlnaStreamSession::kWavHeaderBytes;
+    // Only the file shape declares a length. FLAC and the live WAV shape are
+    // deliberately unbounded and answer with a chunked body instead.
+    const bool fileShape =
+        (session->Shape() == DlnaStreamShape::WavFile ||
+         session->Shape() == DlnaStreamShape::FlacFile) &&
+        session->TotalBytes() > 0;
     if (fileShape) {
         const std::uint64_t totalBytes = session->TotalBytes();
         std::uint64_t startAbs = 0;
@@ -767,7 +757,8 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
                 std::to_wstring(endAbs) + L"/" + std::to_wstring(totalBytes) + L"\r\n";
         }
         headerW += L"Accept-Ranges: bytes\r\n";
-        headerW += L"TransferMode.dlna.org: Streaming\r\n";
+        headerW += CommonHeaders();
+        headerW += L"transferMode.dlna.org: Streaming\r\n";
         headerW += L"contentFeatures.dlna.org: " + session->ContentFeatures() + L"\r\n";
         headerW += L"Connection: close\r\n\r\n";
         const std::string header = Narrow(headerW);
@@ -788,7 +779,8 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
         std::uint64_t chunksSent = 0;
         const std::uint64_t streamStartTick = GetTickCount64();
         std::uint64_t firstChunkAt = 0;
-        if (position < DlnaStreamSession::kWavHeaderBytes) {
+        if (session->Shape() == DlnaStreamShape::WavFile &&
+            position < DlnaStreamSession::kWavHeaderBytes) {
             const auto wavHeader = DlnaStreamServer::WavHeader(session->Format(), totalBytes);
             const auto take = static_cast<std::size_t>(std::min<std::uint64_t>(
                 DlnaStreamSession::kWavHeaderBytes - position, remaining));
@@ -844,87 +836,8 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
         closesocket(client);
         return;
     }
-
-    // Bare LPCM (audio/L16, audio/L24) path. It has no container, so there is
-    // no header to announce a length for and the entity stays unbounded; only
-    // renderers that pull raw PCM on their own accept this shape. WAV never
-    // reaches here - it is always served file-shaped above.
-    const std::wstring headerW =
-        L"HTTP/1.1 200 OK\r\nContent-Type: " + contentType + L"\r\n" +
-        L"Transfer-Encoding: chunked\r\n" +
-        L"TransferMode.dlna.org: Streaming\r\n" +
-        L"contentFeatures.dlna.org: " + session->ContentFeatures() + L"\r\n" +
-        L"Accept-Ranges: none\r\nConnection: close\r\n\r\n";
-    const std::string header = Narrow(headerW);
-    LogDlnaLine(L"http 200 token=" + token + L" type=" + contentType +
-                L" wav=" + std::to_wstring(session->Wav()) +
-                L" bits=" + std::to_wstring(session->Format().containerBits));
-    if (!SendAll(client, header.data(), header.size())) {
-        closesocket(client);
-        return;
-    }
-    if (headRequest) {
-        closesocket(client);
-        return;
-    }
-    // Each connection gets its own cursor. A probe connection therefore cannot
-    // steal audio from the one that is playing, and opening a second connection
-    // never terminates the first.
-    auto reader = session->NewReader();
-
-    std::vector<BYTE> body(kSendChunkBytes);
-    std::uint64_t chunksSent = 0;
-    std::uint64_t bytesSent = 0;
-    // Capture the stream start so firstChunkMs can be logged as an actual
-    // latency (delta) instead of an absolute GetTickCount64 value, which the
-    // old label silently misrepresented.
-    const std::uint64_t streamStartTick = GetTickCount64();
-    std::uint64_t firstChunkAt = 0;
-    bool endedByStream = false;
-    bool readFailed = false;
-    while (!stopping.load(std::memory_order_acquire)) {
-        std::size_t written = 0;
-        bool eos = false;
-        if (!reader.Read(body.data(), body.size(), written, eos, 500)) {
-            // A plain timeout has eos=false and is retried. Cursor faults use
-            // eos=true to avoid spinning forever on an unrecoverable position.
-            if (session->Aborted()) break;
-            if (eos) {
-                readFailed = true;
-                break;
-            }
-            continue;
-        }
-        if (eos && written == 0) {
-            endedByStream = true;
-            break;
-        }
-        if (written != 0) {
-            if (!SendChunk(client, body.data(), written)) {
-                // A send failure right after the response is the difference
-                // between "the renderer rejected the payload" and "the
-                // renderer hung up". Record it explicitly.
-                LogDlnaLine(L"http send failed token=" + token + L" afterChunks=" +
-                            std::to_wstring(chunksSent) + L" afterBytes=" +
-                            std::to_wstring(bytesSent));
-                break;
-            }
-            if (firstChunkAt == 0) firstChunkAt = GetTickCount64();
-            ++chunksSent;
-            bytesSent += written;
-        }
-    }
-    LogDlnaLine(L"http stream closed token=" + token + L" chunks=" +
-                std::to_wstring(chunksSent) + L" bytes=" + std::to_wstring(bytesSent) +
-                L" firstChunkMs=" +
-                std::to_wstring(firstChunkAt ? firstChunkAt - streamStartTick : 0) +
-                L" reason=" + (session->Aborted() ? L"abort" :
-                                endedByStream ? L"eos" :
-                                readFailed ? L"read" : L"client"));
-    // Terminate the chunked body so a renderer that is still waiting learns the
-    // stream ended rather than blocking until the socket times out.
-    const char* terminator = "0\r\n\r\n";
-    (void)SendAll(client, terminator, std::strlen(terminator));
+    // Only file shapes exist, so a request that matched neither is
+    // malformed; close instead of falling through.
     closesocket(client);
 }
 

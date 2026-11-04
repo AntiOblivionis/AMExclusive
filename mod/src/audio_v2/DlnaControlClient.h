@@ -77,7 +77,8 @@ public:
                       std::wstring& error) noexcept;
 
     static std::wstring HostFromLocation(const std::wstring& location);
-    static std::wstring ProtocolInfoFor(bool wav, const PcmFormat& format, bool converted);
+    static std::wstring ProtocolInfoFor(DlnaStreamShape shape, const PcmFormat& format,
+                                        bool converted);
     static bool ProtocolAllows(const std::wstring& sinkProtocolInfo, bool wav,
                                std::uint32_t sampleRate, std::uint16_t bits,
                                std::uint16_t channels);

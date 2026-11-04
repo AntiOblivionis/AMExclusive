@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(AMExclusive VERSION 0.2.1 LANGUAGES CXX RC)
+project(AMExclusive VERSION 0.2.2 LANGUAGES CXX RC)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "AMExclusive supports Windows x64 only")
@@ -25,6 +25,7 @@ add_executable(am_exclusive_dlna_selftest EXCLUDE_FROM_ALL
   src/audio_v2/DlnaLog.cpp
   src/audio_v2/DlnaResolve.cpp
   src/audio_v2/DlnaSink.cpp
+  src/audio_v2/FlacEncoder.cpp
   src/audio_v2/DlnaStreamServer.cpp
   src/UpnpXml.cpp)
 target_include_directories(am_exclusive_dlna_selftest PRIVATE src)
@@ -80,6 +81,7 @@ add_library(am_exclusive_hook SHARED
   src/audio_v2/DlnaLog.cpp
   src/audio_v2/DlnaResolve.cpp
   src/audio_v2/DlnaSink.cpp
+  src/audio_v2/FlacEncoder.cpp
   src/audio_v2/DlnaStreamServer.cpp
   src/audio_v2/NativeRenderGateProxy.cpp
   src/audio_v2/ResampledPcmSource.cpp

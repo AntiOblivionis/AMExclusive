@@ -379,7 +379,7 @@ bool DlnaSink::BuildFormatCandidates(const std::wstring& sinkProtocolInfo) noexc
     if (formatCandidates_.empty()) return false;
     formatIndex_ = 0;
     format_ = formatCandidates_.front().first;
-    wav_ = formatCandidates_.front().second;
+    wav_ = DlnaStreamShapeUsesWavContainer(shape_);
     converted_ = RequiresPcmConversion(params_.format, format_);
     return true;
 }
@@ -401,8 +401,35 @@ bool DlnaSink::SetupStream() noexcept {
     }
     chunkFrames_ = std::min<std::uint32_t>(
         std::max<std::uint32_t>(format_.sampleRate / 50u, 256u), 4096u);
-    protocolInfo_ = DlnaControlClient::ProtocolInfoFor(wav_, format_, converted_);
+    if (shape_ == DlnaStreamShape::FlacFile) {
+        // Constant-size frames keep the declared length exact.
+        const std::uint64_t samples =
+            shape_ == DlnaStreamShape::FlacFile
+                ? static_cast<std::uint64_t>(format_.sampleRate) *
+                      static_cast<std::uint64_t>(std::max<std::uint32_t>(streamSeconds_, 5))
+                : 0;
+        flac_.Reset(format_.sampleRate, format_.channels, format_.containerBits,
+                    shape_ == DlnaStreamShape::FlacFile, samples);
+    }
+    // Renderers disagree about the WAV MIME spelling and several only accept
+    // the one they advertise. Pick theirs when they name exactly one.
+    std::wstring wireMime;
+    if (shape_ == DlnaStreamShape::WavFile && !sinkProtocolInfoText_.empty()) {
+        const bool plain = sinkProtocolInfoText_.find(L"audio/wav") != std::wstring::npos;
+        const bool xWav = sinkProtocolInfoText_.find(L"audio/x-wav") != std::wstring::npos;
+        const bool wave = sinkProtocolInfoText_.find(L"audio/wave") != std::wstring::npos;
+        if (!plain && xWav) wireMime = L"audio/x-wav";
+        else if (!plain && wave) wireMime = L"audio/wave";
+    }
+    protocolInfo_ = DlnaControlClient::ProtocolInfoFor(shape_, format_, converted_);
     contentFeatures_ = FeaturesOf(protocolInfo_);
+    // DLNA's contentFeatures normally opens with a profile name. WAV has no
+    // registered profile, but strict renderers still expect the field, so the
+    // widely used "WAV" spelling is added when the protocolInfo carries none.
+    if (shape_ == DlnaStreamShape::WavFile &&
+        contentFeatures_.find(L"DLNA.ORG_PN=") == std::wstring::npos) {
+        contentFeatures_ = L"DLNA.ORG_PN=WAV;" + contentFeatures_;
+    }
     // Echo the capability decision once per stream so a failing renderer can be
     // diagnosed from the log alone: raw PCM vs WAV fallback, and which
     // protocolInfo entries the device actually advertised.
@@ -423,23 +450,40 @@ bool DlnaSink::SetupStream() noexcept {
     // the producer eventually emits. Overshooting is safe: the renderer simply
     // stops at the end of the real audio and waits for the next track's URL.
     // Undershooting would truncate the song, so the value is a ceiling.
-    totalBytes_ = DlnaStreamSession::kWavHeaderBytes +
-        bytesPerSecond * static_cast<std::uint64_t>(std::max<std::uint32_t>(streamSeconds_, 5));
-    // Keep the 32-bit RIFF data size representable.
-    totalBytes_ = std::min<std::uint64_t>(totalBytes_, 0x7FFF0000ull);
+    if (shape_ == DlnaStreamShape::FlacFile) {
+        // Verbatim frames are fixed size, so the exact entity length is known
+        // before a single sample exists. That is what lets a live capture be
+        // announced as a normal file with Content-Length and byte ranges.
+        const std::uint64_t samples =
+            static_cast<std::uint64_t>(format_.sampleRate) *
+            static_cast<std::uint64_t>(std::max<std::uint32_t>(streamSeconds_, 5));
+        totalBytes_ = FlacEncoder::VerbatimSize(format_.sampleRate, format_.channels,
+                                                format_.containerBits, samples);
+    } else {
+        totalBytes_ = DlnaStreamSession::kWavHeaderBytes +
+            bytesPerSecond * static_cast<std::uint64_t>(
+                std::max<std::uint32_t>(streamSeconds_, 5));
+        // Keep the 32-bit RIFF data size representable.
+        totalBytes_ = std::min<std::uint64_t>(totalBytes_, 0x7FFF0000ull);
+    }
     const auto capacity = static_cast<std::uint32_t>(std::min<std::uint64_t>(
         std::max<std::uint64_t>(bytesPerSecond * (bufferMs_ + 3000u) / 1000u,
                                 1024u * 1024u),
         32u * 1024u * 1024u));
     const auto token = GuidToken();
-    session_ = std::make_shared<DlnaStreamSession>(token, format_, wav_, capacity,
+    if (!wireMime.empty()) {
+        DlnaLog(L"wav mime follows the renderer: " + wireMime);
+    }
+    session_ = std::make_shared<DlnaStreamSession>(token, format_, shape_, capacity,
                                                    contentFeatures_, totalBytes_);
+    if (!wireMime.empty()) session_->SetMime(wireMime);
     server_.AddSession(session_);
     // The HTTP reader thread and the producer both walk this ring; pinning it
     // keeps either of them from taking a page fault mid-transfer.
     DlnaLog(L"stream ring=" + std::to_wstring(capacity / 1024u) + L"KB locked=" +
             std::to_wstring(session_->LockMemory() ? 1 : 0));
-    streamUrl_ = server_.BaseUrl() + L"/ame/" + token + (wav_ ? L".wav" : L".l16");
+    streamUrl_ = server_.BaseUrl() + L"/ame/" + token +
+        (shape_ == DlnaStreamShape::FlacFile ? L".flac" : L".wav");
     return true;
 }
 
@@ -456,7 +500,7 @@ bool DlnaSink::TryNextFormat() noexcept {
     if (formatIndex_ + 1 >= formatCandidates_.size()) return false;
     ++formatIndex_;
     format_ = formatCandidates_[formatIndex_].first;
-    wav_ = formatCandidates_[formatIndex_].second;
+    wav_ = DlnaStreamShapeUsesWavContainer(shape_);
     converted_ = RequiresPcmConversion(params_.format, format_);
     return SetupStream();
 }
@@ -531,6 +575,10 @@ HRESULT DlnaSink::Open(const AudioSinkOpenParams& params) noexcept {
             }
         }
     }
+    // An explicit value (self test) overrides both the ini guess and SMTC.
+    if (params.streamSeconds != 0) {
+        streamSeconds_ = params.streamSeconds;
+    }
     if (!params.dlna.avTransportControl.empty() || !params.dlna.openHomePlaylist.empty() ||
         !params.dlna.location.empty()) {
         params_ = params;
@@ -539,6 +587,19 @@ HRESULT DlnaSink::Open(const AudioSinkOpenParams& params) noexcept {
         return ammod::audio::kDlnaDeviceUnavailable;
     }
     bufferMs_ = std::min<std::uint32_t>(std::max<std::uint32_t>(params.streamBufferMs, 300u), 3000u);
+    // Wire shape: wav (default, unchanged), flac, or live. Read here so a
+    // change takes effect on the next track without restarting Apple Music.
+    // params.streamShape wins when the caller sets it explicitly (the self
+    // test does); otherwise the persisted ini decides, which is the production
+    // path since the broker does not carry the shape over IPC.
+    shape_ = params.streamShape;
+    if (shape_ == DlnaStreamShape::WavFile) {
+        wchar_t value[16]{};
+        GetPrivateProfileStringW(L"dlna", L"stream_format", L"wav", value,
+                                 static_cast<DWORD>(std::size(value)),
+                                 IniPath().c_str());
+        shape_ = DlnaStreamShapeFromText(value);
+    }
     std::wstring error;
     // A renderer that is booting, waking, or momentarily busy can fail the
     // first description fetch. Retry briefly instead of giving up silently,
@@ -623,9 +684,16 @@ bool DlnaSink::SendStreamToDevice() noexcept {
     // AURALiC-class devices accept from a live source. Bare LPCM has no
     // container and therefore no length, so it stays a radio broadcast.
     const auto duration = DlnaControlClient::TimeText(streamSeconds_) + L".000";
-    const auto didl = upnp::BuildDidlLite(L"ame-" + GuidToken(), L"Apple Music",
-                                          streamUrl_, protocolInfo_, duration,
-                                          !wav_, wav_ ? totalBytes_ : 0);
+    // Every shape is a file now: a musicTrack with duration (and size when the
+    // container length is known), never an unbounded broadcast item.
+    constexpr bool broadcast = false;
+    const std::uint64_t didlSize =
+        (shape_ == DlnaStreamShape::WavFile || shape_ == DlnaStreamShape::FlacFile)
+            ? totalBytes_ : 0;
+    const auto didl = upnp::BuildDidlLite(
+        L"ame-" + GuidToken(), L"Apple Music", streamUrl_, protocolInfo_,
+        broadcast ? std::wstring() : duration, broadcast, didlSize,
+        format_.sampleRate, format_.containerBits, format_.channels);
     if (target_.openHome && !target_.openHomePlaylist.empty()) {
         // Verified against foo_upnp (BubbleUPnPServer 0.9-update51) on the LAN:
         // OpenHome Playlist has no SetStreams action. The sequence that actually
@@ -839,6 +907,7 @@ void DlnaSink::ProducerMain() noexcept {
         }
         if (prepared == S_FALSE) {
             waitingForSource_.store(false, std::memory_order_release);
+            FlushEncoderTail();
             (void)session_->Append(nullptr, 0, true);
             endOfStreamSubmitted_.store(true, std::memory_order_release);
             break;
@@ -870,6 +939,7 @@ void DlnaSink::ProducerMain() noexcept {
         }
         submittedFrames_.fetch_add(written, std::memory_order_relaxed);
         if (eos) {
+            FlushEncoderTail();
             (void)session_->Append(nullptr, 0, true);
             endOfStreamSubmitted_.store(true, std::memory_order_release);
             break;
@@ -882,7 +952,20 @@ void DlnaSink::ProducerMain() noexcept {
 }
 
 bool DlnaSink::PackChunk(const std::int32_t* samples, std::uint32_t frames,
-                         bool endOfStream, std::vector<BYTE>& output) const noexcept {
+                         bool endOfStream, std::vector<BYTE>& output) noexcept {
+    if (shape_ == DlnaStreamShape::FlacFile) {
+        // FLAC frames are emitted whole, so the encoder buffers up to one block
+        // and hands back whatever is ready. Nothing is produced for a partial
+        // block, which is why Drain may return an empty vector.
+        output.clear();
+        if (samples && frames != 0) flac_.Push(samples, frames);
+        if (endOfStream) {
+            flac_.Finish(output);
+        } else {
+            flac_.Drain(output);
+        }
+        return true;
+    }
     (void)endOfStream;
     if (!samples || frames == 0) return true;
     // See ProducerMain: the channel count must come from the negotiated format,
@@ -900,6 +983,13 @@ bool DlnaSink::PackChunk(const std::int32_t* samples, std::uint32_t frames,
         return PackLpcmNetworkOrder(samples, output.data(), sampleCount, bits);
     }
     return PackCanonicalPcm32(samples, output.data(), sampleCount, bits);
+}
+
+void DlnaSink::FlushEncoderTail() noexcept {
+    if (shape_ != DlnaStreamShape::FlacFile || !session_) return;
+    std::vector<BYTE> tail;
+    if (!PackChunk(nullptr, 0, true, tail) || tail.empty()) return;
+    (void)session_->Append(tail.data(), tail.size(), false);
 }
 
 void DlnaSink::JoinProducer() noexcept {
