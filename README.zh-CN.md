@@ -8,6 +8,31 @@
 > （MIT License）的派生项目，由本仓库维护者独立维护，与 Apple Inc. 及上游作者均无关联，
 > 也未获得其许可或背书。`amexclusive.tgwgroup.ltd` 是**上游项目**的官网，不是本分支的官网。
 
+## 直接下载（无需编译）
+
+编译好的 Windows x64 安装包挂在
+[GitHub Releases](https://github.com/dxdxdxlm123/AMExclusive-Openhome/releases) 上，
+**不需要** Visual Studio、CMake，也不需要下载源码。
+
+| 下载 | 说明 |
+|---|---|
+| **[最新版 Release](https://github.com/dxdxdxlm123/AMExclusive-Openhome/releases/latest)** | 推荐，始终指向最新构建 |
+| **[AMExclusive-Setup-0.2.0-20261104.exe](https://github.com/dxdxdxlm123/AMExclusive-Openhome/releases/download/v0.2.0/AMExclusive-Setup-0.2.0-20261104.exe)** | 2.7 MB 安装程序（v0.2.0 直链） |
+| **[AMExclusive-0.2.0-20261104.zip](https://github.com/dxdxdxlm123/AMExclusive-Openhome/releases/download/v0.2.0/AMExclusive-0.2.0-20261104.zip)** | 安装程序 + 中文《使用说明.txt》 |
+
+安装程序 SHA-256：
+`3676D1A28C58FF3A3F6ADD45D1786C5593BC63DCB29E5BEC1F352408547E5EE9`
+
+**安装步骤**：完全退出 Apple Music → 右键安装程序 →
+**以管理员身份运行** → 重新打开 Apple Music → 在应用内面板选择输出
+（本机 DAC 选 WASAPI 独占，网播选 DLNA 并先扫描设备）。
+需要 Windows 10/11 x64 与 Microsoft Store 版 Apple Music。
+
+安装包**未做代码签名**，Windows SmartScreen 会提示「未知发布者」；请先核对上面的
+校验值，再点「更多信息 → 仍要运行」。
+
+想自己从源码编译请看[编译与安装](#编译与安装)。
+
 ## 本分支增加了什么
 
 上游项目提供 WASAPI 独占输出和强制最高音质无损流。本分支完整保留这些能力，并新增

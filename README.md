@@ -10,6 +10,31 @@
 > Apple Inc. or by the upstream author. `amexclusive.tgwgroup.ltd` is the upstream
 > project's website; it is not the website of this fork.
 
+## Download — no build required
+
+Prebuilt Windows x64 installers are attached to every
+[GitHub Release](https://github.com/dxdxdxlm123/AMExclusive-Openhome/releases).
+You do **not** need Visual Studio, CMake, or any source code to install.
+
+| Download | What it is |
+|---|---|
+| **[Latest release](https://github.com/dxdxdxlm123/AMExclusive-Openhome/releases/latest)** | Recommended — always points at the newest build |
+| **[AMExclusive-Setup-0.2.0-20261104.exe](https://github.com/dxdxdxlm123/AMExclusive-Openhome/releases/download/v0.2.0/AMExclusive-Setup-0.2.0-20261104.exe)** | 2.7 MB installer (v0.2.0 direct link) |
+| **[AMExclusive-0.2.0-20261104.zip](https://github.com/dxdxdxlm123/AMExclusive-Openhome/releases/download/v0.2.0/AMExclusive-0.2.0-20261104.zip)** | Installer plus a Chinese `使用说明.txt` |
+
+SHA-256 of the `.exe`:
+`3676D1A28C58FF3A3F6ADD45D1786C5593BC63DCB29E5BEC1F352408547E5EE9`
+
+**Install:** fully quit Apple Music → right-click the installer →
+**Run as administrator** → reopen Apple Music → choose the output in the in-app
+panel (WASAPI exclusive for a local DAC, or DLNA after scanning for a renderer).
+A Microsoft Store installation of Apple Music on Windows 10/11 x64 is required.
+
+The installer is **not code-signed**, so Windows SmartScreen will warn about an
+unknown publisher; verify the checksum above, then choose "More info → Run anyway".
+
+To build from source instead, see [Build and install](#build-and-install).
+
 ## What this fork adds
 
 The upstream project provides WASAPI exclusive output and a highest-quality lossless
