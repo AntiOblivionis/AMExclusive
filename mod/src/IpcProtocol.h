@@ -12,7 +12,7 @@ namespace ammod::ipc {
 
 inline constexpr std::uint32_t kMagic = 0x50494D41; // "AMIP" little-endian
 inline constexpr std::uint16_t kProtocolMajor = 2;
-inline constexpr std::uint16_t kProtocolMinor = 2;
+inline constexpr std::uint16_t kProtocolMinor = 3;
 inline constexpr std::size_t kEndpointIdChars = 256;
 inline constexpr std::size_t kEndpointNameChars = 128;
 inline constexpr std::size_t kFormatChars = 160;
@@ -43,6 +43,15 @@ enum class MessageType : std::uint16_t {
     TransportIntent = 9,
     SetHardwareBuffer = 10,
     SetAllowResampling = 11,
+    // Protocol 2.3 additions. Older peers ignore unknown types.
+    RefreshDevices = 12,
+    DeviceFound = 13,
+    DeviceLost = 14,
+    SetOutputTarget = 15,
+    AddDevice = 16,
+    DeviceAddResult = 17,
+    RestartCurrent = 18,
+    RestartResult = 19,
 };
 
 enum class RuntimeState : std::uint16_t {
@@ -84,6 +93,11 @@ enum class ErrorCategory : std::uint16_t {
     BitPerfectFormatUnavailable,
     ExclusiveFormatUnavailable,
     EndpointDrainTimeout,
+    DlnaDeviceUnavailable,
+    DlnaFormatUnsupported,
+    DlnaStreamFailed,
+    DlnaControlFailed,
+    DlnaSeekUnsupported,
 };
 
 #pragma pack(push, 1)
@@ -138,6 +152,11 @@ inline ErrorCategory CategorizeAudioError(HRESULT hr) noexcept {
     case ammod::audio::kExclusiveFormatUnavailable:
         return ErrorCategory::ExclusiveFormatUnavailable;
     case ammod::audio::kEndpointDrainTimeout: return ErrorCategory::EndpointDrainTimeout;
+    case ammod::audio::kDlnaDeviceUnavailable: return ErrorCategory::DlnaDeviceUnavailable;
+    case ammod::audio::kDlnaFormatUnsupported: return ErrorCategory::DlnaFormatUnsupported;
+    case ammod::audio::kDlnaStreamFailed: return ErrorCategory::DlnaStreamFailed;
+    case ammod::audio::kDlnaControlFailed: return ErrorCategory::DlnaControlFailed;
+    case ammod::audio::kDlnaSeekUnsupported: return ErrorCategory::DlnaSeekUnsupported;
     case HRESULT_FROM_WIN32(ERROR_TIMEOUT): return ErrorCategory::Timeout;
     case AUDCLNT_E_UNSUPPORTED_FORMAT: return ErrorCategory::FormatUnsupported;
     case AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED: return ErrorCategory::ExclusiveNotAllowed;

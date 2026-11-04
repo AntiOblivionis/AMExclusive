@@ -1,4 +1,5 @@
 #include "BoundedLog.h"
+#include "DlnaDiscovery.h"
 #include "IpcProtocol.h"
 #include "IpcTransport.h"
 
@@ -9,11 +10,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <memory>
 #include <fstream>
 #include <filesystem>
 #include <iterator>
 #include <iostream>
 #include <iomanip>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -72,6 +78,7 @@ struct Client {
     HANDLE pipe{};
     Role role{Role::Unknown};
     DWORD pid{};
+    std::uint16_t minor{};
 };
 
 std::mutex g_mutex;
@@ -80,6 +87,20 @@ std::atomic<bool> g_shutdown{};
 std::atomic<std::uint64_t> g_lastErrorDialogSignature{};
 std::vector<Client> g_clients;
 HANDLE g_authoritativeAgentPipe{INVALID_HANDLE_VALUE};
+std::uint8_t g_outputKind{}; // 0 = WASAPI, 1 = DLNA/OpenHome
+std::wstring g_dlnaUdn;
+std::wstring g_dlnaName;
+std::wstring g_dlnaLocation;
+std::uint32_t g_dlnaBufferMs{1500};
+std::wstring g_manualUrls;
+std::unique_ptr<ammod::dlna::DlnaDiscovery> g_discovery;
+std::mutex g_deviceQueueMutex;
+std::condition_variable g_deviceQueueCv;
+std::deque<ammod::dlna::DiscoveredDevice> g_deviceQueue;
+std::thread g_deviceBroadcastThread;
+std::atomic<bool> g_deviceBroadcastStop{false};
+std::thread g_iniWatchThread;
+std::atomic<bool> g_iniWatchStop{false};
 Message g_status = [] {
     auto message = NewMessage(MessageType::StatusChanged, Role::Broker);
     message.state = RuntimeState::Off;
@@ -89,6 +110,157 @@ Message g_status = [] {
 void Log(const std::wstring& text);
 void Broadcast(const Message& message, HANDLE source);
 std::vector<DWORD> FindProcesses(const wchar_t* executableName);
+
+template <std::size_t N>
+void CopyText(wchar_t (&destination)[N], const std::wstring& source) {
+    const std::size_t count = std::min<std::size_t>(source.size(), N - 1u);
+    if (count) std::memcpy(destination, source.c_str(), count * sizeof(wchar_t));
+    destination[count] = L'\0';
+}
+
+std::uint8_t ReadOutputKind() {
+    wchar_t value[32]{};
+    GetPrivateProfileStringW(L"mod", L"output", L"wasapi", value,
+                             static_cast<DWORD>(std::size(value)), BrokerIniPath().c_str());
+    return _wcsicmp(value, L"dlna") == 0 ? 1u : 0u;
+}
+
+std::wstring ReadDlnaValue(const wchar_t* key) {
+    wchar_t value[512]{};
+    GetPrivateProfileStringW(L"dlna", key, L"", value,
+                             static_cast<DWORD>(std::size(value)), BrokerIniPath().c_str());
+    return value;
+}
+
+std::uint32_t ReadDlnaBufferMs() {
+    const auto value = GetPrivateProfileIntW(L"dlna", L"buffer_ms", 1500,
+                                             BrokerIniPath().c_str());
+    return static_cast<std::uint32_t>(
+        std::min(std::max(static_cast<int>(value), 300), 3000));
+}
+
+void WriteOutputTarget(std::uint8_t kind, const std::wstring& udn,
+                       const std::wstring& name, const std::wstring& location,
+                       std::uint32_t bufferMs) {
+    const auto path = BrokerIniPath();
+    (void)WritePrivateProfileStringW(L"mod", L"output",
+                                     kind ? L"dlna" : L"wasapi", path.c_str());
+    (void)WritePrivateProfileStringW(L"dlna", L"device_udn", udn.c_str(), path.c_str());
+    (void)WritePrivateProfileStringW(L"dlna", L"device_name", name.c_str(), path.c_str());
+    (void)WritePrivateProfileStringW(L"dlna", L"location", location.c_str(), path.c_str());
+    const auto bufferText = std::to_wstring(bufferMs);
+    (void)WritePrivateProfileStringW(L"dlna", L"buffer_ms", bufferText.c_str(), path.c_str());
+    (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+}
+
+void BroadcastDevice(const ammod::dlna::DiscoveredDevice& device) {
+    Log(L"broadcast device begin udn=" + device.udn + L" name=" + device.friendlyName);
+    // Discovery callback runs on the SSDP worker, which has no COM apartment.
+    // Build the wire message explicitly and broadcast from a dedicated broker
+    // worker so a slow/stale UI pipe can never stall the receive loop.
+    Message message{};
+    message.type = device.online ? MessageType::DeviceFound : MessageType::DeviceLost;
+    message.role = Role::Broker;
+    message.senderPid = GetCurrentProcessId();
+    GetSystemTimeAsFileTime(&message.timestampUtc);
+    CopyText(message.endpointId, device.udn);
+    CopyText(message.endpointName, device.friendlyName);
+    CopyText(message.detail, device.location);
+    message.reserved[0] = device.online ? 1u : 0u;
+    message.reserved[1] = device.openHome ? 1u : 0u;
+    message.reserved[2] = device.avTransport ? 1u : 0u;
+    std::vector<HANDLE> targets;
+    {
+        std::lock_guard lock(g_mutex);
+        for (const auto& client : g_clients) {
+            if (client.role != Role::Ui || client.minor < 3) continue;
+            HANDLE duplicate{};
+            if (DuplicateHandle(GetCurrentProcess(), client.pipe, GetCurrentProcess(),
+                                &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                targets.push_back(duplicate);
+            }
+        }
+    }
+    Log(L"broadcast device targets=" + std::to_wstring(targets.size()));
+    for (HANDLE pipe : targets) {
+        const bool written = WriteMessage(pipe, message);
+        Log(L"broadcast device write ok=" + std::to_wstring(written));
+        CloseHandle(pipe);
+    }
+}
+
+void EnqueueDevice(const ammod::dlna::DiscoveredDevice& device) {
+    {
+        std::lock_guard lock(g_deviceQueueMutex);
+        if (g_deviceQueue.size() < 64) g_deviceQueue.push_back(device);
+    }
+    g_deviceQueueCv.notify_one();
+}
+
+void DeviceBroadcastThread() {
+    for (;;) {
+        ammod::dlna::DiscoveredDevice device;
+        {
+            std::unique_lock lock(g_deviceQueueMutex);
+            g_deviceQueueCv.wait(lock, [] {
+                return g_deviceBroadcastStop.load(std::memory_order_acquire) ||
+                    !g_deviceQueue.empty();
+            });
+            if (g_deviceBroadcastStop.load(std::memory_order_acquire) &&
+                g_deviceQueue.empty()) break;
+            device = std::move(g_deviceQueue.front());
+            g_deviceQueue.pop_front();
+        }
+        BroadcastDevice(device);
+    }
+}
+
+Message OutputTargetMessage() {
+    auto message = NewMessage(MessageType::SetOutputTarget, Role::Broker);
+    message.enabledIntent = g_outputKind;
+    message.hardwareBufferMs = g_dlnaBufferMs;
+    CopyText(message.endpointId, g_dlnaUdn);
+    CopyText(message.endpointName, g_dlnaName);
+    CopyText(message.detail, g_dlnaLocation);
+    return message;
+}
+
+// The output target used to be read from the ini exactly once at broker start,
+// so editing am-exclusive.ini (or the device coming back under a new address)
+// left the hook pointing at a stale, often unreachable, renderer: DLNA open
+// failed silently and playback fell back to silence/passthrough. Re-read the
+// ini on a slow cadence and re-broadcast the target whenever it changes so a
+// running stack converges on the configured device without a restart.
+void IniWatchThread() {
+    for (;;) {
+        for (int tick = 0; tick < 10; ++tick) {
+            if (g_iniWatchStop.load(std::memory_order_acquire)) return;
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        const auto kind = ReadOutputKind();
+        const auto udn = ReadDlnaValue(L"device_udn");
+        const auto name = ReadDlnaValue(L"device_name");
+        const auto location = ReadDlnaValue(L"location");
+        const auto bufferMs = ReadDlnaBufferMs();
+        const bool changed = kind != g_outputKind || udn != g_dlnaUdn ||
+            name != g_dlnaName || location != g_dlnaLocation ||
+            bufferMs != g_dlnaBufferMs;
+        if (!changed) continue;
+        g_outputKind = kind;
+        g_dlnaUdn = udn;
+        g_dlnaName = name;
+        g_dlnaLocation = location;
+        g_dlnaBufferMs = bufferMs;
+        g_status.reserved[0] = g_outputKind;
+        if (g_outputKind != 0) {
+            CopyText(g_status.endpointId, g_dlnaUdn);
+            CopyText(g_status.endpointName, g_dlnaName);
+        }
+        Log(L"ini target reloaded output=" + std::to_wstring(g_outputKind) +
+            L" device=" + g_dlnaName + L" location=" + g_dlnaLocation);
+        Broadcast(OutputTargetMessage(), nullptr);
+    }
+}
 
 bool UseChineseUi() noexcept {
     const LANGID language = GetUserDefaultUILanguage();
@@ -232,6 +404,26 @@ void ShowErrorDialogAsync(ErrorCategory error, HRESULT result,
         case ErrorCategory::EndpointDrainTimeout:
             reason = chinese ? L"等待播放设备完成歌曲尾部播放时超时。请重试歌曲。"
                              : L"Timed out waiting for the playback device to finish the track tail. Retry the song.";
+            break;
+        case ErrorCategory::DlnaDeviceUnavailable:
+            reason = chinese ? L"DLNA/OpenHome 设备未找到或当前离线。请刷新设备列表后重试。"
+                             : L"The DLNA/OpenHome device was not found or is offline. Refresh the device list and retry.";
+            break;
+        case ErrorCategory::DlnaFormatUnsupported:
+            reason = chinese ? L"设备不支持当前音源格式。可在设置中开启“允许兼容格式转换”，或选择其它设备。"
+                             : L"The device does not support the current source format. Enable compatible format conversion or choose another device.";
+            break;
+        case ErrorCategory::DlnaStreamFailed:
+            reason = chinese ? L"本机音频流服务启动失败。请检查防火墙是否允许 AMPLibraryAgent 监听局域网端口。"
+                             : L"The local audio stream service failed to start. Check that the firewall allows AMPLibraryAgent to listen on the LAN.";
+            break;
+        case ErrorCategory::DlnaControlFailed:
+            reason = chinese ? L"设备未拉流或拒绝了播放控制请求。请确认设备未被其它控制点占用，并查看 am-exclusive-dlna.log。"
+                             : L"The device did not pull the stream or rejected the control request. Check that it is not busy and inspect am-exclusive-dlna.log.";
+            break;
+        case ErrorCategory::DlnaSeekUnsupported:
+            reason = chinese ? L"当前设备不支持精确 seek。"
+                             : L"The current device does not support precise seeking.";
             break;
         case ErrorCategory::HookLoadFailed:
             reason = chinese
@@ -827,6 +1019,77 @@ void PublishStatus(HANDLE source) {
 void HandleMessage(const Message& incoming, HANDLE source) {
     Log(L"handle type=" + std::to_wstring(static_cast<unsigned>(incoming.type)) +
         L" role=" + std::to_wstring(static_cast<unsigned>(incoming.role)));
+    if (incoming.type == MessageType::RestartCurrent &&
+        (incoming.role == Role::Ui || incoming.role == Role::Controller)) {
+        {
+            std::lock_guard lock(g_mutex);
+            if (incoming.minor < 3 ||
+                std::none_of(g_clients.begin(), g_clients.end(), [&](const Client& client) {
+                    return client.pipe == source && client.role == incoming.role &&
+                           client.pid == incoming.senderPid;
+                })) return;
+        }
+        wchar_t brokerPath[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, brokerPath, static_cast<DWORD>(std::size(brokerPath)));
+        const auto control = std::filesystem::path(brokerPath).parent_path() /
+            L"am_exclusive_media_control.exe";
+        std::wstring command = L"\"" + control.wstring() + L"\" restart-current";
+        STARTUPINFOW startup{sizeof(startup)};
+        PROCESS_INFORMATION process{};
+        const bool started = std::filesystem::exists(control) &&
+            CreateProcessW(control.c_str(), command.data(), nullptr, nullptr, FALSE,
+                           CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+        if (started) {
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+        }
+        auto result = NewMessage(MessageType::RestartResult, Role::Broker);
+        result.reserved[0] = started ? 1u : 0u;
+        CopyText(result.detail, started ? L"restart-requested" : L"media-control-missing");
+        (void)WriteMessage(source, result);
+        Log(L"restart current requested ok=" + std::to_wstring(started));
+        return;
+    }
+    if (incoming.type == MessageType::AddDevice &&
+        (incoming.role == Role::Ui || incoming.role == Role::Controller)) {
+        {
+            std::lock_guard lock(g_mutex);
+            if (incoming.minor < 3 ||
+                std::none_of(g_clients.begin(), g_clients.end(), [&](const Client& client) {
+                    return client.pipe == source && client.role == incoming.role &&
+                           client.pid == incoming.senderPid;
+                })) return;
+        }
+        std::wstring error;
+        bool added = false;
+        if (g_discovery) {
+            added = g_discovery->AddManualDevice(incoming.detail, error);
+        } else {
+            error = L"discovery is unavailable";
+        }
+        if (added) {
+            std::wstringstream stream(g_manualUrls);
+            std::wstring existing;
+            bool present = false;
+            while (std::getline(stream, existing, L';')) {
+                if (_wcsicmp(existing.c_str(), incoming.detail) == 0) present = true;
+            }
+            if (!present) {
+                if (!g_manualUrls.empty()) g_manualUrls += L";";
+                g_manualUrls += incoming.detail;
+                (void)WritePrivateProfileStringW(L"dlna", L"manual_urls",
+                                                 g_manualUrls.c_str(),
+                                                 BrokerIniPath().c_str());
+            }
+        }
+        auto result = NewMessage(MessageType::DeviceAddResult, Role::Broker);
+        result.reserved[0] = added ? 1u : 0u;
+        CopyText(result.detail, added ? L"added" : error);
+        (void)WriteMessage(source, result);
+        Log(L"manual device add url=" + std::wstring(incoming.detail) +
+            L" ok=" + std::to_wstring(added) + L" reason=" + error);
+        return;
+    }
     if (incoming.type == MessageType::TransportIntent &&
         (incoming.role == Role::Ui || incoming.role == Role::Controller)) {
         {
@@ -839,7 +1102,9 @@ void HandleMessage(const Message& incoming, HANDLE source) {
         return;
     }
     Message status{};
+    Message targetMessage{};
     bool showError = false;
+    bool relayTarget = false;
     {
         std::lock_guard lock(g_mutex);
         if (std::none_of(g_clients.begin(), g_clients.end(), [&](const Client& client) {
@@ -894,11 +1159,53 @@ void HandleMessage(const Message& incoming, HANDLE source) {
                         std::to_wstring(GetLastError()));
                 }
             }
+        } else if (incoming.type == MessageType::SetOutputTarget &&
+                   (incoming.role == Role::Ui || incoming.role == Role::Controller)) {
+            if (incoming.minor < 3) return;
+            const std::uint8_t kind = incoming.enabledIntent ? 1u : 0u;
+            if (kind == 1u && incoming.endpointId[0] == L'\0') return;
+            g_outputKind = kind;
+            g_dlnaUdn = incoming.endpointId;
+            g_dlnaName = incoming.endpointName;
+            g_dlnaLocation = incoming.detail;
+            g_dlnaBufferMs = std::min<std::uint32_t>(
+                std::max<std::uint32_t>(incoming.hardwareBufferMs ? incoming.hardwareBufferMs
+                                                                  : 1500u,
+                                        300u),
+                3000u);
+            (void)WriteOutputTarget(g_outputKind, g_dlnaUdn, g_dlnaName,
+                                    g_dlnaLocation, g_dlnaBufferMs);
+            if (g_outputKind == 1u && !g_status.enabledIntent) {
+                // Choosing a renderer is a request to route audio there, just
+                // like enabling exclusive mode. Persist the enable intent so a
+                // later restart does not silently fall back to local output.
+                g_status.enabledIntent = 1;
+                (void)WritePrivateProfileStringW(L"mod", L"mode", L"exclusive",
+                                                 BrokerIniPath().c_str());
+            }
+            g_status.generation++;
+            g_status.reserved[0] = g_outputKind;
+            CopyText(g_status.endpointName, g_dlnaName);
+            CopyText(g_status.endpointId, g_dlnaUdn);
+            g_status.error = ErrorCategory::None;
+            g_status.hresult = S_OK;
+            g_status.state = g_status.enabledIntent
+                ? RuntimeState::WaitingForStream : RuntimeState::Off;
+            g_status.senderPid = GetCurrentProcessId();
+            GetSystemTimeAsFileTime(&g_status.timestampUtc);
+            status = g_status;
+            targetMessage = OutputTargetMessage();
+            relayTarget = true;
+            Log(L"output target persisted kind=" + std::to_wstring(g_outputKind) +
+                L" device=" + g_dlnaName);
         } else if (incoming.type == MessageType::StatusChanged && incoming.role == Role::Agent) {
             const auto generation = std::max(g_status.generation + 1, incoming.generation);
             const auto persistedIntent = g_status.enabledIntent;
             const auto persistedHardwareBufferMs = g_status.hardwareBufferMs;
             const auto persistedAllowResampling = g_status.allowResampling;
+            const auto persistedOutputKind = g_status.reserved[0];
+            const auto persistedEndpointId = g_status.endpointId;
+            const auto persistedEndpointName = g_status.endpointName;
             g_status = incoming;
             g_status.type = MessageType::StatusChanged;
             g_status.role = Role::Broker;
@@ -911,6 +1218,11 @@ void HandleMessage(const Message& incoming, HANDLE source) {
                 g_status.enabledIntent = persistedIntent;
                 g_status.hardwareBufferMs = persistedHardwareBufferMs;
                 g_status.allowResampling = persistedAllowResampling;
+                g_status.reserved[0] = persistedOutputKind;
+                if (persistedOutputKind != 0) {
+                    CopyText(g_status.endpointId, persistedEndpointId);
+                    CopyText(g_status.endpointName, persistedEndpointName);
+                }
                 if (persistedIntent && incoming.state == RuntimeState::Off) {
                     g_status.state = RuntimeState::WaitingForStream;
                 }
@@ -920,12 +1232,20 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             const auto persistedIntent = g_status.enabledIntent;
             const auto persistedHardwareBufferMs = g_status.hardwareBufferMs;
             const auto persistedAllowResampling = g_status.allowResampling;
+            const auto persistedOutputKind = g_status.reserved[0];
+            const auto persistedEndpointId = g_status.endpointId;
+            const auto persistedEndpointName = g_status.endpointName;
             g_status = incoming;
             g_status.type = MessageType::StatusChanged;
             g_status.role = Role::Broker;
             g_status.generation = generation;
             g_status.hardwareBufferMs = persistedHardwareBufferMs;
             g_status.allowResampling = persistedAllowResampling;
+            g_status.reserved[0] = persistedOutputKind;
+            if (persistedOutputKind != 0) {
+                CopyText(g_status.endpointId, persistedEndpointId);
+                CopyText(g_status.endpointName, persistedEndpointName);
+            }
             if (persistedIntent) {
                 // Retire the failed attempt, not the user's AME preference.
                 // The Agent receives this status and arms a fresh generation
@@ -956,6 +1276,7 @@ void HandleMessage(const Message& incoming, HANDLE source) {
         status = g_status;
     }
     Broadcast(status, source);
+    if (relayTarget) BroadcastToRole(targetMessage, Role::Agent);
     if (showError) ShowErrorDialogAsync(status.error, status.hresult, status.generation);
 }
 
@@ -1015,7 +1336,7 @@ void ClientThread(HANDLE pipe) {
             supersededAgents = BeginAgentConnectionLocked(pipe);
             publishAgentBoundary = true;
         }
-        g_clients.push_back({pipe, hello.role, hello.senderPid});
+        g_clients.push_back({pipe, hello.role, hello.senderPid, hello.minor});
         initialStatus = g_status;
     }
     for (HANDLE retired : supersededAgents) DisconnectNamedPipe(retired);
@@ -1028,6 +1349,33 @@ void ClientThread(HANDLE pipe) {
         CloseHandle(pipe);
         return;
     }
+    if (hello.role == Role::Agent && hello.minor >= 3) {
+        Message target{};
+        {
+            std::lock_guard lock(g_mutex);
+            target = OutputTargetMessage();
+        }
+        if (!WriteMessage(pipe, target)) {
+            RemoveClient(pipe);
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+            return;
+        }
+    }
+    if (hello.role == Role::Ui && hello.minor >= 3 && g_discovery) {
+        const auto devices = g_discovery->Snapshot();
+        for (const auto& device : devices) {
+            auto message = NewMessage(device.online ? MessageType::DeviceFound
+                                                    : MessageType::DeviceLost, Role::Broker);
+            CopyText(message.endpointId, device.udn);
+            CopyText(message.endpointName, device.friendlyName);
+            CopyText(message.detail, device.location);
+            message.reserved[0] = device.online ? 1u : 0u;
+            message.reserved[1] = device.openHome ? 1u : 0u;
+            message.reserved[2] = device.avTransport ? 1u : 0u;
+            (void)WriteMessage(pipe, message);
+        }
+    }
     Log(L"hello complete pid=" + std::to_wstring(hello.senderPid));
     if (publishAgentBoundary) Broadcast(initialStatus, nullptr);
 
@@ -1039,7 +1387,25 @@ void ClientThread(HANDLE pipe) {
         }
         if (incoming.type == MessageType::Goodbye) break;
         if (incoming.type == MessageType::GetStatus) PublishStatus(pipe);
-        else HandleMessage(incoming, pipe);
+        else if (incoming.type == MessageType::RefreshDevices && hello.role == Role::Ui &&
+                 hello.minor >= 3) {
+            if (g_discovery) {
+                const auto devices = g_discovery->Snapshot();
+                for (const auto& device : devices) {
+                    auto message = NewMessage(device.online ? MessageType::DeviceFound
+                                                            : MessageType::DeviceLost,
+                                              Role::Broker);
+                    CopyText(message.endpointId, device.udn);
+                    CopyText(message.endpointName, device.friendlyName);
+                    CopyText(message.detail, device.location);
+                    message.reserved[0] = device.online ? 1u : 0u;
+                    message.reserved[1] = device.openHome ? 1u : 0u;
+                    message.reserved[2] = device.avTransport ? 1u : 0u;
+                    (void)WriteMessage(pipe, message);
+                }
+                g_discovery->Refresh();
+            }
+        } else HandleMessage(incoming, pipe);
     }
     RemoveClient(pipe);
     DisconnectNamedPipe(pipe);
@@ -1066,11 +1432,24 @@ int wmain() {
     g_status.enabledIntent = _wcsicmp(savedMode, L"exclusive") == 0 ? 1 : 0;
     g_status.hardwareBufferMs = ReadHardwareBufferMs();
     g_status.allowResampling = ReadAllowResampling() ? 1 : 0;
+    g_outputKind = ReadOutputKind();
+    g_dlnaUdn = ReadDlnaValue(L"device_udn");
+    g_dlnaName = ReadDlnaValue(L"device_name");
+    g_dlnaLocation = ReadDlnaValue(L"location");
+    g_dlnaBufferMs = ReadDlnaBufferMs();
+    g_manualUrls = ReadDlnaValue(L"manual_urls");
+    g_status.reserved[0] = g_outputKind;
+    if (g_outputKind != 0) {
+        CopyText(g_status.endpointId, g_dlnaUdn);
+        CopyText(g_status.endpointName, g_dlnaName);
+    }
     g_status.state = g_status.enabledIntent ? RuntimeState::WaitingForStream : RuntimeState::Off;
     Log(L"companion started pid=" + std::to_wstring(GetCurrentProcessId()) +
         L" persistedIntent=" + std::to_wstring(g_status.enabledIntent) +
         L" hardwareBufferMs=" + std::to_wstring(g_status.hardwareBufferMs) +
-        L" allowResampling=" + std::to_wstring(g_status.allowResampling));
+        L" allowResampling=" + std::to_wstring(g_status.allowResampling) +
+        L" output=" + std::to_wstring(g_outputKind) +
+        L" dlnaDevice=" + g_dlnaName);
     const auto pipeName = PipeName();
     PipeSecurity security;
     if (pipeName.empty() || !security.IsValid()) {
@@ -1079,6 +1458,27 @@ int wmain() {
         return 2;
     }
     std::wcout << L"Broker ready: " << pipeName << L'\n';
+    g_deviceBroadcastThread = std::thread(DeviceBroadcastThread);
+    g_iniWatchThread = std::thread(IniWatchThread);
+    g_discovery = std::make_unique<ammod::dlna::DlnaDiscovery>();
+    std::wstring discoveryError;
+    if (!g_discovery->Start([](const ammod::dlna::DiscoveredDevice& device) {
+            EnqueueDevice(device);
+        }, [](const std::wstring& text) {
+            Log(text);
+        }, discoveryError)) {
+        Log(L"DLNA discovery unavailable: " + discoveryError);
+    } else if (!g_manualUrls.empty()) {
+        std::wstringstream stream(g_manualUrls);
+        std::wstring url;
+        while (std::getline(stream, url, L';')) {
+            if (url.empty()) continue;
+            std::wstring error;
+            if (!g_discovery->AddManualDevice(url, error)) {
+                Log(L"manual device startup failed url=" + url + L" reason=" + error);
+            }
+        }
+    }
     if (HANDLE watcher = CreateThread(nullptr, 0, ProcessWatcher, nullptr, 0, nullptr)) {
         CloseHandle(watcher);
     } else {
@@ -1113,6 +1513,12 @@ int wmain() {
         std::thread(ClientThread, pipe).detach();
     }
     Log(L"companion shutdown complete");
+    if (g_discovery) g_discovery->Stop();
+    g_deviceBroadcastStop.store(true, std::memory_order_release);
+    g_deviceQueueCv.notify_all();
+    if (g_deviceBroadcastThread.joinable()) g_deviceBroadcastThread.join();
+    g_iniWatchStop.store(true, std::memory_order_release);
+    if (g_iniWatchThread.joinable()) g_iniWatchThread.join();
     // No host remains. Terminate detached IPC workers without destructing mutexes under them.
     ExitProcess(0);
 }
