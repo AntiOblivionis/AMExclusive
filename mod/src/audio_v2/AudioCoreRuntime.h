@@ -3,6 +3,7 @@
 #include "ApplePcmOutput.h"
 #include "ApplePcmTap.h"
 #include "AudioCoreConverterRegistry.h"
+#include "AudioSink.h"
 #include "WasapiExclusiveSink.h"
 #include "../ProcessLifetime.h"
 
@@ -97,7 +98,7 @@ struct AudioCoreRuntimeStats final {
     std::size_t bufferedFrames{};
     AudioCoreCoordinatorStats coordinator{};
     ApplePcmTapStats tap{};
-    WasapiSinkStats sink{};
+    AudioSinkStats sink{};
     AudioCorePcmFillStats pcmFill{};
 };
 
@@ -107,6 +108,8 @@ struct AudioCoreRuntimeEventSnapshot final {
     std::uint64_t epoch{};
     std::uint64_t contextToken{};
     std::uint64_t mediaGeneration{};
+    AudioSinkKind sinkKind{AudioSinkKind::Wasapi};
+    std::wstring sinkName;
     void* converter{};
     PcmFormat outputFormat{}, sourceFormat{};
     bool resampled{}, reducingBitDepth{}, sourceMappingExact{}, converting{};
@@ -134,6 +137,11 @@ public:
     void SetUiEnabled(bool enabled) noexcept;
     void SetHardwareBufferMilliseconds(std::uint32_t milliseconds) noexcept;
     void SetAllowResampling(bool enabled) noexcept;
+    // Output target changes are deferred to the next media generation while a
+    // graph is live. The current bridge cannot rebind an existing converter
+    // after SetUiEnabled(false) clears its graph identity.
+    void SetOutputTarget(AudioSinkKind kind, const DlnaTarget& target,
+                         std::uint32_t streamBufferMs) noexcept;
     bool UiEnabled() const noexcept { return uiEnabled_.load(std::memory_order_acquire); }
 
     // UI transport intents are control-plane only. They gate when the exact
@@ -304,6 +312,15 @@ private:
     std::atomic<bool> abandoned_{};
     std::atomic<std::uint32_t> hardwareBufferMs_{20};
     std::atomic<bool> allowResampling_{};
+    AudioSinkKind outputKind_{AudioSinkKind::Wasapi};
+    DlnaTarget dlnaTarget_{};
+    std::uint32_t streamBufferMs_{1500};
+    bool outputChangePending_{};
+    AudioSinkKind pendingOutputKind_{AudioSinkKind::Wasapi};
+    DlnaTarget pendingDlnaTarget_{};
+    std::uint32_t pendingStreamBufferMs_{1500};
+    std::uint64_t nativePumpLowWaterFrames_{};
+    std::uint64_t nativePumpHighWaterFrames_{};
     HANDLE wakeEvent_{};
     HANDLE workerThread_{};
 

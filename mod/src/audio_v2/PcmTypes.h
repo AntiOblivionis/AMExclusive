@@ -177,6 +177,45 @@ inline bool PackCanonicalPcm32(const std::int32_t* source,
     return false;
 }
 
+// Network LPCM in big-endian byte order, as RFC 3551 (audio/L16) and RFC 3190
+// (audio/L24) require. PackCanonicalPcm32 produces little-endian bytes, which
+// a conforming renderer decodes as a byte-swapped waveform - audibly noise.
+// This is a pure byte-order transform of the same canonical samples.
+inline bool PackLpcmNetworkOrder(const std::int32_t* source,
+                                 BYTE* destination,
+                                 std::size_t sampleCount,
+                                 std::uint16_t containerBits) noexcept {
+    if ((!source || !destination) && sampleCount != 0) return false;
+    if (containerBits == 32) {
+        for (std::size_t index = 0; index < sampleCount; ++index) {
+            const auto value = static_cast<std::uint32_t>(source[index]);
+            destination[index * 4u] = static_cast<BYTE>(value >> 24u);
+            destination[index * 4u + 1u] = static_cast<BYTE>(value >> 16u);
+            destination[index * 4u + 2u] = static_cast<BYTE>(value >> 8u);
+            destination[index * 4u + 3u] = static_cast<BYTE>(value);
+        }
+        return true;
+    }
+    if (containerBits == 24) {
+        for (std::size_t index = 0; index < sampleCount; ++index) {
+            const auto value = static_cast<std::uint32_t>(source[index]) >> 8u;
+            destination[index * 3u] = static_cast<BYTE>(value >> 16u);
+            destination[index * 3u + 1u] = static_cast<BYTE>(value >> 8u);
+            destination[index * 3u + 2u] = static_cast<BYTE>(value);
+        }
+        return true;
+    }
+    if (containerBits == 16) {
+        for (std::size_t index = 0; index < sampleCount; ++index) {
+            const auto value = static_cast<std::uint32_t>(source[index]) >> 16u;
+            destination[index * 2u] = static_cast<BYTE>(value >> 8u);
+            destination[index * 2u + 1u] = static_cast<BYTE>(value);
+        }
+        return true;
+    }
+    return false;
+}
+
 inline bool MakeWasapiFormat(const PcmFormat& source, WAVEFORMATEXTENSIBLE& output,
                              bool allowConversion = false) noexcept {
     if (!IsValidEndpointFormat(source, allowConversion)) return false;

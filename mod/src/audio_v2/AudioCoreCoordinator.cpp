@@ -1,4 +1,6 @@
 #include "AudioCoreCoordinator.h"
+#include "DlnaLog.h"
+#include "DlnaSink.h"
 
 #include <new>
 
@@ -36,7 +38,22 @@ HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) n
 
     try {
         queue_ = std::make_unique<PcmQueue>(config.queueCapacity);
+        // Pin the capture queue: the real-time P0 callback writes straight into
+        // it, and a page fault there is an audible dropout. Best effort - the
+        // queue works unchanged if the working-set quota refuses the lock.
+        const bool queueLocked = queue_->LockMemory();
+        if (config.sinkKind == AudioSinkKind::Dlna) {
+            LogDlnaLine(L"capture queue=" + std::to_wstring(queue_->LockableBytes() / 1024u) +
+                        L"KB locked=" + std::to_wstring(queueLocked ? 1 : 0));
+        }
+        if (config.sinkKind == AudioSinkKind::Dlna) {
+            sink_ = std::make_unique<DlnaSink>();
+        } else {
+            sink_ = std::make_unique<WasapiExclusiveSink>();
+        }
     } catch (const std::bad_alloc&) {
+        sink_.reset();
+        queue_.reset();
         gate_.SetUiEnabled(false);
         CloseHandle(sourceReadyEvent_);
         sourceReadyEvent_ = nullptr;
@@ -61,8 +78,7 @@ HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) n
 }
 
 void AudioCoreCoordinator::Disable() noexcept {
-    if (!gate_.UiEnabled() && !queue_ && !source_ && !sourceReadyEvent_ &&
-        sink_.State() == WasapiSinkState::Closed) {
+    if (!gate_.UiEnabled() && !queue_ && !source_ && !sourceReadyEvent_ && !sink_) {
         return;
     }
 
@@ -72,11 +88,15 @@ void AudioCoreCoordinator::Disable() noexcept {
     outputGate_.Reset();
     gate_.SetUiEnabled(false);
     if (sourceReadyEvent_) SetEvent(sourceReadyEvent_);
-    sink_.Stop();
-    sink_.Close();
+    if (sink_) {
+        sink_->Stop();
+        sink_->Close();
+        sink_.reset();
+    }
     resampledSource_.Reset();
     source_.reset();
     if (queue_) queue_->Clear();
+    if (queue_) queue_->UnlockMemory();
     queue_.reset();
     if (sourceReadyEvent_) {
         CloseHandle(sourceReadyEvent_);
@@ -92,7 +112,7 @@ bool AudioCoreCoordinator::PushResult(bool pushed, std::uint32_t frames) noexcep
         // The producer notification exists only to restart a sink that had to
         // stop for source starvation. Signaling it for every healthy P0 block
         // needlessly wakes the real-time render thread at producer cadence.
-        if (sourceReadyEvent_ && sink_.WaitingForSource()) SetEvent(sourceReadyEvent_);
+        if (sourceReadyEvent_ && sink_ && sink_->WaitingForSource()) SetEvent(sourceReadyEvent_);
     } else {
         droppedFrames_.fetch_add(frames, std::memory_order_relaxed);
         gate_.Fail(token_);
@@ -132,23 +152,23 @@ bool AudioCoreCoordinator::PushP0Planar(std::uint64_t firstFrame,
 }
 
 HRESULT AudioCoreCoordinator::OpenEndpoint() noexcept {
-    if (!queue_ || !source_ || !gate_.CanOpenEndpoint(token_)) return E_UNEXPECTED;
+    if (!queue_ || !source_ || !sink_ || !gate_.CanOpenEndpoint(token_)) return E_UNEXPECTED;
     if (queue_->Size() == 0) return E_PENDING;
 
-    HRESULT hr = sink_.Open(config_.sink);
+    HRESULT hr = sink_->Open(config_.sink);
     if (SUCCEEDED(hr) && IsConverting()) {
-        hr = resampledSource_.Configure(*source_, sourceFormat_, sink_.Format(),
-                                         sink_.BufferFrames());
+        hr = resampledSource_.Configure(*source_, sourceFormat_, sink_->Format(),
+                                         sink_->BufferFrames());
     }
     if (FAILED(hr)) {
-        sink_.Close();
+        sink_->Close();
         resampledSource_.Reset();
         outputGate_.Reset();
         gate_.Fail(token_);
         return hr;
     }
     if (!gate_.MarkPrebuffered(token_)) {
-        sink_.Close();
+        sink_->Close();
         outputGate_.Reset();
         gate_.Fail(token_);
         return E_UNEXPECTED;
@@ -157,20 +177,20 @@ HRESULT AudioCoreCoordinator::OpenEndpoint() noexcept {
 }
 
 HRESULT AudioCoreCoordinator::Start() noexcept {
-    if (!source_ || !gate_.CanMutateAudio(token_) ||
+    if (!source_ || !sink_ || !gate_.CanMutateAudio(token_) ||
         gate_.Phase() != AudioCoreGatePhase::Prebuffered) {
         return E_UNEXPECTED;
     }
-    const HRESULT hr = sink_.Start(ActiveSource());
+    const HRESULT hr = sink_->Start(ActiveSource());
     if (FAILED(hr)) {
         outputGate_.Reset();
-        sink_.Close();
+        sink_->Close();
         gate_.Fail(token_);
         return hr;
     }
     if (!outputGate_.CommitCutover(token_)) {
-        sink_.Stop();
-        sink_.Close();
+        sink_->Stop();
+        sink_->Close();
         outputGate_.Rollback(token_);
         return E_UNEXPECTED;
     }
@@ -178,17 +198,17 @@ HRESULT AudioCoreCoordinator::Start() noexcept {
 }
 
 void AudioCoreCoordinator::PauseEndpoint() noexcept {
-    if (gate_.Phase() == AudioCoreGatePhase::Active &&
-        sink_.State() == WasapiSinkState::Running) {
-        sink_.Pause();
+    if (gate_.Phase() == AudioCoreGatePhase::Active && sink_ &&
+        sink_->State() == AudioSinkState::Running) {
+        sink_->Pause();
     }
 }
 
 HRESULT AudioCoreCoordinator::ResumeEndpoint() noexcept {
-    if (!source_ || gate_.Phase() != AudioCoreGatePhase::Active) return E_UNEXPECTED;
-    if (sink_.State() == WasapiSinkState::Running) return S_OK;
-    if (sink_.State() != WasapiSinkState::Open) return E_UNEXPECTED;
-    return sink_.Start(ActiveSource());
+    if (!source_ || !sink_ || gate_.Phase() != AudioCoreGatePhase::Active) return E_UNEXPECTED;
+    if (sink_->State() == AudioSinkState::Running) return S_OK;
+    if (sink_->State() != AudioSinkState::Open) return E_UNEXPECTED;
+    return sink_->Start(ActiveSource());
 }
 
 IIntegerPcmSource& AudioCoreCoordinator::ActiveSource() noexcept {

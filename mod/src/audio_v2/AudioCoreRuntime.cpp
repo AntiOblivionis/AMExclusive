@@ -232,6 +232,35 @@ void AudioCoreRuntime::SetAllowResampling(bool enabled) noexcept {
     allowResampling_.store(enabled, std::memory_order_release);
 }
 
+void AudioCoreRuntime::SetOutputTarget(AudioSinkKind kind, const DlnaTarget& target,
+                                       std::uint32_t streamBufferMs) noexcept {
+    if (abandoned_.load(std::memory_order_acquire)) return;
+    if (streamBufferMs < 200) streamBufferMs = 200;
+    if (streamBufferMs > 3000) streamBufferMs = 3000;
+    ControlScope lock(*this);
+    if (kind == outputKind_ && target.udn == dlnaTarget_.udn &&
+        target.friendlyName == dlnaTarget_.friendlyName &&
+        target.location == dlnaTarget_.location &&
+        streamBufferMs == streamBufferMs_) {
+        return;
+    }
+    if (graphBound_ || graphConverter_ ||
+        boundConverter_.load(std::memory_order_acquire) != nullptr ||
+        coordinator_.Phase() != AudioCoreGatePhase::Off) {
+        // The bridge cannot rebind an existing converter after its graph
+        // identity was cleared, so apply at the next natural converter item.
+        outputChangePending_ = true;
+        pendingOutputKind_ = kind;
+        pendingDlnaTarget_ = target;
+        pendingStreamBufferMs_ = streamBufferMs;
+        Wake();
+        return;
+    }
+    outputKind_ = kind;
+    dlnaTarget_ = target;
+    streamBufferMs_ = streamBufferMs;
+}
+
 void AudioCoreRuntime::OnTransportPlayPause(std::uint64_t revision) noexcept {
     if (!UiEnabled()) return;
     ControlScope lock(*this);
@@ -1439,7 +1468,7 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
             ControlScope lock(*this);
             nextDiagnosticTelemetryTick_ = 0;
             if (graphBound_ && coordinator_.SinkState() == WasapiSinkState::Faulted) {
-                HRESULT sinkError = coordinator_.Sink().Stats().lastError;
+                HRESULT sinkError = coordinator_.SinkStats().lastError;
                 if (SUCCEEDED(sinkError)) sinkError = E_UNEXPECTED;
                 uiEnabled_.store(false, std::memory_order_release);
                 Emit(AudioCoreRuntimeEvent::Faulted, sinkError);
@@ -1531,6 +1560,8 @@ void AudioCoreRuntime::Emit(AudioCoreRuntimeEvent event, HRESULT result) noexcep
     snapshot.contextToken = callbacks_.captureEventContext
         ? callbacks_.captureEventContext(callbacks_.context) : 0;
     snapshot.mediaGeneration = boundMediaGeneration_.load(std::memory_order_acquire);
+    snapshot.sinkKind = coordinator_.SinkKind();
+    snapshot.sinkName = dlnaTarget_.friendlyName;
     snapshot.converter = BoundConverter();
     snapshot.outputFormat = coordinator_.OutputFormat();
     snapshot.sourceFormat = coordinator_.SourceFormat();
@@ -1540,7 +1571,7 @@ void AudioCoreRuntime::Emit(AudioCoreRuntimeEvent event, HRESULT result) noexcep
     snapshot.converting = coordinator_.IsConverting();
     if (event == AudioCoreRuntimeEvent::Telemetry) snapshot.stats = Stats();
     else if (event == AudioCoreRuntimeEvent::Faulted)
-        snapshot.stats.sink = coordinator_.Sink().Stats();
+        snapshot.stats.sink = coordinator_.SinkStats();
     std::lock_guard lock(pendingEventMutex_);
     if (pendingEventCount_ < pendingEvents_.size()) {
         pendingEvents_[pendingEventCount_++] = snapshot;
@@ -1624,12 +1655,18 @@ AudioCoreRuntimeStats AudioCoreRuntime::Stats() const noexcept {
     pcmFill.lastResult = lastFillResult_.load(std::memory_order_acquire);
     pcmFill.lastProducedPackets = lastProducedPackets_.load(std::memory_order_acquire);
     return AudioCoreRuntimeStats{
-        coordinator.BufferedFrames(), coordinator.Stats(), tap_.Stats(), coordinator.Sink().Stats(),
+        coordinator.BufferedFrames(), coordinator.Stats(), tap_.Stats(), coordinator.SinkStats(),
         pcmFill,
     };
 }
 
 void AudioCoreRuntime::TryBindGraphLocked() noexcept {
+    if (outputChangePending_) {
+        outputKind_ = pendingOutputKind_;
+        dlnaTarget_ = pendingDlnaTarget_;
+        streamBufferMs_ = pendingStreamBufferMs_;
+        outputChangePending_ = false;
+    }
     if (!UiEnabled() || !graphUnit_ || graphRate_ < 8000 || graphRate_ > 768000 ||
         graphChannels_ != 2) return;
     if (!graphConverter_ && graphSourceBits_ != 0) {
@@ -1694,6 +1731,9 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     PcmFormat format{};
     if (!BuildFormat(snapshot, format)) return;
     AudioCoreCoordinatorConfig config{};
+    config.sinkKind = outputKind_;
+    config.sink.streamBufferMs = streamBufferMs_;
+    config.sink.dlna = dlnaTarget_;
     config.sink.format = format;
     config.sink.allowResampling = allowConversion;
     // A new generation after a known pause reopens the physical stream. Keep
@@ -1753,9 +1793,29 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     // Cut over only after roughly 100 ms is already captured. A single 20 ms
     // device period was too easy to drain during transient CPU scheduling load;
     // this remains far below the old second-scale reservoir that hurt controls.
+    // DLNA additionally needs its configured network reservoir before the
+    // device is told to play; the queue has room for 5-12 seconds of P0.
     requiredPrebufferFrames_ = std::max<std::uint32_t>(
         config.sink.periodFrames ? config.sink.periodFrames * 5u : 0u,
         std::max<std::uint32_t>(1u, format.sampleRate / 10u));
+    if (outputKind_ == AudioSinkKind::Dlna) {
+        const auto networkFrames = static_cast<std::uint64_t>(format.sampleRate) *
+            std::max<std::uint32_t>(streamBufferMs_, 200u) / 1000u;
+        requiredPrebufferFrames_ = std::max<std::uint32_t>(
+            requiredPrebufferFrames_,
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(networkFrames, 4000000u)));
+    }
+    const auto rate = static_cast<std::uint64_t>(format.sampleRate);
+    if (outputKind_ == AudioSinkKind::Dlna) {
+        // Keep the reservoir near the configured target. The existing 9/10/11 ms
+        // software pump performs the coarse drift correction; +/-10% covers
+        // ordinary DAC clock drift with a 1-1.5 s reservoir.
+        nativePumpLowWaterFrames_ = rate * std::max<std::uint32_t>(streamBufferMs_ / 2u, 300u) / 1000u;
+        nativePumpHighWaterFrames_ = rate * (streamBufferMs_ + 500u) / 1000u;
+    } else {
+        nativePumpLowWaterFrames_ = rate * 3u / 10u;
+        nativePumpHighWaterFrames_ = rate / 2u;
+    }
     nativePumpSampleRate_.store(format.sampleRate, std::memory_order_release);
     nativePumpBufferedFrames_.store(
         static_cast<std::uint64_t>(coordinator_.BufferedFrames()),
@@ -2089,8 +2149,10 @@ std::uint32_t AudioCoreRuntime::NativePumpPeriodMs() const noexcept {
     // Keep a modest load-jitter reservoir without returning to the old 1+ s
     // pause-latency buffer. 300-500 ms gives the producer substantially more
     // scheduling headroom while the 9/10/11 ms loop still corrects clock drift.
-    const std::uint64_t lowWaterFrames = NativePumpLowWaterFrames(sampleRate);
-    const std::uint64_t highWaterFrames = sampleRate / 2u;
+    const std::uint64_t lowWaterFrames = nativePumpLowWaterFrames_ != 0
+        ? nativePumpLowWaterFrames_ : NativePumpLowWaterFrames(sampleRate);
+    const std::uint64_t highWaterFrames = nativePumpHighWaterFrames_ != 0
+        ? nativePumpHighWaterFrames_ : static_cast<std::uint64_t>(sampleRate) / 2u;
     if (bufferedFrames < lowWaterFrames) return kCatchUpMs;
     if (bufferedFrames > highWaterFrames) return kBackOffMs;
     return kNominalMs;

@@ -41,6 +41,22 @@ WasapiExclusiveSink::~WasapiExclusiveSink() {
     Close();
 }
 
+HRESULT WasapiExclusiveSink::Open(const AudioSinkOpenParams& params) noexcept {
+    WasapiSinkConfig config{};
+    config.format = params.format;
+    config.formatCandidates = params.formatCandidates;
+    config.formatCandidateCount = params.formatCandidateCount;
+    config.endpointId = params.endpointId;
+    config.periodFrames = params.periodFrames;
+    config.alignmentRetries = params.alignmentRetries;
+    config.allowResampling = params.allowResampling;
+    config.primeWithSilence = params.primeWithSilence;
+    config.sourceReadyEvent = params.sourceReadyEvent;
+    config.lifecycleContext = params.lifecycleContext;
+    config.onLifecycle = params.onLifecycle;
+    return Open(config);
+}
+
 HRESULT WasapiExclusiveSink::Open(const WasapiSinkConfig& config) noexcept {
     Close();
     config_ = config;
@@ -934,24 +950,26 @@ void WasapiExclusiveSink::NotifyLifecycle(WasapiSinkLifecycleEvent event,
     if (config_.onLifecycle) config_.onLifecycle(config_.lifecycleContext, event, result);
 }
 
-WasapiSinkStats WasapiExclusiveSink::Stats() const noexcept {
-    return WasapiSinkStats{
-        submittedFrames_.load(std::memory_order_acquire),
-        submittedBuffers_.load(std::memory_order_acquire),
-        controlledSilenceFrames_.load(std::memory_order_acquire),
-        sourceWaits_.load(std::memory_order_acquire),
-        underruns_.load(std::memory_order_acquire),
-        getBufferFailures_.load(std::memory_order_acquire),
-        releaseBufferFailures_.load(std::memory_order_acquire),
-        static_cast<HRESULT>(lastError_.load(std::memory_order_acquire)),
-        clockPosition_.load(std::memory_order_relaxed),
-        clockTarget_.load(std::memory_order_relaxed),
-        clockFrequency_.load(std::memory_order_relaxed),
-        drainElapsedMs_.load(std::memory_order_relaxed),
-        static_cast<HRESULT>(clockReadResult_.load(std::memory_order_relaxed)),
-        clientStarts_.load(std::memory_order_acquire),
-        startsBeforeFirstBuffer_.load(std::memory_order_acquire),
-    };
+AudioSinkStats WasapiExclusiveSink::Stats() const noexcept {
+    AudioSinkStats stats{};
+    stats.kind = AudioSinkKind::Wasapi;
+    stats.state = state_.load(std::memory_order_acquire);
+    stats.submittedFrames = submittedFrames_.load(std::memory_order_acquire);
+    stats.submittedBuffers = submittedBuffers_.load(std::memory_order_acquire);
+    stats.controlledSilenceFrames = controlledSilenceFrames_.load(std::memory_order_acquire);
+    stats.sourceWaits = sourceWaits_.load(std::memory_order_acquire);
+    stats.underruns = underruns_.load(std::memory_order_acquire);
+    stats.getBufferFailures = getBufferFailures_.load(std::memory_order_acquire);
+    stats.releaseBufferFailures = releaseBufferFailures_.load(std::memory_order_acquire);
+    stats.lastError = static_cast<HRESULT>(lastError_.load(std::memory_order_acquire));
+    stats.clockPosition = clockPosition_.load(std::memory_order_relaxed);
+    stats.clockTarget = clockTarget_.load(std::memory_order_relaxed);
+    stats.clockFrequency = clockFrequency_.load(std::memory_order_relaxed);
+    stats.drainElapsedMs = drainElapsedMs_.load(std::memory_order_relaxed);
+    stats.clockReadResult = static_cast<HRESULT>(clockReadResult_.load(std::memory_order_relaxed));
+    stats.clientStarts = clientStarts_.load(std::memory_order_acquire);
+    stats.startsBeforeFirstBuffer = startsBeforeFirstBuffer_.load(std::memory_order_acquire);
+    return stats;
 }
 
 } // namespace ammod::audio_v2

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AudioCoreGate.h"
+#include "AudioSink.h"
 #include "AppleOutputGate.h"
 #include "BitPerfectVerifier.h"
 #include "PcmQueue.h"
@@ -18,7 +19,8 @@
 namespace ammod::audio_v2 {
 
 struct AudioCoreCoordinatorConfig final {
-    WasapiSinkConfig sink{};
+    AudioSinkKind sinkKind{AudioSinkKind::Wasapi};
+    AudioSinkOpenParams sink{};
     std::size_t queueCapacity{8};
     std::uint64_t mediaGeneration{1};
     PcmMappingPolicy mappingPolicy{PcmMappingPolicy::ExactSourceInteger};
@@ -71,29 +73,42 @@ public:
     AudioCoreGatePhase Phase() const noexcept { return gate_.Phase(); }
     // Requested output until the endpoint opens, then its negotiated format.
     const PcmFormat& OutputFormat() const noexcept {
-        return sink_.State() == WasapiSinkState::Closed ? config_.sink.format : sink_.Format();
+        return !sink_ || sink_->State() == AudioSinkState::Closed
+            ? config_.sink.format : sink_->Format();
     }
     const PcmFormat& SourceFormat() const noexcept { return sourceFormat_; }
     bool IsSourceMappingExact() const noexcept {
         return config_.mappingPolicy == PcmMappingPolicy::ExactSourceInteger;
     }
     bool IsResampling() const noexcept {
-        return sink_.State() != WasapiSinkState::Closed &&
-               sink_.Format().sampleRate != sourceFormat_.sampleRate;
+        return sink_ && sink_->State() != AudioSinkState::Closed &&
+               sink_->Format().sampleRate != sourceFormat_.sampleRate;
     }
     bool IsReducingBitDepth() const noexcept {
-        return sink_.State() != WasapiSinkState::Closed &&
-            sink_.Format().validBits < EffectiveSourceValidBits(sourceFormat_);
+        return sink_ && sink_->State() != AudioSinkState::Closed &&
+            sink_->Format().validBits < EffectiveSourceValidBits(sourceFormat_);
     }
     bool IsConverting() const noexcept {
-        return sink_.State() != WasapiSinkState::Closed &&
-            RequiresPcmConversion(sourceFormat_, sink_.Format());
+        return sink_ && sink_->State() != AudioSinkState::Closed &&
+            RequiresPcmConversion(sourceFormat_, sink_->Format());
     }
     std::uint64_t MediaGeneration() const noexcept { return config_.mediaGeneration; }
     const AudioCoreCoordinatorStats Stats() const noexcept;
-    const WasapiExclusiveSink& Sink() const noexcept { return sink_; }
-    WasapiSinkState SinkState() const noexcept { return sink_.State(); }
-    void SetSinkResumeBlocked(bool blocked) noexcept { sink_.SetResumeBlocked(blocked); }
+    AudioSinkStats SinkStats() const noexcept {
+        return sink_ ? sink_->Stats() : AudioSinkStats{};
+    }
+    AudioSinkState SinkState() const noexcept {
+        return sink_ ? sink_->State() : AudioSinkState::Closed;
+    }
+    AudioSinkKind SinkKind() const noexcept {
+        return sink_ ? sink_->Kind() : config_.sinkKind;
+    }
+    std::uint32_t BufferFrames() const noexcept {
+        return sink_ ? sink_->BufferFrames() : 0;
+    }
+    void SetSinkResumeBlocked(bool blocked) noexcept {
+        if (sink_) sink_->SetResumeBlocked(blocked);
+    }
     std::size_t BufferedBlocks() const noexcept { return queue_ ? queue_->Size() : 0; }
     std::size_t BufferedFrames() const noexcept {
         return queue_ ? queue_->QueuedFrames() : 0;
@@ -109,9 +124,9 @@ public:
         // when the worker observes EOS. Always let it see the producer seal;
         // independent queue/staging snapshots cannot prove that it is empty.
         return PendingSourceFrames() != 0 ||
-            (sink_.State() != WasapiSinkState::Closed &&
-             (IsConverting() || sink_.Stats().submittedFrames != 0) &&
-             !sink_.EndOfStreamComplete());
+            (sink_ && sink_->State() != AudioSinkState::Closed &&
+             (IsConverting() || sink_->Stats().submittedFrames != 0) &&
+             !sink_->EndOfStreamComplete());
     }
     bool SealEndOfStream() noexcept {
         if (!queue_) return false;
@@ -119,8 +134,12 @@ public:
         if (sourceReadyEvent_) SetEvent(sourceReadyEvent_);
         return true;
     }
-    bool EndOfStreamSubmitted() const noexcept { return sink_.EndOfStreamSubmitted(); }
-    bool EndOfStreamComplete() const noexcept { return sink_.EndOfStreamComplete(); }
+    bool EndOfStreamSubmitted() const noexcept {
+        return sink_ && sink_->EndOfStreamSubmitted();
+    }
+    bool EndOfStreamComplete() const noexcept {
+        return sink_ && sink_->EndOfStreamComplete();
+    }
 
 private:
     bool PushResult(bool pushed, std::uint32_t frames) noexcept;
@@ -135,7 +154,7 @@ private:
     std::optional<QueuedPcmSource> source_;
     ResampledPcmSource resampledSource_;
     BitPerfectVerifier verifier_{};
-    WasapiExclusiveSink sink_{};
+    std::unique_ptr<IAudioSink> sink_;
     HANDLE sourceReadyEvent_{};
     std::uint64_t nextSequence_{};
     std::atomic<std::uint64_t> capturedFrames_{};

@@ -7,6 +7,7 @@
 #include <winrt/Windows.Media.Control.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -115,7 +116,93 @@ bool RestartCurrentItem(const GlobalSystemMediaTransportControlsSession& session
 
 } // namespace
 
+namespace {
+
+// The DLNA sink needs two facts about the track that Apple Music is playing:
+// how long it is (the served WAV has to declare a length before its first byte
+// leaves) and when it changes (a new track needs a new URL, because the WAV
+// header carries the sample rate). Both live in SMTC, but reading them costs a
+// WinRT round trip, so this process reads them once and streams the result on
+// stdout instead of letting the audio path poll.
+//
+// Wire format, one line per refresh:
+//   TRACK<TAB>durationMs<TAB>title
+// A line is emitted when the timeline end changes and every few seconds after
+// that, so the reader can tell "no news" apart from "the helper died".
+constexpr std::uint32_t kPollMs = 800;
+constexpr std::uint64_t kRefreshMs = 3000;
+
+void WriteUtf8Line(const std::wstring& text) {
+    if (text.empty()) return;
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+                                          static_cast<int>(text.size()),
+                                          nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return;
+    std::string utf8(static_cast<std::size_t>(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                        utf8.data(), bytes, nullptr, nullptr);
+    std::fwrite(utf8.data(), 1, utf8.size(), stdout);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+}
+
+int WatchTracks() {
+    init_apartment(apartment_type::multi_threaded);
+    auto manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
+    GlobalSystemMediaTransportControlsSession session{nullptr};
+    std::int64_t lastEnd100ns = -1;
+    std::wstring title;
+    std::uint64_t lastPrint = 0;
+    for (;;) {
+        try {
+            if (!session) {
+                for (const auto& candidate : manager.GetSessions()) {
+                    const std::wstring source = candidate.SourceAppUserModelId().c_str();
+                    if (source.find(L"AppleMusic") != std::wstring::npos) {
+                        session = candidate;
+                        break;
+                    }
+                }
+            }
+            if (session) {
+                const auto timeline = session.GetTimelineProperties();
+                const auto end100ns =
+                    (timeline.EndTime() - timeline.StartTime()).count();
+                const auto now = GetTickCount64();
+                if (end100ns != lastEnd100ns) {
+                    // A different timeline end means a different item: fetch the
+                    // metadata once here rather than on every poll.
+                    const auto media = session.TryGetMediaPropertiesAsync().get();
+                    title = media.Title().c_str();
+                    lastEnd100ns = end100ns;
+                    WriteUtf8Line(L"TRACK\t" +
+                                  std::to_wstring(end100ns > 0 ? end100ns / 10000 : 0) +
+                                  L"\t" + title);
+                    lastPrint = now;
+                } else if (now - lastPrint >= kRefreshMs) {
+                    WriteUtf8Line(L"TRACK\t" +
+                                  std::to_wstring(end100ns > 0 ? end100ns / 10000 : 0) +
+                                  L"\t" + title);
+                    lastPrint = now;
+                }
+            }
+        } catch (...) {
+            // Apple Music closing, or the session going stale, surfaces as a
+            // COM failure. Drop it and look again; the reader simply keeps the
+            // last value until a new line arrives.
+            session = nullptr;
+            lastEnd100ns = -1;
+        }
+        Sleep(kPollMs);
+    }
+}
+
+} // namespace
+
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 2 && _wcsicmp(argv[1], L"watch") == 0) {
+        return WatchTracks();
+    }
     if (argc != 2 || (_wcsicmp(argv[1], L"restart-current") != 0 &&
                       _wcsicmp(argv[1], L"reject-current") != 0)) return 2;
 

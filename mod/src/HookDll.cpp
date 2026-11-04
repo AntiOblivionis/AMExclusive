@@ -1281,13 +1281,23 @@ void RefreshConfiguredAudioQuality() {
     const unsigned char lossless = g_cfPreferencesGetAppBooleanValue(
         g_losslessEnabledPreferenceKey, g_cfPreferencesCurrentApplication, &losslessExists);
     const bool known = qualityExists && losslessExists && quality >= 0 && quality <= 0xFFFF;
+    std::uint16_t tier = known ? static_cast<std::uint16_t>(quality) : 0;
     if (known) {
-        g_configuredStreamQuality.store(static_cast<std::uint16_t>(quality),
-                                        std::memory_order_release);
+        // Apple only offers the Hi-Res tier (20) when it believes an external
+        // DAC is attached; on any other endpoint it caps the request at plain
+        // lossless (15), so 24/192 is never even considered. Raising the tier
+        // here only widens the ceiling: the selection policy still takes the
+        // highest rate the item actually carries and falls back to 44.1 ALAC
+        // when no Hi-Res variant exists, so this cannot invent a stream.
+        if (lossless != 0 && tier == 15 && ReadBool(L"force_hires", true)) {
+            tier = 20;
+        }
+        g_configuredStreamQuality.store(tier, std::memory_order_release);
         g_configuredLosslessEnabled.store(lossless != 0, std::memory_order_release);
     }
     g_configuredQualityKnown.store(known, std::memory_order_release);
     Log(L"Apple preferences audio quality=" + std::to_wstring(quality) +
+        L" effectiveTier=" + std::to_wstring(tier) +
         L" qualityExists=" + std::to_wstring(qualityExists) +
         L" losslessEnabled=" + std::to_wstring(static_cast<unsigned int>(lossless)) +
         L" losslessExists=" + std::to_wstring(losslessExists));
@@ -1781,7 +1791,8 @@ void SendAgentEvent(ammod::ipc::MessageType type, ammod::ipc::RuntimeState state
                     ammod::ipc::ErrorCategory category = ammod::ipc::ErrorCategory::None,
                     const std::wstring& detail = {},
                     const std::wstring& displayFormat = {},
-                    std::uint64_t contextToken = 0, std::uint64_t eventEpoch = 0) {
+                    std::uint64_t contextToken = 0, std::uint64_t eventEpoch = 0,
+                    const std::wstring& endpointName = {}) {
     using namespace ammod::ipc;
     if (!g_ipcConnected.load()) return;
     auto message = NewMessage(type, Role::Agent);
@@ -1791,6 +1802,7 @@ void SendAgentEvent(ammod::ipc::MessageType type, ammod::ipc::RuntimeState state
     message.hresult = hr;
     message.error = category;
     CopyText(message.endpointId, endpoint);
+    CopyText(message.endpointName, endpointName);
     CopyText(message.format, displayFormat.empty() ? FormatText(format) : displayFormat);
     CopyText(message.detail, detail);
     std::lock_guard lock(g_outboundMutex);
@@ -1872,8 +1884,11 @@ void AudioCoreRuntimeEventCallback(void*, const ammod::audio_v2::AudioCoreRuntim
         SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
                        ammod::ipc::RuntimeState::Active, true, {}, nullptr, S_OK,
                        ammod::ipc::ErrorCategory::None,
-                       (floatOutput || !sourceMappingExact) ? L"converted" : depthReduced ? (resampled ? L"resampled-requantized" : L"requantized") :
-                           (resampled ? L"resampled" : L"native"), displayFormat, snapshot.contextToken, snapshot.epoch);
+                       snapshot.sinkKind == ammod::audio_v2::AudioSinkKind::Dlna
+                           ? (converted ? L"dlna-converted" : L"dlna")
+                           : (floatOutput || !sourceMappingExact) ? L"converted" : depthReduced ? (resampled ? L"resampled-requantized" : L"requantized") :
+                               (resampled ? L"resampled" : L"native"),
+                       displayFormat, snapshot.contextToken, snapshot.epoch, snapshot.sinkName);
         break;
     }
     case ammod::audio_v2::AudioCoreRuntimeEvent::Faulted: {
@@ -3608,6 +3623,20 @@ DWORD WINAPI PipeClientLoop(void*) {
                     std::to_wstring(static_cast<unsigned>(incoming.state)) +
                     L" hardwareBufferMs=" + std::to_wstring(hardwareBufferMs) +
                     L" allowResampling=" + std::to_wstring(incoming.allowResampling));
+            } else if (incoming.type == MessageType::SetOutputTarget) {
+                ammod::audio_v2::DlnaTarget target{};
+                target.udn = incoming.endpointId;
+                target.friendlyName = incoming.endpointName;
+                target.location = incoming.detail;
+                const auto kind = incoming.enabledIntent
+                    ? ammod::audio_v2::AudioSinkKind::Dlna
+                    : ammod::audio_v2::AudioSinkKind::Wasapi;
+                const auto streamBufferMs = incoming.hardwareBufferMs
+                    ? incoming.hardwareBufferMs : 1500u;
+                g_audioCoreRuntime.SetOutputTarget(kind, target, streamBufferMs);
+                Log(L"output target received kind=" + std::to_wstring(
+                        static_cast<unsigned>(kind)) + L" device=" + target.friendlyName +
+                    L" location=" + target.location);
             } else if (incoming.type == MessageType::TransportIntent) {
                 if (wcscmp(incoming.detail, L"play_pause") == 0) {
                     g_audioCoreRuntime.OnTransportPlayPause(incoming.generation);
