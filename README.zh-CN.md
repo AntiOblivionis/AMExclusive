@@ -79,6 +79,8 @@
 5. **DLNA / OpenHome 输出** —— SSDP 发现、`ConnectionManager.GetSinkProtocolInfo`
    格式协商、OpenHome `Playlist.DeleteAll + Insert + Play` 控制。网播通过 HTTP 从
    Apple Music 进程内的服务器拉取 WAV/LPCM 流。每首歌开启新 URL，并重新协商采样率与位深。
+   网播以 **UDN 而非地址**作为身份：这类设备每隔几分钟就会重新绑定 HTTP 端口，
+   因此开流失败时会按 UDN 重新发 M-SEARCH 解析描述地址，而不是反复重试已失效的旧地址。
 6. **文件形态的实时流** —— `LightningPlayer` 一类网播遇到没有总长度的响应体会直接报
    "不支持此类格式"。因此本分支声明 `Content-Length`、支持 `Accept-Ranges: bytes`，
    对 `Range: bytes=N-` 返回 `206 + Content-Range`。音频仍然是实时产生的，声明长度只是上限。

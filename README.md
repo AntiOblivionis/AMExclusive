@@ -87,7 +87,9 @@ the lock is active. Other versions and devices are not guaranteed to work.
    format negotiation, and OpenHome `Playlist.DeleteAll + Insert + Play` control.
    The renderer pulls a WAV/LPCM stream over HTTP from a server hosted inside the
    Apple Music process. Every track opens a new URL and renegotiates the sample rate
-   and bit depth.
+   and bit depth. The renderer is identified by **UDN, not by address**: these
+   devices re-bind their HTTP port every few minutes, so a failed open re-resolves
+   the description URL from a live M-SEARCH instead of retrying a stale one.
 6. **File-shaped live stream** — renderers of the `LightningPlayer` class refuse a body
    with no total length. The stream therefore announces `Content-Length`, honours
    `Accept-Ranges: bytes`, and answers `Range: bytes=N-` with `206 + Content-Range`.

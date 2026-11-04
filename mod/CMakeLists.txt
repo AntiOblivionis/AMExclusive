@@ -23,12 +23,14 @@ add_executable(am_exclusive_dlna_selftest EXCLUDE_FROM_ALL
   tests/DlnaSelfTest.cpp
   src/audio_v2/DlnaControlClient.cpp
   src/audio_v2/DlnaLog.cpp
+  src/audio_v2/DlnaResolve.cpp
   src/audio_v2/DlnaSink.cpp
   src/audio_v2/DlnaStreamServer.cpp
   src/UpnpXml.cpp)
 target_include_directories(am_exclusive_dlna_selftest PRIVATE src)
 target_compile_definitions(am_exclusive_dlna_selftest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(am_exclusive_dlna_selftest PRIVATE ole32 oleaut32 uuid ws2_32 winhttp msxml6)
+target_link_libraries(am_exclusive_dlna_selftest PRIVATE ole32 oleaut32 uuid ws2_32 winhttp
+  msxml6 iphlpapi)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -76,6 +78,7 @@ add_library(am_exclusive_hook SHARED
   src/audio_v2/AudioCoreRuntime.cpp
   src/audio_v2/DlnaControlClient.cpp
   src/audio_v2/DlnaLog.cpp
+  src/audio_v2/DlnaResolve.cpp
   src/audio_v2/DlnaSink.cpp
   src/audio_v2/DlnaStreamServer.cpp
   src/audio_v2/NativeRenderGateProxy.cpp
@@ -86,7 +89,7 @@ target_include_directories(am_exclusive_hook PRIVATE
   src "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/rigtorp-SPSCQueue/include")
 target_compile_definitions(am_exclusive_hook PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(am_exclusive_hook PRIVATE minhook ole32 oleaut32 uuid advapi32 avrt
-  ws2_32 winhttp msxml6 bcrypt)
+  ws2_32 winhttp msxml6 bcrypt iphlpapi)
 set_target_properties(am_exclusive_hook PROPERTIES OUTPUT_NAME "am-exclusive-hook")
 
 add_library(am_exclusive_ui SHARED src/UiAdapter.cpp src/IpcTransport.cpp)

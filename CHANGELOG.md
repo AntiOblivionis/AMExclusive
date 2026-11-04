@@ -6,6 +6,29 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] - 2026-11-04
+
+### Fixed
+
+- **DLNA output no longer dies when the renderer re-binds its HTTP port.**
+  AURALiC / `LightningPlayer`-class devices pick a new UPnP port every few
+  minutes while staying up, so the `location` cached in `am-exclusive.ini`
+  goes stale. Previously `DlnaSink::Open` retried that stale address four
+  times and gave up, leaving the renderer silent while Apple Music kept
+  playing locally.
+  - New `mod/src/audio_v2/DlnaResolve.{h,cpp}`: resolves the current
+    description URL from a live M-SEARCH by **UDN**, sending from every usable
+    IPv4 interface (the same adapter-selection strategy the broker uses) so a
+    multi-homed host does not lose the multicast.
+  - `DlnaSink::Open` now re-resolves the location by UDN when the cached
+    description fetch fails, then retries against the current URL. Measured
+    31–47 ms against a live VEGA G2.2.
+  - `Broker` now records the newest location SSDP reports and adopts it once
+    the UDN matches the bound device: it rewrites the ini and pushes a fresh
+    `SetOutputTarget` to the agent, so a running stack converges without a
+    restart or re-picking the device in the UI.
+  - `am-exclusive-hook` and the DLNA self-test now link `iphlpapi`.
+
 ## [0.2.0] - 2026-11-04
 
 First release of the OpenHome/DLNA derivative.

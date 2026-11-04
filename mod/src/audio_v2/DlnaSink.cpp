@@ -6,6 +6,7 @@
 #include "../AudioErrors.h"
 #include "../UpnpXml.h"
 #include "DlnaLog.h"
+#include "DlnaResolve.h"
 
 #include <windows.h>
 #include <oleauto.h>
@@ -551,6 +552,32 @@ HRESULT DlnaSink::Open(const AudioSinkOpenParams& params) noexcept {
             DlnaLog(L"open LoadDescription failed attempt=" + std::to_wstring(attempt) +
                     L" device=" + target_.friendlyName + L" location=" + target_.location +
                     L" reason=" + error);
+        }
+    }
+    if (!described && !target_.udn.empty()) {
+        // The UDN is the only stable identity. Renderers of the AURALiC /
+        // LightningPlayer class re-bind their UPnP HTTP port every few minutes,
+        // so the location cached in am-exclusive.ini is frequently stale while
+        // nothing else about the device changed. Re-resolve it from a live
+        // M-SEARCH instead of retrying an address that no longer listens, then
+        // retry the description fetch against the current URL.
+        std::wstring resolved;
+        if (ResolveLocationByUdn(target_.udn, 1500, resolved) &&
+            _wcsicmp(resolved.c_str(), target_.location.c_str()) != 0) {
+            DlnaLog(L"open re-resolved device=" + target_.friendlyName +
+                    L" stale=" + target_.location + L" current=" + resolved);
+            target_.location = resolved;
+            for (int attempt = 0; attempt < 2 && !described; ++attempt) {
+                if (attempt) std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                described = control_.LoadDescription(target_, error);
+                if (!described) {
+                    DlnaLog(L"open LoadDescription failed after re-resolve attempt=" +
+                            std::to_wstring(attempt) + L" location=" + target_.location +
+                            L" reason=" + error);
+                }
+            }
+        } else {
+            DlnaLog(L"open re-resolve found no new location for udn=" + target_.udn);
         }
     }
     if (!described) {

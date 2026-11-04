@@ -92,6 +92,14 @@ std::wstring g_dlnaUdn;
 std::wstring g_dlnaName;
 std::wstring g_dlnaLocation;
 std::uint32_t g_dlnaBufferMs{1500};
+// Newest location SSDP reported for a renderer. LightningPlayer-class devices
+// re-bind their UPnP HTTP port every few minutes, so the location persisted in
+// the ini goes stale while the UDN stays valid. The broadcast worker records it
+// here; IniWatchThread adopts it once it matches the bound UDN and pushes a
+// fresh SetOutputTarget, keeping every output-target mutation on one thread.
+std::mutex g_discoveredMutex;
+std::wstring g_discoveredUdn;
+std::wstring g_discoveredLocation;
 std::wstring g_manualUrls;
 std::unique_ptr<ammod::dlna::DlnaDiscovery> g_discovery;
 std::mutex g_deviceQueueMutex;
@@ -189,6 +197,17 @@ void BroadcastDevice(const ammod::dlna::DiscoveredDevice& device) {
     }
 }
 
+// Remember the newest location SSDP reported. Called from the device broadcast
+// worker; IniWatchThread consumes it so all output-target writes stay on one
+// thread. A device that only appears under a new port therefore converges
+// without a broker restart and without the user re-picking it in the UI.
+void NoteDiscoveredLocation(const ammod::dlna::DiscoveredDevice& device) {
+    if (!device.online || device.udn.empty() || device.location.empty()) return;
+    std::lock_guard lock(g_discoveredMutex);
+    g_discoveredUdn = device.udn;
+    g_discoveredLocation = device.location;
+}
+
 void EnqueueDevice(const ammod::dlna::DiscoveredDevice& device) {
     {
         std::lock_guard lock(g_deviceQueueMutex);
@@ -211,6 +230,7 @@ void DeviceBroadcastThread() {
             device = std::move(g_deviceQueue.front());
             g_deviceQueue.pop_front();
         }
+        NoteDiscoveredLocation(device);
         BroadcastDevice(device);
     }
 }
@@ -236,6 +256,28 @@ void IniWatchThread() {
         for (int tick = 0; tick < 10; ++tick) {
             if (g_iniWatchStop.load(std::memory_order_acquire)) return;
             std::this_thread::sleep_for(std::chrono::seconds(1));
+            // Adopt a refreshed location as soon as SSDP reports one for the
+            // bound renderer. The ini is only a cache: the UDN is authoritative,
+            // and this class of device moves its HTTP port while it stays up.
+            if (g_outputKind == 1u && !g_dlnaUdn.empty()) {
+                std::wstring udn;
+                std::wstring location;
+                {
+                    std::lock_guard lock(g_discoveredMutex);
+                    udn = g_discoveredUdn;
+                    location = g_discoveredLocation;
+                }
+                if (!location.empty() && _wcsicmp(udn.c_str(), g_dlnaUdn.c_str()) == 0 &&
+                    _wcsicmp(location.c_str(), g_dlnaLocation.c_str()) != 0) {
+                    const auto stale = g_dlnaLocation;
+                    g_dlnaLocation = location;
+                    (void)WriteOutputTarget(g_outputKind, g_dlnaUdn, g_dlnaName,
+                                            g_dlnaLocation, g_dlnaBufferMs);
+                    Log(L"renderer location refreshed device=" + g_dlnaName +
+                        L" stale=" + stale + L" current=" + g_dlnaLocation);
+                    Broadcast(OutputTargetMessage(), nullptr);
+                }
+            }
         }
         const auto kind = ReadOutputKind();
         const auto udn = ReadDlnaValue(L"device_udn");
