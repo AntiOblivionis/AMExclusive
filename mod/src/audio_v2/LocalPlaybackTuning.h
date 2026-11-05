@@ -75,6 +75,13 @@ public:
     }
 
     // Control plane: called when a local generation is bound and at shutdown.
+    // Only the audiohost may raise its own process class. Inside Apple Music
+    // that would lift the decoder, UI and network threads together, which is
+    // worse than the audio thread's MMCSS priority.
+    static void SetProcessPriorityAllowed(bool allowed) noexcept {
+        ProcessPriorityAllowed().store(allowed, std::memory_order_release);
+    }
+
     void Configure(const LocalPlaybackTuning& requested) noexcept {
         LocalPlaybackTuning tuning = requested;
         tuning.Clamp();
@@ -172,6 +179,11 @@ private:
     using NtQueryTimerResolutionFn = long(WINAPI*)(unsigned long*, unsigned long*, unsigned long*);
     using NtSetTimerResolutionFn = long(WINAPI*)(unsigned long, unsigned char, unsigned long*);
 
+    static std::atomic<bool>& ProcessPriorityAllowed() noexcept {
+        static std::atomic<bool> allowed{false};
+        return allowed;
+    }
+
     static NtQueryTimerResolutionFn ResolveNtQueryTimerResolution() noexcept {
         const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (!ntdll) return nullptr;
@@ -256,6 +268,9 @@ private:
     }
 
     void ConfigureProcessPriority(bool enabled) noexcept {
+        if (enabled && !ProcessPriorityAllowed().load(std::memory_order_acquire)) {
+            enabled = false;
+        }
         if (enabled) {
             if (!priorityActive_) {
                 previousPriorityClass_ = GetPriorityClass(GetCurrentProcess());

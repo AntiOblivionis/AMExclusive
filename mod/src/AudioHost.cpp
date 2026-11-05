@@ -267,6 +267,11 @@ int wmain(int argc, wchar_t** argv) {
     const std::wstring spaceName = HostObjectName(kHostSpaceEventPrefix, session);
 
     HostState state{};
+    // This process is the playback engine, so process-wide tuning belongs here
+    // and only here: raise the class at startup so the pipe/ring threads are
+    // covered even before the first track opens.
+    ammod::audio_v2::LocalPlaybackTuningRuntime::SetProcessPriorityAllowed(true);
+    ammod::audio_v2::LocalPlaybackTuningRuntime::Instance().Configure(ReadTuning());
     ammod::audio_v2::SetHardWorkingSetFloorEnabled(true);
     const bool largePagePrivilege = EnableLockMemoryPrivilege();
     Log(largePagePrivilege ? L"lock-memory privilege enabled"
