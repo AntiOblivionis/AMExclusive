@@ -2646,6 +2646,66 @@ Controls::Border CreateOutputTargetCard(
     shapeRow.Children().Append(shapeCombo);
     networkPanel.Children().Append(shapeRow);
 
+    // Pull buffer: start/seek latency versus network jitter tolerance. Like the
+    // stream format it writes straight to the shared ini; the hook reads it when
+    // the next track opens, so no save button is involved.
+    Controls::StackPanel bufferRow;
+    bufferRow.Orientation(Controls::Orientation::Horizontal);
+    bufferRow.Spacing(8.0);
+    bufferRow.Margin(Xaml::Thickness{0, 4, 0, 0});
+    Controls::TextBlock bufferLabel;
+    bufferLabel.Text(Localized(L"拉流缓冲", L"Pull buffer"));
+    bufferLabel.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    bufferLabel.MinWidth(120.0);
+    Controls::ComboBox bufferCombo;
+    bufferCombo.Name(L"AMExclusiveDlnaBufferCombo");
+    bufferCombo.MinWidth(160.0);
+    bufferCombo.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    {
+        const wchar_t* names[5][2] = {
+            {L"1.5 秒", L"1.5 s"}, {L"2 秒", L"2 s"}, {L"3 秒", L"3 s"},
+            {L"5 秒", L"5 s"}, {L"8 秒", L"8 s"}};
+        for (const auto& name : names) {
+            Controls::ComboBoxItem item;
+            item.Content(box_value(Localized(name[0], name[1])));
+            bufferCombo.Items().Append(item);
+        }
+    }
+    {
+        static constexpr int kBufferMs[5] = {1500, 2000, 3000, 5000, 8000};
+        const int saved = ReadIniInt(L"dlna", L"buffer_ms", 1500);
+        int best = 0;
+        int bestDistance = 0x7fffffff;
+        for (int i = 0; i < 5; ++i) {
+            const int distance = saved > kBufferMs[i] ? saved - kBufferMs[i]
+                                                      : kBufferMs[i] - saved;
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = i;
+            }
+        }
+        bufferCombo.SelectedIndex(best);
+    }
+    bufferCombo.SelectionChanged([](auto&& sender, auto&&) {
+        try {
+            static constexpr int kBufferMs[5] = {1500, 2000, 3000, 5000, 8000};
+            const int index = sender.as<Controls::ComboBox>().SelectedIndex();
+            if (index < 0 || index > 4) return;
+            WriteIniText(L"dlna", L"buffer_ms", std::to_wstring(kBufferMs[index]));
+            const auto path = StreamFormatIniPath();
+            if (!path.empty()) {
+                (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+            }
+            Log(L"ui dlna buffer saved ms=" + std::to_wstring(kBufferMs[index]));
+        } catch (...) {
+        }
+    });
+    Automation::AutomationProperties::SetName(
+        bufferCombo, Localized(L"拉流缓冲", L"Pull buffer"));
+    bufferRow.Children().Append(bufferLabel);
+    bufferRow.Children().Append(bufferCombo);
+    networkPanel.Children().Append(bufferRow);
+
     Controls::StackPanel networkButtons;
     networkButtons.Orientation(Controls::Orientation::Horizontal);
     networkButtons.Spacing(8.0);
