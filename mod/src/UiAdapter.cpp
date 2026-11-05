@@ -106,6 +106,10 @@ winrt::weak_ref<Controls::ComboBox> g_localDeviceCombo;   // endpoints / drivers
 winrt::weak_ref<Controls::ToggleSwitch> g_localTuningToggle;
 winrt::weak_ref<Controls::ComboBox> g_localReservoirCombo;
 winrt::weak_ref<Controls::ToggleSwitch> g_localSystemToggle;
+// Set while the card is being built so IsOn()/SelectedIndex() do not fire a
+// save from inside construction. User interaction runs on the UI thread and
+// saves immediately; the Save button path no longer touches these controls.
+std::atomic<bool> g_suppressLocalTuningSave{true};
 winrt::weak_ref<Controls::Button> g_localTabButton;
 winrt::weak_ref<Controls::Button> g_networkTabButton;
 winrt::weak_ref<Controls::StackPanel> g_localPanel;
@@ -1927,12 +1931,14 @@ void PersistOutputSettings(const OutputSettings& settings) {
 // this section on the next SetOutputTarget, and the save path restarts the
 // current track, which is the generation boundary where it takes effect.
 void PersistLocalTuning() {
+    if (g_suppressLocalTuningSave.load(std::memory_order_acquire)) return;
     // Never overwrite the ini from a save that happened before the card (or a
     // future panel revision) actually produced these controls.
     if (!g_localTuningToggle.get() && !g_localReservoirCombo.get() &&
         !g_localSystemToggle.get()) {
         return;
     }
+    try {
     static constexpr int kReservoirMs[] = {100, 500, 2000, 5000, 10000};
     bool enabled = false;
     if (auto toggle = g_localTuningToggle.get()) {
@@ -1956,6 +1962,10 @@ void PersistLocalTuning() {
     Log(L"ui local tuning saved enabled=" + std::to_wstring(enabled ? 1 : 0) +
         L" reservoirMs=" + std::to_wstring(kReservoirMs[index]) +
         L" system=" + std::to_wstring(system ? 1 : 0));
+    } catch (...) {
+        // A WinRT failure here must never escape into the XAML event thread.
+        // The output-selection save path is deliberately isolated from it.
+    }
 }
 
 void SetOutputStatusText(const std::wstring& text) {
@@ -2069,9 +2079,6 @@ void ApplyOutputSelection() {
     auto settings = ReadOutputSettings();
     const int tab = g_activeOutputTab.load();
     settings.tab = tab;
-    // Persist tuning before any device validation so a user who only flips
-    // these switches never loses the change to a missing-driver early return.
-    if (tab == 0) PersistLocalTuning();
     std::wstring localId;
     std::wstring displayName;
 
@@ -2250,6 +2257,7 @@ void UpdateOutputDevice(const Message& message, bool found) {
 Controls::Border CreateOutputTargetCard(
     const Controls::Border& appearance,
     const std::vector<Controls::TextBlock>& nativeText) {
+    g_suppressLocalTuningSave.store(true, std::memory_order_release);
     Controls::TextBlock title;
     title.Text(Localized(L"输出方式", L"Output"));
     Controls::TextBlock description;
@@ -2363,6 +2371,9 @@ Controls::Border CreateOutputTargetCard(
     tuningToggle.OnContent(nullptr);
     tuningToggle.OffContent(nullptr);
     tuningToggle.IsOn(ReadIniInt(L"local", L"enabled", 0) != 0);
+    tuningToggle.Toggled([](auto&&, auto&&) {
+        try { PersistLocalTuning(); } catch (...) {}
+    });
     tuningRow.Children().Append(tuningToggleLabel);
     tuningRow.Children().Append(tuningToggle);
     localPanel.Children().Append(tuningRow);
@@ -2404,6 +2415,9 @@ Controls::Border CreateOutputTargetCard(
         }
         reservoirCombo.SelectedIndex(best);
     }
+    reservoirCombo.SelectionChanged([](auto&&, auto&&) {
+        try { PersistLocalTuning(); } catch (...) {}
+    });
     reservoirRow.Children().Append(reservoirLabel);
     reservoirRow.Children().Append(reservoirCombo);
     localPanel.Children().Append(reservoirRow);
@@ -2424,10 +2438,15 @@ Controls::Border CreateOutputTargetCard(
     systemToggle.IsOn(ReadIniInt(L"local", L"timer_100ns", 0) != 0 ||
                       ReadIniInt(L"local", L"dedicated_core", 0) != 0 ||
                       ReadIniInt(L"local", L"large_pages", 0) != 0);
+    systemToggle.Toggled([](auto&&, auto&&) {
+        try { PersistLocalTuning(); } catch (...) {}
+    });
     systemRow.Children().Append(systemLabel);
     systemRow.Children().Append(systemToggle);
     localPanel.Children().Append(systemRow);
     g_localSystemToggle = winrt::make_weak(systemToggle);
+    // Controls are fully initialised; user interaction may save from now on.
+    g_suppressLocalTuningSave.store(false, std::memory_order_release);
 
     Controls::TextBlock tuningHint;
     tuningHint.Text(Localized(
@@ -3323,23 +3342,37 @@ DWORD WINAPI PipeThread(void*) {
             }
             if (incoming.type == MessageType::RestartResult) {
                 const bool success = incoming.reserved[0] != 0;
-                if (auto status = g_outputTargetStatus.get()) {
-                    status.Text(success
-                        ? Localized(L"已请求重开当前曲目；请观察播放状态",
-                                    L"Restart requested; watch playback")
-                        : Localized(L"重开失败：媒体控制组件不可用",
-                                    L"Restart failed: media control unavailable"));
+                // PipeThread is not the UI thread. TextBlock has thread
+                // affinity; writing it inline raised RPC_E_WRONG_THREAD and
+                // terminated the process right after "Save & apply".
+                const std::wstring text = success
+                    ? Localized(L"已请求重开当前曲目；请观察播放状态",
+                                L"Restart requested; watch playback")
+                    : Localized(L"重开失败：媒体控制组件不可用",
+                                L"Restart failed: media control unavailable");
+                if (g_dispatcher) {
+                    g_dispatcher.TryEnqueue([text]() noexcept {
+                        if (auto status = g_outputTargetStatus.get()) {
+                            try { status.Text(text); } catch (...) {}
+                        }
+                    });
                 }
                 Log(L"restart current result success=" + std::to_wstring(success));
                 continue;
             }
             if (incoming.type == MessageType::DeviceAddResult) {
                 const bool success = incoming.reserved[0] != 0;
-                if (auto status = g_outputTargetStatus.get()) {
-                    status.Text(success
-                        ? Localized(L"设备已添加", L"Device added")
-                        : Localized(L"添加失败：", L"Add failed: ") +
-                            std::wstring(incoming.detail));
+                // Same thread-affinity rule as RestartResult: marshal first.
+                const std::wstring text = success
+                    ? Localized(L"设备已添加", L"Device added")
+                    : Localized(L"添加失败：", L"Add failed: ") +
+                        std::wstring(incoming.detail);
+                if (g_dispatcher) {
+                    g_dispatcher.TryEnqueue([text]() noexcept {
+                        if (auto status = g_outputTargetStatus.get()) {
+                            try { status.Text(text); } catch (...) {}
+                        }
+                    });
                 }
                 Log(L"manual device add result success=" + std::to_wstring(success) +
                     L" detail=" + std::wstring(incoming.detail));
