@@ -167,8 +167,9 @@ std::wstring ReadDlnaValue(const wchar_t* key) {
 std::uint32_t ReadDlnaBufferMs() {
     const auto value = GetPrivateProfileIntW(L"dlna", L"buffer_ms", 1500,
                                              BrokerIniPath().c_str());
+    // 10000 matches the panel dropdown and DlnaSink's own clamp.
     return static_cast<std::uint32_t>(
-        std::min(std::max(static_cast<int>(value), 300), 3000));
+        std::min(std::max(static_cast<int>(value), 300), 10000));
 }
 
 void WriteOutputTarget(std::uint8_t kind, const std::wstring& udn,
@@ -1263,11 +1264,10 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             g_dlnaUdn = incoming.endpointId;
             g_dlnaName = incoming.endpointName;
             g_dlnaLocation = incoming.detail;
-            g_dlnaBufferMs = std::min<std::uint32_t>(
-                std::max<std::uint32_t>(incoming.hardwareBufferMs ? incoming.hardwareBufferMs
-                                                                  : 1500u,
-                                        300u),
-                3000u);
+            // The panel's pull-buffer dropdown writes [dlna] buffer_ms directly;
+            // re-read it here instead of deriving it from the local-buffer
+            // value, which used to overwrite the dropdown with 1500.
+            g_dlnaBufferMs = ReadDlnaBufferMs();
             const std::wstring localId = incoming.format;
             const std::wstring localName = incoming.endpointName;
             if (kind == 2u) {
