@@ -566,7 +566,11 @@ HRESULT DlnaSink::Open(const AudioSinkOpenParams& params) noexcept {
         if (_wtoi(value) != 0) {
             auto& monitor = TrackMonitor::Instance();
             monitor.EnsureStarted();
-            const auto info = monitor.Snapshot(900);
+            // Just after a track change the SMTC pipeline can take a second or
+            // two to publish the new metadata; 900 ms made high-resolution
+            // tracks (where the wait matters most) fall back to the 600 s
+            // guess and declare a wildly wrong length.
+            const auto info = monitor.Snapshot(2500);
             const bool fresh = info.valid &&
                 GetTickCount64() - info.stampTick < 15000;
             if (fresh && info.durationMs >= 10000 &&

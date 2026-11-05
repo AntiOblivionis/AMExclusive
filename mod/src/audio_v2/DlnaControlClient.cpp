@@ -558,7 +558,12 @@ bool DlnaControlClient::OpenHomeInfo(const DlnaTarget& target,
 std::wstring DlnaControlClient::ProtocolInfoFor(DlnaStreamShape shape,
                                                 const PcmFormat& format,
                                                 bool converted) {
-    const std::wstring ci = converted ? L"1" : L"0";
+    // CI=1 means "fetch this through the connection manager's transcoder".
+    // We transcode server-side and hand the renderer a WAV it can decode
+    // natively, so the flag must stay 0 - a VEGA G2.2 stopped consuming a
+    // transcoded stream entirely when it saw CI=1 (the only time a track
+    // failed, and the only time the flag was set).
+    const std::wstring ci = L"0";
     // 0x01700000 flags: streaming mode, no interactive control, no background
     // transfer, no connection stall. Seek and time flags are deliberately 0.
     const std::wstring flags =
