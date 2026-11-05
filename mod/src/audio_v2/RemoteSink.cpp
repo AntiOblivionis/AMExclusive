@@ -5,9 +5,43 @@
 #include "WasapiExclusiveSink.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace ammod::audio_v2 {
+namespace {
+
+// The hook cannot use HookDll's logger from this translation unit, and a
+// failed host connection must be diagnosable without a debugger.
+void LogRemote(const wchar_t* text) noexcept {
+    // The hook runs inside AppleMusic/AMPLibraryAgent, whose package directory
+    // is read-only. Diagnostics belong next to the main log under Public.
+    wchar_t publicPath[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"PUBLIC", publicPath, MAX_PATH);
+    std::wstring path;
+    if (length != 0 && length < MAX_PATH) {
+        path = std::wstring(publicPath) + L"\\AMExclusive\\am-exclusive-remote.log";
+    } else {
+        wchar_t modulePath[MAX_PATH]{};
+        if (!GetModuleFileNameW(nullptr, modulePath, MAX_PATH)) return;
+        std::wstring base(modulePath);
+        const auto slash = base.find_last_of(L"\\/");
+        path = (slash == std::wstring::npos ? std::wstring(L".") : base.substr(0, slash)) +
+               L"\\am-exclusive-remote.log";
+    }
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(), L"a, ccs=UTF-8") == 0 && file) {
+        SYSTEMTIME now{};
+        GetLocalTime(&now);
+        fwprintf(file,
+                 L"%04u-%02u-%02uT%02u:%02u:%02u.%03u pid=%u %s\n",
+                 now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+                 now.wSecond, now.wMilliseconds, GetCurrentProcessId(), text);
+        fclose(file);
+    }
+}
+
+} // namespace
 
 RemoteSink::RemoteSink() noexcept = default;
 
@@ -32,32 +66,53 @@ bool RemoteSink::Connect() noexcept {
                             OPEN_EXISTING, 0, nullptr);
         if (pipe_ == INVALID_HANDLE_VALUE) Sleep(25);
     }
-    if (pipe_ == INVALID_HANDLE_VALUE) return false;
+    if (pipe_ == INVALID_HANDLE_VALUE) {
+        LogRemote(L"connect: host pipe unavailable");
+        return false;
+    }
 
     for (int attempt = 0; attempt < 20 && !ringMapping_; ++attempt) {
         ringMapping_ = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, ringName.c_str());
         if (!ringMapping_) Sleep(25);
     }
-    if (!ringMapping_) return false;
+    if (!ringMapping_) {
+        LogRemote(L"connect: ring section unavailable");
+        return false;
+    }
     ringView_ = MapViewOfFile(ringMapping_, FILE_MAP_ALL_ACCESS, 0, 0, 0);
-    if (!ringView_) return false;
+    if (!ringView_) {
+        LogRemote(L"connect: ring map failed");
+        return false;
+    }
 
     dataEvent_ = OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, dataName.c_str());
     spaceEvent_ = OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, spaceName.c_str());
-    if (!dataEvent_ || !spaceEvent_) return false;
+    if (!dataEvent_ || !spaceEvent_) {
+        LogRemote(L"connect: events unavailable");
+        return false;
+    }
 
-    if (!ring_.Attach(ringView_, spaceEvent_)) return false;
+    if (!ring_.Attach(ringView_, spaceEvent_)) {
+        LogRemote(L"connect: ring header rejected");
+        return false;
+    }
 
     // Hello handshake is advisory: the host answers with its protocol version
     // so a stale host binary is rejected instead of producing silence.
     HostMessage hello{};
     hello.type = static_cast<std::uint32_t>(HostMessageType::Hello);
     hello.generation = 0;
-    HostMessage reply{};
-    if (!Request(hello) || reply.type != static_cast<std::uint32_t>(HostMessageType::HelloAck) ||
+    // Request() sends this message and overwrites it with the reply, so the
+    // reply must start as a copy of the request. Checking a fresh default
+    // message here made every handshake fail and silently fell back.
+    HostMessage reply = hello;
+    if (!Request(reply) ||
+        reply.type != static_cast<std::uint32_t>(HostMessageType::HelloAck) ||
         FAILED(reply.result)) {
+        LogRemote(L"connect: hello handshake failed");
         return false;
     }
+    LogRemote(L"connect: handshake ok");
     return true;
 }
 

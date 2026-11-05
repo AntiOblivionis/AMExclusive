@@ -221,10 +221,39 @@ $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
 if ($LASTEXITCODE -ne 0) { throw (Get-InstallerText "设置安装目录权限失败：icacls 退出码 $LASTEXITCODE" "Failed to secure install directory: icacls exit $LASTEXITCODE") }
 Write-ProgressMilestone 40 'secure_install'
 
+# Keep the user's ini. The template is copied for hash verification, then the
+# previous file is restored and only genuinely new keys are added - otherwise
+# every upgrade resets device choices, [local] tuning and player mode.
+$iniPath = Join-Path $install 'am-exclusive.ini'
+$previousIni = if (Test-Path -LiteralPath $iniPath -PathType Leaf) {
+    [IO.File]::ReadAllBytes($iniPath)
+} else { $null }
+
 foreach ($name in $payloadFiles) {
     $destination = Join-Path $install $name
     Copy-Item -LiteralPath (Join-Path $source $name) -Destination $destination -Force
     if ((Get-Sha256Hex $destination) -ne $expectedHashes[$name]) { throw (Get-InstallerText "发布文件验证失败：$name" "Payload verification failed: $name") }
+}
+
+if ($null -ne $previousIni) {
+    [IO.File]::WriteAllBytes($iniPath, $previousIni)
+    $existing = [IO.File]::ReadAllText($iniPath)
+    $template = [IO.File]::ReadAllText((Join-Path $source 'am-exclusive.ini'))
+    $rewritten = $false
+    if ($existing -notmatch '(?m)^\s*player_mode\s*=') {
+        $existing = [regex]::Replace($existing, '(?m)(^\[mod\][^\[]*)', "`$1player_mode=am`r`n")
+        $rewritten = $true
+    }
+    if ($existing -notmatch '(?m)^\s*\[local\]') {
+        $localSection = [regex]::Match($template, '(?s)\[local\].*?(?=\[dlna\])')
+        if ($localSection.Success) {
+            $existing = $existing.TrimEnd() + "`r`n`r`n" + $localSection.Value.TrimEnd() + "`r`n"
+            $rewritten = $true
+        }
+    }
+    if ($rewritten) {
+        [IO.File]::WriteAllText($iniPath, $existing, (New-Object Text.UTF8Encoding($false)))
+    }
 }
 if ($preservedMode) {
     $iniPath = Join-Path $install 'am-exclusive.ini'

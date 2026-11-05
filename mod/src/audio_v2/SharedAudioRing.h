@@ -103,6 +103,12 @@ public:
         return header_->capacityFrames > buffered ? header_->capacityFrames - buffered : 0;
     }
 
+    // Frames the engine has already drained into the endpoint. In remote mode
+    // this is the closest thing the hook has to "submitted" telemetry.
+    std::uint64_t ConsumedFrames() const noexcept {
+        return header_ ? header_->readFrame.load(std::memory_order_acquire) : 0;
+    }
+
     // Writes up to frames; returns how many were copied. When the ring is
     // full and waitMs is non-zero, waits for the consumer's space event.
     std::uint32_t Write(const std::int32_t* source, std::uint32_t frames,

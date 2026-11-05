@@ -72,18 +72,47 @@ public:
     void Stop() noexcept override;
     void Close() noexcept override;
 
-    AudioSinkState State() const noexcept override { return state_.load(std::memory_order_acquire); }
-    AudioSinkStats Stats() const noexcept override { return stats_; }
-    const PcmFormat& Format() const noexcept override { return params_.format; }
-    std::uint32_t BufferFrames() const noexcept override { return params_.periodFrames; }
+    AudioSinkState State() const noexcept override {
+        return fallback_ ? fallback_->State() : state_.load(std::memory_order_acquire);
+    }
+    // When the host is unavailable this sink delegates to the in-process one;
+    // the counters must come from whoever is actually feeding the endpoint.
+    AudioSinkStats Stats() const noexcept override {
+        if (fallback_) return fallback_->Stats();
+        AudioSinkStats value = stats_;
+        value.kind = AudioSinkKind::Remote;
+        value.state = state_.load(std::memory_order_acquire);
+        value.submittedFrames = ring_.ConsumedFrames();
+        value.bufferedFrames = ring_.BufferedFrames();
+        return value;
+    }
+    const PcmFormat& Format() const noexcept override {
+        return fallback_ ? fallback_->Format() : params_.format;
+    }
+    std::uint32_t BufferFrames() const noexcept override {
+        return fallback_ ? fallback_->BufferFrames() : params_.periodFrames;
+    }
     std::size_t BufferedFrames() const noexcept override {
-        return static_cast<std::size_t>(ring_.BufferedFrames());
+        return fallback_ ? fallback_->BufferedFrames()
+                         : static_cast<std::size_t>(ring_.BufferedFrames());
     }
 
-    bool WaitingForSource() const noexcept override { return false; }
-    bool EndOfStreamSubmitted() const noexcept override { return eosSubmitted_.load(std::memory_order_acquire); }
-    bool EndOfStreamComplete() const noexcept override { return eosComplete_.load(std::memory_order_acquire); }
+    bool WaitingForSource() const noexcept override {
+        return fallback_ ? fallback_->WaitingForSource() : false;
+    }
+    bool EndOfStreamSubmitted() const noexcept override {
+        return fallback_ ? fallback_->EndOfStreamSubmitted()
+                         : eosSubmitted_.load(std::memory_order_acquire);
+    }
+    bool EndOfStreamComplete() const noexcept override {
+        return fallback_ ? fallback_->EndOfStreamComplete()
+                         : eosComplete_.load(std::memory_order_acquire);
+    }
     void SetResumeBlocked(bool blocked) noexcept override {
+        if (fallback_) {
+            fallback_->SetResumeBlocked(blocked);
+            return;
+        }
         resumeBlocked_.store(blocked, std::memory_order_release);
     }
 
