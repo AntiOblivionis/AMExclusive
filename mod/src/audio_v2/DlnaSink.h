@@ -70,6 +70,9 @@ private:
     void FlushEncoderTail() noexcept;
     void JoinProducer() noexcept;
     void RecordError(HRESULT error) noexcept;
+    // Re-issues the current track through the panel's media control helper.
+    // Used when the renderer stops pulling while the track is still playing.
+    void RequestRestartCurrent() noexcept;
 
     AudioSinkOpenParams params_{};
     DlnaTarget target_{};
@@ -107,6 +110,11 @@ private:
     DlnaControlClient control_{};
     DlnaStreamServer server_{};
     std::shared_ptr<DlnaStreamSession> session_{};
+
+    // Renderer stall watchdog: bytes served and the last time they moved.
+    std::uint64_t lastServedBytes_{};
+    std::uint64_t lastProgressTick_{};
+    int stallRestarts_{};
 
     IIntegerPcmSource* source_{};
     std::thread producer_;

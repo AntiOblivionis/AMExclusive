@@ -571,6 +571,20 @@ std::shared_ptr<DlnaStreamSession> DlnaStreamServer::FindSession(
 }
 
 void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
+    // Audio over TCP: Nagle batches small writes into bursts and a small send
+    // buffer makes send() block, both of which show up as jitter at the
+    // renderer. EF marking lets a QoS-aware switch prioritize the flow.
+    {
+        int enabled = 1;
+        (void)setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
+                         reinterpret_cast<const char*>(&enabled), sizeof(enabled));
+        int sendBuffer = 512 * 1024;
+        (void)setsockopt(client, SOL_SOCKET, SO_SNDBUF,
+                         reinterpret_cast<const char*>(&sendBuffer), sizeof(sendBuffer));
+        int dscp = 0xB8; // DSCP EF (46) << 2
+        (void)setsockopt(client, IPPROTO_IP, IP_TOS,
+                         reinterpret_cast<const char*>(&dscp), sizeof(dscp));
+    }
     std::string request;
     char buffer[512]{};
     while (request.size() < kMaxHttpHeaderBytes) {
