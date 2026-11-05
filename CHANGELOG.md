@@ -6,6 +6,17 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.1-preview] - 2026-11-05
+
+### Removed
+
+- **DLNA 断流自动恢复（BytesServed 停滞检测）整体移除**。
+  大缓冲网播设备（LUMIN 等）会预读几十 MB 后暂停拉流、转为播放缓冲，
+  停滞本身就是它们的正常节奏；服务端无法从连接层面区分"自己节奏拉流"
+  与"真卡死"。8 秒检测在 LUMIN 上于 3–4 分钟（一个预读窗口）误触发
+  restart，导致播放中断。真卡死时用户听不到声音，面板的
+  「重开当前曲目」按钮保留作为手动恢复入口。
+
 ## [0.4.0-preview] - 2026-11-05
 
 ### Added
