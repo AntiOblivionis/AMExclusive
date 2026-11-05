@@ -193,6 +193,12 @@ void FlacEncoder::Reset(std::uint32_t sampleRate, std::uint32_t channels,
     sampleRate_ = sampleRate;
     channels_ = std::min<std::uint32_t>(std::max<std::uint32_t>(channels, 1u), 8u);
     bits_ = std::min<std::uint32_t>(std::max<std::uint32_t>(bitsPerSample, 8u), 24u);
+    // Callers hand over canonical Q31 samples, the same domain PackCanonicalPcm32
+    // packs (a 24-bit sample is `value >> 8`). FLAC wants the sample
+    // right-justified at the declared depth, so the low bits have to be dropped
+    // here - emitting the low `bits_` bits of a left-justified value is exactly
+    // what produced full-scale noise on a VEGA G2.2.
+    shift_ = 32u - bits_;
     started_ = false;
     frameNumber_ = 0;
     framesEncoded_ = 0;
@@ -332,20 +338,25 @@ void FlacEncoder::EncodeBlock() noexcept {
 
     std::vector<std::uint8_t> frame;
     frame.reserve(static_cast<std::size_t>(blockFrames_) * channels_ * 4u + 64u);
-    WriteFrameHeader(frame);
-
-    BitWriter writer(frame);
     // A verbatim stream must keep a constant frame size for its declared length
-    // to hold, so the final short block is zero-padded to a full block.
+    // to hold, so the final short block is zero-padded to a full block. This has
+    // to happen *before* the header is written: the header carries the block
+    // size, and a header that announces 1000 frames while 4096 follow desyncs
+    // the decoder at the end of every track.
     if (verbatim_ && blockFrames_ < kBlockSize) {
         block_.resize(static_cast<std::size_t>(kBlockSize) * channels_, 0);
         blockFrames_ = kBlockSize;
     }
+    WriteFrameHeader(frame);
+
+    BitWriter writer(frame);
     const std::uint32_t frames = blockFrames_;
     for (std::uint32_t ch = 0; ch < channels_; ++ch) {
         channel_.resize(frames);
         for (std::uint32_t i = 0; i < frames; ++i) {
-            channel_[i] = block_[static_cast<std::size_t>(i) * channels_ + ch];
+            // Canonical samples are left-justified in 32 bits; FLAC stores them
+            // right-justified at bits_. Arithmetic shift keeps the sign.
+            channel_[i] = block_[static_cast<std::size_t>(i) * channels_ + ch] >> shift_;
         }
 
         if (verbatim_) {

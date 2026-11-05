@@ -79,7 +79,7 @@ std::wstring CommonHeaders() {
     headers.append(date.begin(), date.end());
     headers += L"\r\n";
     // Some renderers use the Server banner to pick a compatibility profile.
-    headers += L"Server: AMExclusive/0.2.2 UPnP/1.0 DLNADOC/1.50\r\n";
+    headers += L"Server: AMExclusive/0.2.3 UPnP/1.0 DLNADOC/1.50\r\n";
     return headers;
 }
 

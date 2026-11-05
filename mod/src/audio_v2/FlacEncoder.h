@@ -42,9 +42,12 @@ public:
                                       std::uint32_t bitsPerSample,
                                       std::uint64_t totalSamples) noexcept;
 
-    // Appends interleaved canonical integer samples (the same values the WAV
-    // path packs, i.e. sign-extended within bitsPerSample). Frames are encoded
-    // as soon as a whole block is available.
+    // Appends interleaved canonical integer samples: the same left-justified
+    // 32-bit (Q31) values the WAV path packs, where a 24-bit sample is written
+    // as `value >> 8`. The encoder shifts each sample down to the stream's bit
+    // depth itself, because FLAC stores right-justified samples - taking the
+    // low bits of a left-justified value yields full-scale noise.
+    // Frames are encoded as soon as a whole block is available.
     void Push(const std::int32_t* interleaved, std::uint32_t frames) noexcept;
 
     // Moves every byte encoded so far into `out` (appends).
@@ -67,6 +70,9 @@ private:
     std::uint32_t sampleRate_{48000};
     std::uint32_t channels_{2};
     std::uint32_t bits_{24};
+    // Right shift from the canonical Q31 domain to `bits_`. Zero when the
+    // caller already supplies right-justified samples.
+    std::uint32_t shift_{32u - 24u};
     bool verbatim_{false};
     bool started_{false};
     std::uint64_t frameNumber_{};

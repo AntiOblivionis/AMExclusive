@@ -6,6 +6,26 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.3] - 2026-11-05
+
+### Fixed
+
+- **File-shaped FLAC played as full-scale noise.** `FlacEncoder` was fed the
+  canonical Q31 samples the WAV path packs (a 24-bit sample is `value >> 8`,
+  i.e. left-justified in 32 bits) but wrote their low `bitsPerSample` bits, so
+  every sample reached the renderer scrambled. The encoder now shifts each
+  sample down to the stream depth itself, which makes the FLAC payload
+  bit-identical to the WAV payload for the same PCM. Confirmed by decoding a
+  captured entity: the decoded samples match the source exactly (a 12000-level
+  440 Hz tone decodes as 12000, not 3072000), with no ffmpeg errors.
+- **The final frame of a verbatim stream announced the wrong block size.** The
+  zero-padding that keeps every frame the same size ran *after* the frame header
+  had been written, so the last frame declared 256 frames while carrying 4096.
+  Padding now happens before the header. A captured 40 s entity walks cleanly:
+  469 frames, all `blockCode = 0xC`, all CRC-16 correct, ending exactly at the
+  declared `Content-Length`.
+- `Server:` response header still reported `0.2.1` in the 0.2.2 build.
+
 ## [0.2.2] - 2026-11-04
 
 ### Added
