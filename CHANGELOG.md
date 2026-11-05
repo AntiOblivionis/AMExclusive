@@ -6,6 +6,58 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.1-preview] - 2026-11-05
+
+### Added
+
+- **Local playback tuning for WASAPI / ASIO**, modelled on JPLAY's local engine
+  and off by default (an empty or disabled `[local]` section reproduces 0.3.0
+  behavior exactly):
+  - **Deep reservoir** (`reservoir_ms`, 0.1–30 s): the capture queue grows with
+    the target and the software pump water marks chase it. The cutover gate
+    deliberately stays at 0.1 s, so playback never deadlocks when Apple Music
+    can only decode a little ahead.
+  - **System timing**: `NtSetTimerResolution` (0.5 ms by default), a dedicated
+    core for the WASAPI render thread, the software pump and the ASIO
+    `bufferSwitch` callback (applied once on the driver-owned thread), and
+    Windows dynamic priority boost disabled.
+  - **Large pages**: the capture queue can use `MEM_LARGE_PAGES` after
+    requesting `SeLockMemoryPrivilege`; any failure falls back to the ordinary
+    allocator and `VirtualLock` unchanged.
+- **Panel controls**: Output → Local → *Local playback tuning* — master switch,
+  memory reservoir (0.1 / 0.5 / 2 / 5 / 10 s) and system timing. The save path
+  writes `[local]` and restarts the current track, reusing the existing
+  `SetOutputTarget` flow; no protocol change.
+- New header-only `audio_v2/LocalPlaybackTuning.h` and a documented `[local]`
+  section in `am-exclusive.ini`.
+
+### Changed
+
+- The local staging queue's 240-block headroom now follows the actual capture
+  queue capacity, so a larger reservoir is no longer capped by the staging
+  layer. With the default 256-block queue the limit is still exactly 240.
+
+### Verified
+
+- Release build clean: hook / ui / broker / setup plus both
+  `EXCLUDE_FROM_ALL` self-tests (`am_exclusive_drain_probe`,
+  `am_exclusive_dlna_selftest`).
+- First real run (Realtek speakers, 44.1 kHz/24-bit exclusive): zero underruns,
+  zero dropped frames, `bufferedFrames` ≈ 58.6k ≈ 1.33 s (was ~0.1 s).
+  Apple Music appears able to decode about 1.3–1.4 s ahead, not a whole track.
+- `largePages=0` on that machine (privilege or contiguous memory unavailable);
+  the queue silently used the ordinary allocator.
+- Panel layout has not been visually verified yet.
+
+### Not included
+
+- Kernel Streaming output (JPLAY creates KS pins directly).
+- System-wide Throttle / Hibernate (suspending other processes, switching power
+  schemes, blocking input).
+- A separate playback process or the dual-PC UDP boundary.
+
+The DLNA / OpenHome path is untouched by every item above.
+
 ## [0.3.0-preview] - 2026-11-05
 
 ### Added
