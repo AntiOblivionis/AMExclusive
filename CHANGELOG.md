@@ -6,6 +6,32 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.2-preview] - 2026-11-05
+
+### Fixed
+
+- **"Save & apply" closed Apple Music.** `PipeThread` (a background IPC thread)
+  wrote the output-status `TextBlock` inline when it received `RestartResult` or
+  `DeviceAddResult`. XAML objects have thread affinity, so C++/WinRT raised
+  `RPC_E_WRONG_THREAD`; the exception escaped and the process terminated through
+  `std::terminate` → `abort` (`ucrtbase`, `0xc0000409`). Saving triggers
+  `RestartCurrent` → `RestartResult`, which is why the app closed about a second
+  later rather than immediately. Both paths now marshal through the window
+  dispatcher and swallow WinRT failures.
+  Verified against `AppleMusic.exe.22768.dmp`: stack `ucrtbase!abort` ←
+  `ucrtbase!terminate` ← `am_exclusive_ui` (`throw_hresult`).
+
+### Changed
+
+- The local-tuning ini write no longer runs inside the output-save path. The
+  three switches persist on their own `Toggled` / `SelectionChanged` events,
+  with a suppression flag while the card is built and a catch-all around the
+  writer. The Save button path is the 0.3.0 flow again.
+
+### Note
+
+- **v0.3.1-preview carries the crash above; use 0.3.2-preview instead.**
+
 ## [0.3.1-preview] - 2026-11-05
 
 ### Added
