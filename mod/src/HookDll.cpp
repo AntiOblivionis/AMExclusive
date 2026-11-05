@@ -3693,17 +3693,17 @@ DWORD WINAPI PipeClientLoop(void*) {
                 // 0 = WASAPI endpoint, 1 = DLNA/OpenHome renderer, 2 = ASIO driver.
                 const std::uint8_t kindCode = incoming.enabledIntent > 2u
                     ? 0u : incoming.enabledIntent;
-                // "HiFi player" mode routes local WASAPI/ASIO through the
-                // separate audiohost process. Network playback (kind 1) never
-                // uses it. The underlying local kind is still carried by the
-                // device fields below, so RemoteSink can tell WASAPI from ASIO.
+                // "HiFi player" mode routes every local kind - WASAPI, ASIO and
+                // DLNA - through the separate audiohost process. The hook only
+                // moves PCM; the device fields below still carry enough for
+                // RemoteSink (and its in-process fallback) to pick the engine.
                 const bool hifiMode =
                     _wcsicmp(ReadSetting(L"player_mode", L"am").c_str(), L"hifi") == 0;
                 ammod::audio_v2::OutputProfile profile{};
-                profile.kind = kindCode == 1u ? AudioSinkKind::Dlna
-                    : (hifiMode ? AudioSinkKind::Remote
-                                : (kindCode == 2u ? AudioSinkKind::Asio
-                                                  : AudioSinkKind::Wasapi));
+                profile.kind = hifiMode ? AudioSinkKind::Remote
+                    : (kindCode == 2u ? AudioSinkKind::Asio
+                     : kindCode == 1u ? AudioSinkKind::Dlna
+                                      : AudioSinkKind::Wasapi);
                 profile.dlna.udn = incoming.endpointId;
                 profile.dlna.friendlyName = incoming.endpointName;
                 profile.dlna.location = incoming.detail;

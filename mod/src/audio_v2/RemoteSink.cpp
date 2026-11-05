@@ -1,6 +1,7 @@
 #include "RemoteSink.h"
 
 #include "AsioExclusiveSink.h"
+#include "DlnaSink.h"
 #include "LocalPlaybackTuning.h"
 #include "WasapiExclusiveSink.h"
 
@@ -112,6 +113,10 @@ bool RemoteSink::Connect() noexcept {
         LogRemote(L"connect: hello handshake failed");
         return false;
     }
+    if (reply.protocol != kHostProtocolVersion) {
+        LogRemote(L"connect: host protocol mismatch");
+        return false;
+    }
     LogRemote(L"connect: handshake ok");
     return true;
 }
@@ -140,7 +145,9 @@ bool RemoteSink::Request(HostMessage& message) noexcept {
 
 HRESULT RemoteSink::OpenFallback(const AudioSinkOpenParams& params) noexcept {
     fallback_.reset();
-    if (!params.asioDriverClsid.empty()) {
+    if (targetKind_ == static_cast<std::uint32_t>(HostTargetKind::Dlna)) {
+        fallback_ = std::make_unique<DlnaSink>();
+    } else if (!params.asioDriverClsid.empty()) {
         fallback_ = std::make_unique<AsioExclusiveSink>();
     } else {
         fallback_ = std::make_unique<WasapiExclusiveSink>();
@@ -159,6 +166,13 @@ HRESULT RemoteSink::OpenFallback(const AudioSinkOpenParams& params) noexcept {
 HRESULT RemoteSink::Open(const AudioSinkOpenParams& params) noexcept {
     Close();
     params_ = params;
+    // DLNA wins when the profile carries a renderer location; ASIO when it
+    // carries a driver CLSID; otherwise it is plain WASAPI.
+    targetKind_ = !params.dlna.location.empty()
+        ? static_cast<std::uint32_t>(HostTargetKind::Dlna)
+        : (!params.asioDriverClsid.empty()
+               ? static_cast<std::uint32_t>(HostTargetKind::Asio)
+               : static_cast<std::uint32_t>(HostTargetKind::Wasapi));
     if (!Connect()) {
         Disconnect();
         return OpenFallback(params);
@@ -166,6 +180,8 @@ HRESULT RemoteSink::Open(const AudioSinkOpenParams& params) noexcept {
 
     HostMessage open{};
     open.type = static_cast<std::uint32_t>(HostMessageType::Open);
+    open.protocol = kHostProtocolVersion;
+    open.targetKind = targetKind_;
     open.format = params.format;
     open.periodFrames = params.periodFrames;
     open.bufferMs = params.periodFrames ? params.periodFrames : 20;
@@ -173,8 +189,14 @@ HRESULT RemoteSink::Open(const AudioSinkOpenParams& params) noexcept {
         kSharedRingMaxFrames,
         std::max<std::uint32_t>(params.format.sampleRate * 10u, 48000u));
     open.alignmentRetries = params.alignmentRetries;
+    open.streamBufferMs = params.streamBufferMs;
+    open.streamSeconds = params.streamSeconds;
     open.generation = 0;
-    if (!params.asioDriverClsid.empty()) {
+    if (targetKind_ == static_cast<std::uint32_t>(HostTargetKind::Dlna)) {
+        wcsncpy_s(open.endpointId, params.dlna.udn.c_str(), _TRUNCATE);
+        wcsncpy_s(open.asioName, params.dlna.friendlyName.c_str(), _TRUNCATE);
+        wcsncpy_s(open.dlnaLocation, params.dlna.location.c_str(), _TRUNCATE);
+    } else if (targetKind_ == static_cast<std::uint32_t>(HostTargetKind::Asio)) {
         wcsncpy_s(open.asioClsid, params.asioDriverClsid.c_str(), _TRUNCATE);
         wcsncpy_s(open.asioName, params.asioDriverName.c_str(), _TRUNCATE);
     } else {
@@ -184,6 +206,7 @@ HRESULT RemoteSink::Open(const AudioSinkOpenParams& params) noexcept {
     HostMessage reply = open;
     if (!Request(reply) || reply.type != static_cast<std::uint32_t>(HostMessageType::OpenResult) ||
         FAILED(reply.result)) {
+        LogRemote(L"open: host refused the request, falling back in-process");
         Disconnect();
         return OpenFallback(params);
     }

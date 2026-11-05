@@ -105,16 +105,25 @@ target_compile_definitions(am_exclusive_ui PRIVATE UNICODE _UNICODE WIN32_LEAN_A
 target_link_libraries(am_exclusive_ui PRIVATE advapi32 ole32 runtimeobject windowsapp)
 set_target_properties(am_exclusive_ui PROPERTIES OUTPUT_NAME "am-exclusive-ui")
 
-# "HiFi player" engine: owns WASAPI exclusive / ASIO in its own process and
-# drains the shared ring written by the hook. No UI, no Apple Music knowledge.
+# "HiFi player" engine: owns WASAPI exclusive / ASIO / DLNA in its own process
+# and drains the shared ring written by the hook. No UI, no Apple Music
+# knowledge. The DLNA stack (SOAP client, HTTP stream server, FLAC encoder)
+# rides along so network playback also leaves the Apple Music process.
 add_executable(am_exclusive_audiohost
   src/AudioHost.cpp
+  src/UpnpXml.cpp
   src/audio_v2/AsioExclusiveSink.cpp
+  src/audio_v2/DlnaControlClient.cpp
   src/audio_v2/DlnaLog.cpp
+  src/audio_v2/DlnaResolve.cpp
+  src/audio_v2/DlnaSink.cpp
+  src/audio_v2/DlnaStreamServer.cpp
+  src/audio_v2/FlacEncoder.cpp
   src/audio_v2/WasapiExclusiveSink.cpp)
 target_include_directories(am_exclusive_audiohost PRIVATE src)
 target_compile_definitions(am_exclusive_audiohost PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(am_exclusive_audiohost PRIVATE ole32 uuid avrt advapi32)
+target_link_libraries(am_exclusive_audiohost PRIVATE ole32 oleaut32 uuid advapi32
+  avrt ws2_32 winhttp msxml6 bcrypt iphlpapi)
 set_target_properties(am_exclusive_audiohost PROPERTIES OUTPUT_NAME "am-exclusive-audiohost")
 
 add_executable(am_exclusive_media_control src/MediaSessionControl.cpp)

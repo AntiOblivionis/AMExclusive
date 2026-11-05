@@ -31,9 +31,22 @@ enum class HostMessageType : std::uint32_t {
 };
 
 // Fixed-size control message. Both sides include this header, so the layout is
-// identical; PcmFormat is POD and contains no pointers.
+// identical; PcmFormat is POD and contains no pointers. Bump kHostProtocol
+// whenever the layout changes - the host refuses older/newer peers, and the
+// hook falls back to its in-process sinks.
+inline constexpr std::uint32_t kHostProtocolVersion = 3;
+
+// Which engine the audiohost should build: 0 WASAPI, 1 DLNA, 2 ASIO.
+enum class HostTargetKind : std::uint32_t {
+    Wasapi = 0,
+    Dlna = 1,
+    Asio = 2,
+};
+
 struct HostMessage final {
     std::uint32_t type{};
+    std::uint32_t protocol{kHostProtocolVersion};
+    std::uint32_t targetKind{static_cast<std::uint32_t>(HostTargetKind::Wasapi)};
     std::uint32_t size{sizeof(HostMessage)};
     HRESULT result{S_OK};
     PcmFormat format{};
@@ -41,10 +54,18 @@ struct HostMessage final {
     std::uint32_t bufferMs{20};
     std::uint32_t ringFrames{};
     std::uint32_t alignmentRetries{3};
+    // DLNA pull policy. Without these the engine would prebuffer only ~300 ms
+    // and the renderer would refuse to leave its probe loop.
+    std::uint32_t streamBufferMs{0};
+    std::uint32_t streamSeconds{0};
     std::uint64_t generation{};
     wchar_t asioClsid[64]{};
     wchar_t asioName[128]{};
+    // WASAPI: endpoint id. DLNA: the renderer's UDN.
     wchar_t endpointId[256]{};
+    // DLNA: the renderer's device description URL, the only field DlnaSink
+    // really needs - it re-resolves the service URLs itself.
+    wchar_t dlnaLocation[512]{};
 };
 
 inline constexpr wchar_t kHostPipePrefix[] = L"\\\\.\\pipe\\AMEAudioHost_";
@@ -117,6 +138,7 @@ public:
     }
 
     bool UsingFallback() const noexcept { return fallback_ != nullptr; }
+    std::uint32_t TargetKind() const noexcept { return targetKind_; }
 
 private:
     static DWORD WINAPI PumpThreadThunk(void* context) noexcept;
@@ -150,6 +172,7 @@ private:
     std::atomic<AudioSinkState> state_{AudioSinkState::Closed};
     AudioSinkStats stats_{};
     std::uint32_t sessionId_{};
+    std::uint32_t targetKind_{static_cast<std::uint32_t>(HostTargetKind::Wasapi)};
 };
 
 } // namespace ammod::audio_v2

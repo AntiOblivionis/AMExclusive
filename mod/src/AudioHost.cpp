@@ -5,6 +5,7 @@
 // hook falls back to its in-process sink when this process is absent.
 
 #include "audio_v2/AsioExclusiveSink.h"
+#include "audio_v2/DlnaSink.h"
 #include "audio_v2/LocalPlaybackTuning.h"
 #include "audio_v2/MemoryLock.h"
 #include "audio_v2/RemoteSink.h"
@@ -26,7 +27,9 @@ using ammod::audio_v2::AudioSinkOpenParams;
 using ammod::audio_v2::HostMessage;
 using ammod::audio_v2::HostMessageType;
 using ammod::audio_v2::HostObjectName;
+using ammod::audio_v2::HostTargetKind;
 using ammod::audio_v2::IAudioSink;
+using ammod::audio_v2::kHostProtocolVersion;
 using ammod::audio_v2::RingPcmSource;
 using ammod::audio_v2::SharedRingHeader;
 using ammod::audio_v2::kHostDataEventPrefix;
@@ -162,10 +165,21 @@ HRESULT OpenTarget(HostState& state, const HostMessage& request) noexcept {
     params.format = request.format;
     params.periodFrames = request.periodFrames;
     params.alignmentRetries = request.alignmentRetries ? request.alignmentRetries : 2;
+    params.streamBufferMs = request.streamBufferMs;
+    params.streamSeconds = request.streamSeconds;
     params.sourceReadyEvent = state.dataEvent;
     params.endpointId = request.endpointId;
     params.asioDriverClsid = request.asioClsid;
     params.asioDriverName = request.asioName;
+    if (request.targetKind == static_cast<std::uint32_t>(
+            ammod::audio_v2::HostTargetKind::Dlna) ||
+        request.dlnaLocation[0] != L'\0') {
+        params.dlna.udn = request.endpointId;
+        params.dlna.friendlyName = request.asioName;
+        params.dlna.location = request.dlnaLocation;
+        params.endpointId.clear();
+        params.asioDriverClsid.clear();
+    }
 
     if (state.header) {
         std::uint32_t capacity = request.ringFrames;
@@ -182,7 +196,12 @@ HRESULT OpenTarget(HostState& state, const HostMessage& request) noexcept {
             0, capacity);
     }
 
-    if (!params.asioDriverClsid.empty()) {
+    if (!params.dlna.location.empty()) {
+        // Network renderer: the engine owns the SOAP control client, the
+        // HTTP stream server and the encoder, none of which belong in the
+        // Apple Music process.
+        state.sink = std::make_unique<ammod::audio_v2::DlnaSink>();
+    } else if (!params.asioDriverClsid.empty()) {
         state.sink = std::make_unique<ammod::audio_v2::AsioExclusiveSink>();
     } else {
         state.sink = std::make_unique<ammod::audio_v2::WasapiExclusiveSink>();
@@ -203,6 +222,11 @@ void ServeClient(HostState& state) noexcept {
         switch (static_cast<HostMessageType>(request.type)) {
         case HostMessageType::Hello:
             reply.type = static_cast<std::uint32_t>(HostMessageType::HelloAck);
+            // A mismatched layout can only be refused; the hook falls back to
+            // its in-process sinks instead of corrupting the ring.
+            reply.protocol = kHostProtocolVersion;
+            reply.result = request.protocol == kHostProtocolVersion
+                ? S_OK : E_NOT_VALID_STATE;
             break;
         case HostMessageType::Open:
             reply.result = OpenTarget(state, request);
