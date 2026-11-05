@@ -85,6 +85,9 @@ private:
     bool converted_{false};
     std::uint32_t chunkFrames_{1024};
     std::uint32_t bufferMs_{1500};
+    // Ring capacity in seconds, independent of buffer_ms: buffer_ms is what the
+    // renderer keeps, this is what we can hold while it briefly stops pulling.
+    std::uint32_t ringSeconds_{8};
     std::wstring advertiseIp_;
     std::wstring streamUrl_;
     std::wstring protocolInfo_;

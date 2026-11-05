@@ -393,7 +393,15 @@ bool DlnaSink::SetupStream() noexcept {
     CloseStream();
     if (!server_.Running()) {
         const auto host = DlnaControlClient::HostFromLocation(target_.location);
-        advertiseIp_ = AdvertiseAddress(host);
+        // [dlna] bind_interface pins the advertised/bound address. Only needed
+        // on machines with several NICs (wired + Wi-Fi), where the automatic
+        // route lookup can pick the one the renderer cannot reach.
+        wchar_t bindAddress[64]{};
+        GetPrivateProfileStringW(L"dlna", L"bind_interface", L"", bindAddress,
+                                 static_cast<DWORD>(std::size(bindAddress)),
+                                 IniPath().c_str());
+        advertiseIp_ = bindAddress[0] != L'\0' ? std::wstring(bindAddress)
+                                               : AdvertiseAddress(host);
         if (advertiseIp_.empty()) return false;
         std::wstring error;
         std::uint16_t port = 0;
@@ -467,8 +475,7 @@ bool DlnaSink::SetupStream() noexcept {
         totalBytes_ = std::min<std::uint64_t>(totalBytes_, 0x7FFF0000ull);
     }
     const auto capacity = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-        std::max<std::uint64_t>(bytesPerSecond * (bufferMs_ + 3000u) / 1000u,
-                                1024u * 1024u),
+        std::max<std::uint64_t>(bytesPerSecond * ringSeconds_, 1024u * 1024u),
         32u * 1024u * 1024u));
     const auto token = GuidToken();
     if (!wireMime.empty()) {
@@ -589,6 +596,19 @@ HRESULT DlnaSink::Open(const AudioSinkOpenParams& params) noexcept {
     // Up to ten seconds: network jitter absorbs better, at the cost of start /
     // seek latency. The ring itself is capped at 32 MB, which covers 192 kHz.
     bufferMs_ = std::min<std::uint32_t>(std::max<std::uint32_t>(params.streamBufferMs, 300u), 10000u);
+    {
+        // Ring capacity is decoupled from the pull buffer. A larger ring lets
+        // the producer keep running when the renderer pauses for a moment
+        // (Wi-Fi drop, its own decoding hiccup) instead of blocking the PCM
+        // queue and back-pressuring Apple Music.
+        wchar_t value[16]{};
+        GetPrivateProfileStringW(L"dlna", L"ring_seconds", L"8", value,
+                                 static_cast<DWORD>(std::size(value)),
+                                 IniPath().c_str());
+        const auto seconds = static_cast<std::uint32_t>(
+            std::min(std::max(_wtoi(value), 3), 30));
+        ringSeconds_ = std::max(seconds, bufferMs_ / 1000u + 3u);
+    }
     // Wire shape: wav (default, unchanged), flac, or live. Read here so a
     // change takes effect on the next track without restarting Apple Music.
     // params.streamShape wins when the caller sets it explicitly (the self

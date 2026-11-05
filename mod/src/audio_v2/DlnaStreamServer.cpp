@@ -571,6 +571,10 @@ std::shared_ptr<DlnaStreamSession> DlnaStreamServer::FindSession(
 }
 
 void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
+    // The producer deliberately runs above normal; the thread that actually
+    // pushes bytes to the renderer deserves the same treatment, otherwise a
+    // busy neighbour can delay send() even though the ring has data ready.
+    (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     // Optional socket tuning, OFF by default: enabling it changed how a VEGA
     // G2.2 consumed the stream (it read ~2 s then reset). Kept behind a bitmask
     // so it can be re-tested: 1 = TCP_NODELAY, 2 = 512 KB send buffer,
