@@ -1523,27 +1523,101 @@ void ClientThread(HANDLE pipe) {
 
 } // namespace
 
-// The HiFi engine is a separate process owned by the broker. Start it once at
-// boot; the host enforces single-instance and stays idle until the hook
-// connects. Failure is not fatal - RemoteSink falls back to the in-process
-// sink when the host is absent.
-void StartAudioHost() {
+// The HiFi engine is a separate process owned by the broker. It enforces
+// single-instance and stays idle until the hook connects, so the broker can
+// start it unconditionally and keep a watchdog on it.
+HANDLE g_audioHostProcess = nullptr;
+
+std::wstring AudioHostPath() {
     wchar_t modulePath[MAX_PATH]{};
     GetModuleFileNameW(nullptr, modulePath, static_cast<DWORD>(std::size(modulePath)));
-    const auto hostPath = std::filesystem::path(modulePath).parent_path() /
-        L"am-exclusive-audiohost.exe";
-    if (!std::filesystem::exists(hostPath)) return;
+    return (std::filesystem::path(modulePath).parent_path() /
+            L"am-exclusive-audiohost.exe").wstring();
+}
+
+// The host creates its pipe before accepting clients, so a successful open is
+// proof that another instance is already serving this session.
+bool AudioHostServing() {
     DWORD session = 0;
     (void)ProcessIdToSessionId(GetCurrentProcessId(), &session);
-    std::wstring command = L"\"" + hostPath.wstring() + L"\" --session " +
-        std::to_wstring(session);
+    const std::wstring pipeName = L"\\\\.\\pipe\\AMEAudioHost_" + std::to_wstring(session);
+    HANDLE probe = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+    if (probe == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(probe);
+    return true;
+}
+
+HANDLE SpawnAudioHost() {
+    const std::wstring hostPath = AudioHostPath();
+    if (!std::filesystem::exists(hostPath)) return nullptr;
+    DWORD session = 0;
+    (void)ProcessIdToSessionId(GetCurrentProcessId(), &session);
+    std::wstring command = L"\"" + hostPath + L"\" --session " + std::to_wstring(session);
     STARTUPINFOW startup{sizeof(startup)};
     PROCESS_INFORMATION process{};
-    if (CreateProcessW(hostPath.c_str(), command.data(), nullptr, nullptr, FALSE,
-                       CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
+    if (!CreateProcessW(hostPath.c_str(), command.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+        return nullptr;
     }
+    CloseHandle(process.hThread);
+    return process.hProcess;
+}
+
+void StartAudioHost() {
+    if (AudioHostServing()) {
+        Log(L"audiohost already serving; watchdog will track restarts");
+        return;
+    }
+    g_audioHostProcess = SpawnAudioHost();
+    Log(g_audioHostProcess ? L"audiohost started" : L"audiohost not started");
+}
+
+// Five-second poll. Restarts are allowed, but a crash loop is throttled: after
+// five quick failures the watchdog backs off for a minute instead of spinning.
+DWORD WINAPI AudioHostWatchdog(void*) {
+    int consecutiveRestarts = 0;
+    ULONGLONG startedAt = GetTickCount64();
+    for (;;) {
+        Sleep(5000);
+        if (!g_audioHostProcess) {
+            if (!AudioHostServing()) {
+                g_audioHostProcess = SpawnAudioHost();
+                startedAt = GetTickCount64();
+                if (g_audioHostProcess) {
+                    Log(L"audiohost watchdog started a missing engine");
+                }
+            }
+            continue;
+        }
+        const DWORD wait = WaitForSingleObject(g_audioHostProcess, 0);
+        if (wait == WAIT_TIMEOUT) {
+            if (GetTickCount64() - startedAt > 60000) consecutiveRestarts = 0;
+            continue;
+        }
+        DWORD exitCode = 0;
+        (void)GetExitCodeProcess(g_audioHostProcess, &exitCode);
+        CloseHandle(g_audioHostProcess);
+        g_audioHostProcess = nullptr;
+        Log(L"audiohost exited code=" + std::to_wstring(exitCode));
+        // A clean exit while another instance already serves is the normal
+        // single-instance race, not a crash.
+        if (AudioHostServing()) continue;
+        if (++consecutiveRestarts > 5) {
+            Log(L"audiohost watchdog backing off after repeated restarts");
+            Sleep(60000);
+            consecutiveRestarts = 0;
+        }
+        g_audioHostProcess = SpawnAudioHost();
+        startedAt = GetTickCount64();
+        if (g_audioHostProcess) {
+            Log(L"audiohost watchdog restarted engine attempt=" +
+                std::to_wstring(consecutiveRestarts));
+        } else {
+            Log(L"audiohost watchdog restart failed");
+        }
+    }
+    return 0;
 }
 
 int wmain() {
@@ -1587,6 +1661,9 @@ int wmain() {
         L" output=" + std::to_wstring(g_outputKind) +
         L" dlnaDevice=" + g_dlnaName);
     StartAudioHost();
+    if (HANDLE watchdog = CreateThread(nullptr, 0, AudioHostWatchdog, nullptr, 0, nullptr)) {
+        CloseHandle(watchdog);
+    }
     const auto pipeName = PipeName();
     PipeSecurity security;
     if (pipeName.empty() || !security.IsValid()) {
