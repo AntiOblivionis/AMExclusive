@@ -6,6 +6,33 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0-preview] - 2026-11-05
+
+### Added
+
+- **HiFi player mode** (opt-in, default off): a separate
+  `am-exclusive-audiohost.exe` owns the endpoint and drains a cross-process
+  shared-memory ring, so WASAPI exclusive / ASIO and all scheduling tuning run
+  outside the Apple Music process. The hook only moves canonical Q31 PCM.
+  - Panel: Output → Local → **Playback engine** (`AM player` / `HiFi player`),
+    persisted as `[mod] player_mode` in `am-exclusive.ini`.
+  - Transport: 16 MB SPSC ring (up to 2,000,000 frames, ~10.4 s at 192 kHz)
+    plus a fixed-size named-pipe control channel. No UDP, no retransmission.
+  - Automatic fallback: when the host is absent or refuses the request,
+    `RemoteSink` falls back to the in-process WASAPI/ASIO sink.
+  - The engine reads `[local]` itself, so timer resolution, dedicated core,
+    priority boost and large pages are configured in the process that actually
+    owns the audio threads.
+- New build target `am-exclusive-audiohost.exe`: the installer publishes it and
+  the broker starts it at boot (single instance, idle until the hook connects).
+
+### Notes
+
+- PCM only, up to the endpoint's format. DSD is not supported; Apple Music does
+  not provide a DSD source here.
+- The HiFi path has **not been validated on real hardware** yet. `AM player`
+  mode is the 0.3.2 path unchanged.
+
 ## [0.3.2-preview] - 2026-11-05
 
 ### Fixed

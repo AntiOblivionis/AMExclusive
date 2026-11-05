@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(AMExclusive VERSION 0.3.2 LANGUAGES CXX RC)
+project(AMExclusive VERSION 0.4.0 LANGUAGES CXX RC)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "AMExclusive supports Windows x64 only")
@@ -86,6 +86,7 @@ add_library(am_exclusive_hook SHARED
   src/audio_v2/FlacEncoder.cpp
   src/audio_v2/DlnaStreamServer.cpp
   src/audio_v2/NativeRenderGateProxy.cpp
+  src/audio_v2/RemoteSink.cpp
   src/audio_v2/ResampledPcmSource.cpp
   src/audio_v2/WasapiExclusiveSink.cpp
   src/UpnpXml.cpp)
@@ -103,6 +104,18 @@ target_include_directories(am_exclusive_ui PRIVATE src "${WINRT_GENERATED_DIR}")
 target_compile_definitions(am_exclusive_ui PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(am_exclusive_ui PRIVATE advapi32 ole32 runtimeobject windowsapp)
 set_target_properties(am_exclusive_ui PROPERTIES OUTPUT_NAME "am-exclusive-ui")
+
+# "HiFi player" engine: owns WASAPI exclusive / ASIO in its own process and
+# drains the shared ring written by the hook. No UI, no Apple Music knowledge.
+add_executable(am_exclusive_audiohost
+  src/AudioHost.cpp
+  src/audio_v2/AsioExclusiveSink.cpp
+  src/audio_v2/DlnaLog.cpp
+  src/audio_v2/WasapiExclusiveSink.cpp)
+target_include_directories(am_exclusive_audiohost PRIVATE src)
+target_compile_definitions(am_exclusive_audiohost PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(am_exclusive_audiohost PRIVATE ole32 uuid avrt advapi32)
+set_target_properties(am_exclusive_audiohost PROPERTIES OUTPUT_NAME "am-exclusive-audiohost")
 
 add_executable(am_exclusive_media_control src/MediaSessionControl.cpp)
 target_compile_definitions(am_exclusive_media_control PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -128,6 +141,7 @@ if(MSVC)
   target_compile_options(am_exclusive_ui PRIVATE /W4 /permissive- /EHsc /guard:cf /utf-8)
   target_compile_options(am_exclusive_media_control PRIVATE /W4 /permissive- /EHsc /guard:cf)
   target_compile_options(am_exclusive_broker PRIVATE /W4 /permissive- /EHsc /guard:cf /utf-8)
+  target_compile_options(am_exclusive_audiohost PRIVATE /W4 /permissive- /EHsc /guard:cf /utf-8)
   target_link_options(am_exclusive_hook PRIVATE /guard:cf)
   target_link_options(am_exclusive_ui PRIVATE /guard:cf)
   target_link_options(am_exclusive_media_control PRIVATE /guard:cf)
@@ -208,4 +222,5 @@ am_add_version_info(am_exclusive_hook "am-exclusive-hook.dll" "AMExclusive audio
 am_add_version_info(am_exclusive_ui "am-exclusive-ui.dll" "AMExclusive user interface" "AMExclusive 用户界面" VFT_DLL)
 am_add_version_info(am_exclusive_media_control "am_exclusive_media_control.exe" "AMExclusive media session control" "AMExclusive 媒体会话控制" VFT_APP)
 am_add_version_info(am_exclusive_broker "am-exclusive-broker.exe" "AMExclusive Apple Music companion" "AMExclusive Apple Music 伴生程序" VFT_APP)
+am_add_version_info(am_exclusive_audiohost "am-exclusive-audiohost.exe" "AMExclusive HiFi audio engine" "AMExclusive HiFi 音频引擎" VFT_APP)
 am_add_version_info(am_exclusive_setup "AMExclusive-Setup.exe" "AMExclusive installer" "AMExclusive 安装程序" VFT_APP)

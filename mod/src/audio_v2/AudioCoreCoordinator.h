@@ -120,7 +120,12 @@ public:
     }
     std::size_t BufferedBlocks() const noexcept { return queue_ ? queue_->Size() : 0; }
     std::size_t BufferedFrames() const noexcept {
-        return queue_ ? queue_->QueuedFrames() : 0;
+        // In Remote mode the samples move from this queue into the shared ring,
+        // so both halves count as captured-but-not-played. Keeping the sum here
+        // is what lets the pump water marks see the real reservoir.
+        const auto queued = queue_ ? queue_->QueuedFrames() : 0;
+        const auto remote = sink_ ? sink_->BufferedFrames() : 0;
+        return queued + remote;
     }
     std::size_t PendingSourceFrames() const noexcept {
         // Control-plane EOS checks are in source frames and must include the

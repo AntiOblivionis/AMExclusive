@@ -103,6 +103,7 @@ winrt::weak_ref<Controls::Border> g_outputFormatCard;
 winrt::weak_ref<Controls::ComboBox> g_outputCombo;       // network (DLNA) devices
 winrt::weak_ref<Controls::ComboBox> g_localBackendCombo;  // WASAPI / ASIO
 winrt::weak_ref<Controls::ComboBox> g_localDeviceCombo;   // endpoints / drivers
+winrt::weak_ref<Controls::ComboBox> g_playerModeCombo;
 winrt::weak_ref<Controls::ToggleSwitch> g_localTuningToggle;
 winrt::weak_ref<Controls::ComboBox> g_localReservoirCombo;
 winrt::weak_ref<Controls::ToggleSwitch> g_localSystemToggle;
@@ -1859,6 +1860,7 @@ std::wstring StreamFormatIniPath() {
 struct OutputSettings final {
     int kind{0}; // 0 = WASAPI, 1 = DLNA/OpenHome, 2 = ASIO
     int tab{-1}; // -1 = derive from kind
+    int playerMode{0}; // 0 = AM player (in-process), 1 = HiFi player (audiohost)
     std::wstring wasapiId;
     std::wstring wasapiName;
     std::wstring asioClsid;
@@ -1899,6 +1901,8 @@ OutputSettings ReadOutputSettings() {
     const auto tab = ReadIniText(L"mod", L"output_tab", L"");
     settings.tab = _wcsicmp(tab.c_str(), L"network") == 0 ? 1
         : _wcsicmp(tab.c_str(), L"local") == 0 ? 0 : -1;
+    settings.playerMode = _wcsicmp(ReadIniText(L"mod", L"player_mode", L"am").c_str(),
+                                   L"hifi") == 0 ? 1 : 0;
     settings.wasapiId = ReadIniText(L"mod", L"wasapi_device");
     settings.wasapiName = ReadIniText(L"mod", L"wasapi_name");
     settings.asioClsid = ReadIniText(L"mod", L"asio_driver");
@@ -1913,6 +1917,7 @@ void PersistOutputSettings(const OutputSettings& settings) {
     WriteIniText(L"mod", L"output", settings.kind == 2 ? L"asio"
         : settings.kind == 1 ? L"dlna" : L"wasapi");
     WriteIniText(L"mod", L"output_tab", settings.tab == 1 ? L"network" : L"local");
+    WriteIniText(L"mod", L"player_mode", settings.playerMode == 1 ? L"hifi" : L"am");
     WriteIniText(L"mod", L"wasapi_device", settings.wasapiId);
     WriteIniText(L"mod", L"wasapi_name", settings.wasapiName);
     WriteIniText(L"mod", L"asio_driver", settings.asioClsid);
@@ -2079,6 +2084,9 @@ void ApplyOutputSelection() {
     auto settings = ReadOutputSettings();
     const int tab = g_activeOutputTab.load();
     settings.tab = tab;
+    if (auto combo = g_playerModeCombo.get()) {
+        settings.playerMode = combo.SelectedIndex() == 1 ? 1 : 0;
+    }
     std::wstring localId;
     std::wstring displayName;
 
@@ -2300,6 +2308,33 @@ Controls::Border CreateOutputTargetCard(
     Controls::StackPanel localPanel;
     localPanel.Name(L"AMExclusiveLocalOutputPanel");
     localPanel.Margin(Xaml::Thickness{0, 4, 0, 0});
+
+    Controls::StackPanel modeRow;
+    modeRow.Orientation(Controls::Orientation::Horizontal);
+    modeRow.Spacing(8.0);
+    modeRow.Margin(Xaml::Thickness{0, 4, 0, 0});
+    Controls::TextBlock modeLabel;
+    modeLabel.Text(Localized(L"播放模式", L"Playback engine"));
+    modeLabel.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    modeLabel.MinWidth(120.0);
+    Controls::ComboBox modeCombo;
+    modeCombo.Name(L"AMExclusivePlayerModeCombo");
+    modeCombo.MinWidth(260.0);
+    {
+        Controls::ComboBoxItem amItem;
+        amItem.Content(box_value(Localized(L"AM 播放器（进程内）",
+                                           L"AM player (in-process)")));
+        modeCombo.Items().Append(amItem);
+        Controls::ComboBoxItem hifiItem;
+        hifiItem.Content(box_value(Localized(L"HiFi 播放器（独立引擎）",
+                                             L"HiFi player (audiohost)")));
+        modeCombo.Items().Append(hifiItem);
+    }
+    modeCombo.SelectedIndex(ReadOutputSettings().playerMode == 1 ? 1 : 0);
+    modeRow.Children().Append(modeLabel);
+    modeRow.Children().Append(modeCombo);
+    localPanel.Children().Append(modeRow);
+    g_playerModeCombo = winrt::make_weak(modeCombo);
 
     Controls::StackPanel backendRow;
     backendRow.Orientation(Controls::Orientation::Horizontal);

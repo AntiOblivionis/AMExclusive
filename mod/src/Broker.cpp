@@ -1523,6 +1523,29 @@ void ClientThread(HANDLE pipe) {
 
 } // namespace
 
+// The HiFi engine is a separate process owned by the broker. Start it once at
+// boot; the host enforces single-instance and stays idle until the hook
+// connects. Failure is not fatal - RemoteSink falls back to the in-process
+// sink when the host is absent.
+void StartAudioHost() {
+    wchar_t modulePath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, modulePath, static_cast<DWORD>(std::size(modulePath)));
+    const auto hostPath = std::filesystem::path(modulePath).parent_path() /
+        L"am-exclusive-audiohost.exe";
+    if (!std::filesystem::exists(hostPath)) return;
+    DWORD session = 0;
+    (void)ProcessIdToSessionId(GetCurrentProcessId(), &session);
+    std::wstring command = L"\"" + hostPath.wstring() + L"\" --session " +
+        std::to_wstring(session);
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    if (CreateProcessW(hostPath.c_str(), command.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+}
+
 int wmain() {
     using namespace ammod::ipc;
     (void)SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1563,6 +1586,7 @@ int wmain() {
         L" allowResampling=" + std::to_wstring(g_status.allowResampling) +
         L" output=" + std::to_wstring(g_outputKind) +
         L" dlnaDevice=" + g_dlnaName);
+    StartAudioHost();
     const auto pipeName = PipeName();
     PipeSecurity security;
     if (pipeName.empty() || !security.IsValid()) {

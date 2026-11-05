@@ -2,6 +2,7 @@
 #include "AsioExclusiveSink.h"
 #include "DlnaLog.h"
 #include "DlnaSink.h"
+#include "RemoteSink.h"
 
 #include <new>
 
@@ -52,6 +53,8 @@ HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) n
             sink_ = std::make_unique<DlnaSink>();
         } else if (config.sinkKind == AudioSinkKind::Asio) {
             sink_ = std::make_unique<AsioExclusiveSink>();
+        } else if (config.sinkKind == AudioSinkKind::Remote) {
+            sink_ = std::make_unique<RemoteSink>();
         } else {
             sink_ = std::make_unique<WasapiExclusiveSink>();
         }

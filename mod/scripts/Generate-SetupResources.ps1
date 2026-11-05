@@ -20,6 +20,7 @@ $resources = @(
     [pscustomobject]@{ Id = 110; File = Join-Path $ScriptDirectory 'Uninstall.cmd' }
     [pscustomobject]@{ Id = 111; File = Join-Path $RepositoryRoot 'LICENSE' }
     [pscustomobject]@{ Id = 112; File = Join-Path $RepositoryRoot 'THIRD_PARTY_NOTICES.md' }
+    [pscustomobject]@{ Id = 113; File = Join-Path $PayloadDirectory 'am-exclusive-audiohost.exe' }
 )
 
 foreach ($resource in $resources) {

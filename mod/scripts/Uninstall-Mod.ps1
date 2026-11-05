@@ -49,6 +49,7 @@ function Stop-AppleMusicRuntime {
         Start-Sleep -Milliseconds 100
     }
     Get-SessionProcess am-exclusive-broker | Stop-Process -Force
+    Get-SessionProcess am-exclusive-audiohost | Stop-Process -Force
 }
 
 # Mirror of the installer's check: an uninstall under a different (elevated)

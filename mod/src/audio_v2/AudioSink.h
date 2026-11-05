@@ -17,6 +17,9 @@ enum class AudioSinkKind : std::uint8_t {
     // Native ASIO driver, bypassing the Windows audio engine entirely. The
     // driver is chosen by CLSID and follows the track's sample rate.
     Asio = 2,
+    // "HiFi player" mode: a separate am-exclusive-audiohost.exe owns the
+    // endpoint and drains a shared-memory ring. The hook only moves PCM.
+    Remote = 3,
 };
 
 enum class AudioSinkState : std::uint8_t {
@@ -208,6 +211,11 @@ public:
     virtual AudioSinkStats Stats() const noexcept = 0;
     virtual const PcmFormat& Format() const noexcept = 0;
     virtual std::uint32_t BufferFrames() const noexcept = 0;
+
+    // Frames already captured but not yet played by the endpoint. Only the
+    // remote sink has a meaningful cross-process value; in-process sinks keep
+    // their accounting in the coordinator queue.
+    virtual std::size_t BufferedFrames() const noexcept { return 0; }
 
     virtual bool WaitingForSource() const noexcept = 0;
     virtual bool EndOfStreamSubmitted() const noexcept = 0;
