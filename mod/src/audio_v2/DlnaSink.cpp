@@ -906,9 +906,6 @@ void DlnaSink::ProducerMain() noexcept {
     // responsive without competing with MMCSS audio threads.
     const int previousPriority = GetThreadPriority(GetCurrentThread());
     (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-    lastServedBytes_ = 0;
-    lastProgressTick_ = GetTickCount64();
-    stallRestarts_ = 0;
     // The sample buffer is sized in int32 slots: one slot per channel per
     // frame. Hard-coding 2 here silently corrupts mono sources (Fill writes
     // half the buffer, PackChunk then reads the uninitialised tail as noise)
@@ -924,27 +921,6 @@ void DlnaSink::ProducerMain() noexcept {
             continue;
         }
         if (!source_) break;
-        // Renderer stall watchdog. The HTTP layer can resume any offset the
-        // ring still holds, but a range that has already been reclaimed can
-        // only be recovered by re-issuing the URI, so ask the panel to restart
-        // the current item. Eight seconds avoids fighting a normal pause.
-        if (session_) {
-            const auto now = GetTickCount64();
-            const auto served = session_->BytesServed();
-            if (served != lastServedBytes_) {
-                lastServedBytes_ = served;
-                lastProgressTick_ = now;
-                stallRestarts_ = 0;
-            } else if (served > 0 &&
-                       !endOfStreamSubmitted_.load(std::memory_order_acquire) &&
-                       now - lastProgressTick_ > 8000 && stallRestarts_ < 3) {
-                ++stallRestarts_;
-                lastProgressTick_ = now;
-                LogDlnaLine(L"dlna stalled 8s; requesting restart attempt=" +
-                            std::to_wstring(stallRestarts_));
-                RequestRestartCurrent();
-            }
-        }
         const HRESULT prepared = source_->Prepare(chunkFrames_);
         if (prepared == kAudioSourceWouldBlock) {
             waitingForSource_.store(true, std::memory_order_release);
@@ -998,22 +974,6 @@ void DlnaSink::ProducerMain() noexcept {
     waitingForSource_.store(false, std::memory_order_release);
     if (previousPriority != THREAD_PRIORITY_ERROR_RETURN) {
         (void)SetThreadPriority(GetCurrentThread(), previousPriority);
-    }
-}
-
-void DlnaSink::RequestRestartCurrent() noexcept {
-    wchar_t modulePath[MAX_PATH]{};
-    if (!GetModuleFileNameW(nullptr, modulePath, MAX_PATH)) return;
-    const auto helper = std::filesystem::path(modulePath).parent_path() /
-        L"am_exclusive_media_control.exe";
-    if (!std::filesystem::exists(helper)) return;
-    std::wstring command = L"\"" + helper.wstring() + L"\" restart-current";
-    STARTUPINFOW startup{sizeof(startup)};
-    PROCESS_INFORMATION process{};
-    if (CreateProcessW(helper.c_str(), command.data(), nullptr, nullptr, FALSE,
-                       CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
     }
 }
 
