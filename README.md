@@ -8,8 +8,6 @@
 
 [中文](README.zh-CN.md)
 
-[Website](https://amexclusive.tgwgroup.ltd/en/) · [Documentation](https://amexclusive.tgwgroup.ltd/en/docs/)
-
 ## Description
 
 AMExclusive (AME) is an open-source project designed specifically for Apple Music on Windows. It adds WASAPI exclusive audio output and forces Apple Music to use the highest available audio quality, with the goal of turning Apple Music into a more capable Hi-Fi player that can achieve bit-perfect output on supported hardware and configurations.

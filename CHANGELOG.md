@@ -36,9 +36,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **Local playback tuning for WASAPI / ASIO**, modelled on JPLAY's local engine
-  and off by default (an empty or disabled `[local]` section reproduces 0.3.0
-  behavior exactly):
+- **Local playback tuning for WASAPI / ASIO**, off by default (an empty or
+  disabled `[local]` section reproduces 0.3.0 behavior exactly):
   - **Deep reservoir** (`reservoir_ms`, 0.1–30 s): the capture queue grows with
     the target and the software pump water marks chase it. The cutover gate
     deliberately stays at 0.1 s, so playback never deadlocks when Apple Music
@@ -77,7 +76,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Not included
 
-- Kernel Streaming output (JPLAY creates KS pins directly).
+- Kernel Streaming output (direct KS pins).
 - System-wide Throttle / Hibernate (suspending other processes, switching power
   schemes, blocking input).
 - A separate playback process or the dual-PC UDP boundary.

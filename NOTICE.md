@@ -7,8 +7,6 @@ This repository is a fork of
 
 - Upstream license: **MIT License**
 - Upstream copyright: `Copyright (c) 2026 AMExclusive contributors`
-- Upstream website: `https://amexclusive.tgwgroup.ltd` (belongs to the upstream
-  project, not to this fork)
 
 The upstream `LICENSE` text is reproduced verbatim in this repository's
 [`LICENSE`](LICENSE), with a separate copyright line added for the derivative work
