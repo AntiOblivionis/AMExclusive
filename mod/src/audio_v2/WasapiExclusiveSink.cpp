@@ -1,4 +1,5 @@
 #include "WasapiExclusiveSink.h"
+#include "LocalPlaybackTuning.h"
 #include "NativeRenderGateProxy.h"
 #include "ResamplingPolicy.h"
 #include "../AudioErrors.h"
@@ -682,6 +683,9 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
     HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssIndex);
     if (!mmcss) mmcss = AvSetMmThreadCharacteristicsW(L"Audio", &mmcssIndex);
     if (mmcss) (void)AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_CRITICAL);
+    // Once per thread, before the loop: optional core affinity / deterministic
+    // priority boost for the exclusive render thread. No-op when tuning is off.
+    LocalPlaybackTuningRuntime::Instance().ApplyToCurrentThread();
 
     if (SUCCEEDED(apartment) || apartment == RPC_E_CHANGED_MODE) {
         HANDLE handles[3] = {shutdownEvent_, audioEvent_, config_.sourceReadyEvent};

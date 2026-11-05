@@ -2,6 +2,7 @@
 
 #include "PcmTypes.h"
 #include "MemoryLock.h"
+#include "LocalPlaybackTuning.h"
 
 #include <rigtorp/SPSCQueue.h>
 
@@ -19,6 +20,11 @@ namespace ammod::audio_v2 {
 struct PcmBlockPool final {
     PcmBlock* base{};
     std::size_t count{};
+    // Local WASAPI/ASIO only: try a MEM_LARGE_PAGES allocation for the deep
+    // reservoir. DLNA keeps the ordinary allocator.
+    bool preferLargePages{};
+    bool largePages{};
+    std::size_t allocatedBytes{};
 };
 
 // Minimal allocator that only exists to observe the queue's allocation.
@@ -35,14 +41,36 @@ struct PcmBlockAllocator final {
     PcmBlockAllocator& operator=(const PcmBlockAllocator&) noexcept = default;
 
     PcmBlock* allocate(std::size_t count) {
+        if (pool && pool->preferLargePages && count != 0) {
+            std::size_t granted = 0;
+            void* raw = LocalPlaybackTuningRuntime::AllocateLargePages(
+                count * sizeof(PcmBlock), granted);
+            if (raw) {
+                pool->base = static_cast<PcmBlock*>(raw);
+                pool->count = count;
+                pool->largePages = true;
+                pool->allocatedBytes = granted;
+                return pool->base;
+            }
+        }
         PcmBlock* memory = std::allocator<PcmBlock>{}.allocate(count);
         if (pool) {
             pool->base = memory;
             pool->count = count;
+            pool->largePages = false;
+            pool->allocatedBytes = count * sizeof(PcmBlock);
         }
         return memory;
     }
     void deallocate(PcmBlock* memory, std::size_t count) noexcept {
+        if (pool && pool->largePages && memory && memory == pool->base) {
+            LocalPlaybackTuningRuntime::FreeLargePages(memory);
+            pool->base = nullptr;
+            pool->count = 0;
+            pool->largePages = false;
+            pool->allocatedBytes = 0;
+            return;
+        }
         std::allocator<PcmBlock>{}.deallocate(memory, count);
     }
     bool operator==(const PcmBlockAllocator& other) const noexcept {
@@ -55,8 +83,9 @@ struct PcmBlockAllocator final {
 
 class PcmQueue final {
 public:
-    explicit PcmQueue(std::size_t capacity)
-        : queue_(capacity, PcmBlockAllocator{&pool_}) {}
+    explicit PcmQueue(std::size_t capacity, bool preferLargePages = false)
+        : pool_{nullptr, 0u, preferLargePages, false, 0u},
+          queue_(capacity, PcmBlockAllocator{&pool_}) {}
 
     PcmQueue(const PcmQueue&) = delete;
     PcmQueue& operator=(const PcmQueue&) = delete;
@@ -66,10 +95,12 @@ public:
     // a trimmed page just costs a page fault on the callback thread.
     bool LockMemory() noexcept {
         if (!pool_.base || pool_.count == 0) return false;
+        // Large pages are already non-pageable; VirtualLock cannot apply.
+        if (pool_.largePages) return true;
         return LockBuffer(pool_.base, pool_.count * sizeof(PcmBlock));
     }
     void UnlockMemory() noexcept {
-        if (!pool_.base || pool_.count == 0) return;
+        if (!pool_.base || pool_.count == 0 || pool_.largePages) return;
         UnlockBuffer(pool_.base, pool_.count * sizeof(PcmBlock));
     }
     std::size_t LockableBytes() const noexcept {
@@ -173,6 +204,8 @@ public:
         endOfStreamSealed_.store(false, std::memory_order_release);
     }
     std::size_t Size() const noexcept { return queue_.size(); }
+    std::size_t Capacity() const noexcept { return queue_.capacity(); }
+    bool UsesLargePages() const noexcept { return pool_.largePages; }
     bool CanAccept(std::uint32_t frames) const noexcept {
         const auto blocks = (static_cast<std::size_t>(frames) + kMaxBlockFrames - 1u) / kMaxBlockFrames;
         return blocks <= queue_.capacity() && queue_.size() <= queue_.capacity() - blocks;

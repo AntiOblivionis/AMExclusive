@@ -1,4 +1,5 @@
 #include "NativeRenderGateProxy.h"
+#include "LocalPlaybackTuning.h"
 
 #include <algorithm>
 #include <avrt.h>
@@ -892,6 +893,7 @@ DWORD WINAPI NativeAudioClientProxy::PumpThreadThunk(void* context) noexcept {
     HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssIndex);
     if (!mmcss) mmcss = AvSetMmThreadCharacteristicsW(L"Audio", &mmcssIndex);
     if (mmcss) (void)AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_CRITICAL);
+    LocalPlaybackTuningRuntime::Instance().ApplyToCurrentThread();
 
     const HANDLE timer = self->pumpTimer_;
 

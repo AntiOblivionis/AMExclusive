@@ -103,6 +103,9 @@ winrt::weak_ref<Controls::Border> g_outputFormatCard;
 winrt::weak_ref<Controls::ComboBox> g_outputCombo;       // network (DLNA) devices
 winrt::weak_ref<Controls::ComboBox> g_localBackendCombo;  // WASAPI / ASIO
 winrt::weak_ref<Controls::ComboBox> g_localDeviceCombo;   // endpoints / drivers
+winrt::weak_ref<Controls::ToggleSwitch> g_localTuningToggle;
+winrt::weak_ref<Controls::ComboBox> g_localReservoirCombo;
+winrt::weak_ref<Controls::ToggleSwitch> g_localSystemToggle;
 winrt::weak_ref<Controls::Button> g_localTabButton;
 winrt::weak_ref<Controls::Button> g_networkTabButton;
 winrt::weak_ref<Controls::StackPanel> g_localPanel;
@@ -1878,6 +1881,12 @@ void WriteIniText(const wchar_t* section, const wchar_t* key,
     (void)WritePrivateProfileStringW(section, key, value.c_str(), path.c_str());
 }
 
+int ReadIniInt(const wchar_t* section, const wchar_t* key, int fallback) {
+    const auto path = StreamFormatIniPath();
+    if (path.empty()) return fallback;
+    return GetPrivateProfileIntW(section, key, fallback, path.c_str());
+}
+
 OutputSettings ReadOutputSettings() {
     OutputSettings settings;
     const auto output = ReadIniText(L"mod", L"output", L"wasapi");
@@ -1911,6 +1920,42 @@ void PersistOutputSettings(const OutputSettings& settings) {
     if (!path.empty()) {
         (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
     }
+}
+
+// Writes only the three panel-owned keys. process_priority and
+// max_queue_blocks stay hand-editable and are preserved as-is. The hook reads
+// this section on the next SetOutputTarget, and the save path restarts the
+// current track, which is the generation boundary where it takes effect.
+void PersistLocalTuning() {
+    // Never overwrite the ini from a save that happened before the card (or a
+    // future panel revision) actually produced these controls.
+    if (!g_localTuningToggle.get() && !g_localReservoirCombo.get() &&
+        !g_localSystemToggle.get()) {
+        return;
+    }
+    static constexpr int kReservoirMs[] = {100, 500, 2000, 5000, 10000};
+    bool enabled = false;
+    if (auto toggle = g_localTuningToggle.get()) {
+        try { enabled = toggle.IsOn(); } catch (...) {}
+    }
+    int index = 2;
+    if (auto combo = g_localReservoirCombo.get()) {
+        try { index = combo.SelectedIndex(); } catch (...) {}
+    }
+    if (index < 0 || index > 4) index = 2;
+    bool system = false;
+    if (auto toggle = g_localSystemToggle.get()) {
+        try { system = toggle.IsOn(); } catch (...) {}
+    }
+    WriteIniText(L"local", L"enabled", enabled ? L"1" : L"0");
+    WriteIniText(L"local", L"reservoir_ms", std::to_wstring(kReservoirMs[index]));
+    WriteIniText(L"local", L"timer_100ns", system ? L"5000" : L"0");
+    WriteIniText(L"local", L"dedicated_core", system ? L"1" : L"0");
+    WriteIniText(L"local", L"large_pages", system ? L"1" : L"0");
+    WriteIniText(L"local", L"disable_thread_boost", L"1");
+    Log(L"ui local tuning saved enabled=" + std::to_wstring(enabled ? 1 : 0) +
+        L" reservoirMs=" + std::to_wstring(kReservoirMs[index]) +
+        L" system=" + std::to_wstring(system ? 1 : 0));
 }
 
 void SetOutputStatusText(const std::wstring& text) {
@@ -2024,6 +2069,9 @@ void ApplyOutputSelection() {
     auto settings = ReadOutputSettings();
     const int tab = g_activeOutputTab.load();
     settings.tab = tab;
+    // Persist tuning before any device validation so a user who only flips
+    // these switches never loses the change to a missing-driver early return.
+    if (tab == 0) PersistLocalTuning();
     std::wstring localId;
     std::wstring displayName;
 
@@ -2294,6 +2342,101 @@ Controls::Border CreateOutputTargetCard(
     localDeviceRow.Children().Append(localDeviceCombo);
     localDeviceRow.Children().Append(refreshLocal);
     localPanel.Children().Append(localDeviceRow);
+
+    // ---- local tuning (JPLAY-style, WASAPI / ASIO only) ------------------
+    Controls::TextBlock tuningTitle;
+    tuningTitle.Text(Localized(L"本地播放优化", L"Local playback tuning"));
+    tuningTitle.Margin(Xaml::Thickness{0, 12, 0, 0});
+    if (nativeText.size() > 1) tuningTitle.Style(nativeText[1].Style());
+    localPanel.Children().Append(tuningTitle);
+
+    Controls::StackPanel tuningRow;
+    tuningRow.Orientation(Controls::Orientation::Horizontal);
+    tuningRow.Spacing(8.0);
+    tuningRow.Margin(Xaml::Thickness{0, 4, 0, 0});
+    Controls::TextBlock tuningToggleLabel;
+    tuningToggleLabel.Text(Localized(L"深度优化", L"Deep optimisation"));
+    tuningToggleLabel.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    tuningToggleLabel.MinWidth(120.0);
+    Controls::ToggleSwitch tuningToggle;
+    tuningToggle.Name(L"AMExclusiveLocalTuningToggle");
+    tuningToggle.OnContent(nullptr);
+    tuningToggle.OffContent(nullptr);
+    tuningToggle.IsOn(ReadIniInt(L"local", L"enabled", 0) != 0);
+    tuningRow.Children().Append(tuningToggleLabel);
+    tuningRow.Children().Append(tuningToggle);
+    localPanel.Children().Append(tuningRow);
+    g_localTuningToggle = winrt::make_weak(tuningToggle);
+
+    Controls::StackPanel reservoirRow;
+    reservoirRow.Orientation(Controls::Orientation::Horizontal);
+    reservoirRow.Spacing(8.0);
+    reservoirRow.Margin(Xaml::Thickness{0, 4, 0, 0});
+    Controls::TextBlock reservoirLabel;
+    reservoirLabel.Text(Localized(L"内存储备", L"Memory reservoir"));
+    reservoirLabel.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    reservoirLabel.MinWidth(120.0);
+    Controls::ComboBox reservoirCombo;
+    reservoirCombo.Name(L"AMExclusiveLocalReservoirCombo");
+    reservoirCombo.MinWidth(160.0);
+    {
+        const wchar_t* labels[5][2] = {
+            {L"0.1 秒", L"0.1 s"}, {L"0.5 秒", L"0.5 s"}, {L"2 秒", L"2 s"},
+            {L"5 秒", L"5 s"}, {L"10 秒", L"10 s"}};
+        for (const auto& label : labels) {
+            Controls::ComboBoxItem item;
+            item.Content(box_value(Localized(label[0], label[1])));
+            reservoirCombo.Items().Append(item);
+        }
+    }
+    {
+        static constexpr int kReservoirMs[5] = {100, 500, 2000, 5000, 10000};
+        const int saved = ReadIniInt(L"local", L"reservoir_ms", 2000);
+        int best = 2;
+        int bestDistance = 0x7fffffff;
+        for (int i = 0; i < 5; ++i) {
+            const int distance = saved > kReservoirMs[i]
+                ? saved - kReservoirMs[i] : kReservoirMs[i] - saved;
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = i;
+            }
+        }
+        reservoirCombo.SelectedIndex(best);
+    }
+    reservoirRow.Children().Append(reservoirLabel);
+    reservoirRow.Children().Append(reservoirCombo);
+    localPanel.Children().Append(reservoirRow);
+    g_localReservoirCombo = winrt::make_weak(reservoirCombo);
+
+    Controls::StackPanel systemRow;
+    systemRow.Orientation(Controls::Orientation::Horizontal);
+    systemRow.Spacing(8.0);
+    systemRow.Margin(Xaml::Thickness{0, 4, 0, 0});
+    Controls::TextBlock systemLabel;
+    systemLabel.Text(Localized(L"系统级时序", L"System timing"));
+    systemLabel.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    systemLabel.MinWidth(120.0);
+    Controls::ToggleSwitch systemToggle;
+    systemToggle.Name(L"AMExclusiveLocalSystemToggle");
+    systemToggle.OnContent(nullptr);
+    systemToggle.OffContent(nullptr);
+    systemToggle.IsOn(ReadIniInt(L"local", L"timer_100ns", 0) != 0 ||
+                      ReadIniInt(L"local", L"dedicated_core", 0) != 0 ||
+                      ReadIniInt(L"local", L"large_pages", 0) != 0);
+    systemRow.Children().Append(systemLabel);
+    systemRow.Children().Append(systemToggle);
+    localPanel.Children().Append(systemRow);
+    g_localSystemToggle = winrt::make_weak(systemToggle);
+
+    Controls::TextBlock tuningHint;
+    tuningHint.Text(Localized(
+        L"开启后：整轨深储备、0.5ms 定时器、专属核心、大页内存。默认关闭，只作用于 WASAPI / ASIO，网播不受影响；出现爆音或进度异常时关掉即可回退。",
+        L"When on: deep reservoir, 0.5 ms timer, dedicated core, large pages. Off by default; local WASAPI / ASIO only, network playback untouched. Turn it off to roll back."));
+    tuningHint.TextWrapping(Xaml::TextWrapping::Wrap);
+    tuningHint.Margin(Xaml::Thickness{0, 4, 0, 0});
+    if (nativeText.size() > 1) tuningHint.Style(nativeText[1].Style());
+    localPanel.Children().Append(tuningHint);
 
     Controls::StackPanel localButtons;
     localButtons.Orientation(Controls::Orientation::Horizontal);

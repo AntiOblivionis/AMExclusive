@@ -1,4 +1,5 @@
 #include "AudioCoreRuntime.h"
+#include "LocalPlaybackTuning.h"
 #include "../AudioErrors.h"
 #include "../AudioFormatPolicy.h"
 
@@ -133,6 +134,10 @@ void AudioCoreRuntime::Stop() noexcept {
         CloseHandle(workerThread_);
         workerThread_ = nullptr;
     }
+    // Undo process-wide OS state (timer resolution / priority class) that the
+    // local tuning may have armed. Thread affinity and boost changes die with
+    // their audio threads and need no restore.
+    LocalPlaybackTuningRuntime::Instance().Restore();
     {
         ControlScope lock(*this);
         uiEnabled_.store(false, std::memory_order_release);
@@ -230,6 +235,21 @@ void AudioCoreRuntime::SetHardwareBufferMilliseconds(std::uint32_t milliseconds)
 void AudioCoreRuntime::SetAllowResampling(bool enabled) noexcept {
     // Applied when the next generation is bound; never replace a live stream.
     allowResampling_.store(enabled, std::memory_order_release);
+}
+
+void AudioCoreRuntime::SetLocalPlaybackTuning(const LocalPlaybackTuning& tuning) noexcept {
+    LocalPlaybackTuning normalized = tuning;
+    normalized.Clamp();
+    ControlScope lock(*this);
+    if (normalized.SameAs(localTuning_)) return;
+    const bool wasEnabled = localTuning_.enabled;
+    localTuning_ = normalized;
+    // Turning the master switch off must undo process-wide OS state promptly,
+    // even if no new generation is bound for a while. Enabling is deliberately
+    // deferred to the next bind so a live stream is never disturbed.
+    if (!normalized.enabled && wasEnabled) {
+        LocalPlaybackTuningRuntime::Instance().Restore();
+    }
 }
 
 void AudioCoreRuntime::SetOutputTarget(AudioSinkKind kind, const DlnaTarget& target,
@@ -1787,7 +1807,29 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     config.sink.alignmentRetries = 3;
     config.sink.lifecycleContext = callbacks_.context;
     config.sink.onLifecycle = callbacks_.onSinkLifecycle;
-    config.queueCapacity = kProductionQueueCapacity;
+    // JPLAY-style deep reservoir applies to local outputs only. The network
+    // renderer keeps its own [dlna] buffer policy completely untouched.
+    const bool localTuned = outputKind_ != AudioSinkKind::Dlna && localTuning_.enabled;
+    std::size_t queueCapacity = kProductionQueueCapacity;
+    std::uint64_t reservoirFrames = 0;
+    if (localTuned) {
+        reservoirFrames = static_cast<std::uint64_t>(format.sampleRate) *
+                          localTuning_.reservoirMs / 1000u;
+        const std::uint64_t neededBlocks =
+            (reservoirFrames * 5u / 4u + kMaxBlockFrames - 1u) / kMaxBlockFrames;
+        queueCapacity = static_cast<std::size_t>(std::clamp<std::uint64_t>(
+            std::max<std::uint64_t>(neededBlocks, kProductionQueueCapacity),
+            kProductionQueueCapacity, localTuning_.maxQueueBlocks));
+        const std::uint64_t usableBlocks = queueCapacity > 16u ? queueCapacity - 16u : 0u;
+        reservoirFrames = std::min<std::uint64_t>(
+            reservoirFrames, static_cast<std::uint64_t>(usableBlocks) * kMaxBlockFrames);
+    }
+    config.queueCapacity = queueCapacity;
+    config.preferLargePages = localTuned && localTuning_.largePages;
+    // Process-wide OS state belongs to the local path only; binding a DLNA
+    // generation restores the defaults immediately.
+    LocalPlaybackTuningRuntime::Instance().Configure(
+        localTuned ? localTuning_ : LocalPlaybackTuning{});
     config.mediaGeneration = generation;
     // Local int32 has already passed through Apple's float32 P0 output. In
     // compatibility mode accept that decoded stream via the bounded float
@@ -1820,6 +1862,9 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     // Cut over only after roughly 100 ms is already captured. A single 20 ms
     // device period was too easy to drain during transient CPU scheduling load;
     // this remains far below the old second-scale reservoir that hurt controls.
+    // The local deep reservoir is deliberately NOT a cutover gate: Apple Music
+    // may only decode a few seconds ahead, and raising the gate would deadlock
+    // playback. It only widens the queue and moves the pump water marks.
     // DLNA additionally needs its configured network reservoir before the
     // device is told to play; the queue has room for 5-12 seconds of P0.
     requiredPrebufferFrames_ = std::max<std::uint32_t>(
@@ -1840,8 +1885,18 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
         nativePumpLowWaterFrames_ = rate * std::max<std::uint32_t>(streamBufferMs_ / 2u, 300u) / 1000u;
         nativePumpHighWaterFrames_ = rate * (streamBufferMs_ + 500u) / 1000u;
     } else {
-        nativePumpLowWaterFrames_ = rate * 3u / 10u;
-        nativePumpHighWaterFrames_ = rate / 2u;
+        const std::uint64_t baselineLow = rate * 3u / 10u;
+        const std::uint64_t baselineHigh = rate / 2u;
+        if (localTuned && reservoirFrames != 0) {
+            // Keep the 0.3/0.5 s floor and let the existing 9/10/11 ms
+            // software pump chase the deep target. It never changes the
+            // bit-perfect samples or the DAC-driven submission clock.
+            nativePumpLowWaterFrames_ = std::max(baselineLow, reservoirFrames * 7u / 10u);
+            nativePumpHighWaterFrames_ = std::max(baselineHigh, reservoirFrames * 9u / 10u);
+        } else {
+            nativePumpLowWaterFrames_ = baselineLow;
+            nativePumpHighWaterFrames_ = baselineHigh;
+        }
     }
     nativePumpSampleRate_.store(format.sampleRate, std::memory_order_release);
     nativePumpBufferedFrames_.store(

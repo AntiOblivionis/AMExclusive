@@ -20,6 +20,7 @@
 #include "UiPlaybackState.h"
 #include "audio_v2/AudioCoreGate.h"
 #include "audio_v2/AudioCoreRuntime.h"
+#include "audio_v2/LocalPlaybackTuning.h"
 #include "audio_v2/NativeRenderGateProxy.h"
 
 #include <algorithm>
@@ -917,6 +918,50 @@ bool ReadBool(const wchar_t* key, bool fallback) {
     std::wstring value = ReadSetting(key, fallback ? L"true" : L"false");
     std::transform(value.begin(), value.end(), value.begin(), towlower);
     return value == L"true" || value == L"1" || value == L"yes";
+}
+
+// [local] in am-exclusive.ini drives the JPLAY-style tuning for the WASAPI
+// and ASIO paths only. Everything is off by default, so a missing section
+// reproduces the original pipeline byte for byte.
+ammod::audio_v2::LocalPlaybackTuning ReadLocalPlaybackTuning() {
+    using ammod::audio_v2::LocalPlaybackTuning;
+    auto number = [](const wchar_t* key, int fallback) -> std::uint32_t {
+        return static_cast<std::uint32_t>(
+            GetPrivateProfileIntW(L"local", key, fallback, g_iniPath.c_str()));
+    };
+    auto flag = [&number](const wchar_t* key, int fallback) -> bool {
+        return number(key, fallback) != 0;
+    };
+    LocalPlaybackTuning tuning{};
+    tuning.enabled = flag(L"enabled", 0);
+    tuning.reservoirMs = number(L"reservoir_ms", 100);
+    tuning.timerResolution100ns = number(L"timer_100ns", 0);
+    tuning.dedicatedCore = flag(L"dedicated_core", 0);
+    tuning.processPriority = flag(L"process_priority", 0);
+    tuning.disableThreadBoost = flag(L"disable_thread_boost", 1);
+    tuning.largePages = flag(L"large_pages", 0);
+    tuning.maxQueueBlocks = number(L"max_queue_blocks", 4096);
+    tuning.Clamp();
+    return tuning;
+}
+
+std::wstring DescribeLocalTuning(const ammod::audio_v2::LocalPlaybackTuning& tuning) {
+    std::wostringstream out;
+    out << L" enabled=" << tuning.enabled
+        << L" reservoirMs=" << tuning.reservoirMs
+        << L" timer100ns=" << tuning.timerResolution100ns
+        << L" dedicatedCore=" << tuning.dedicatedCore
+        << L" processPriority=" << tuning.processPriority
+        << L" noBoost=" << tuning.disableThreadBoost
+        << L" largePages=" << tuning.largePages
+        << L" maxBlocks=" << tuning.maxQueueBlocks;
+    return out.str();
+}
+
+void ApplyLocalPlaybackTuning(const wchar_t* reason) {
+    const auto tuning = ReadLocalPlaybackTuning();
+    g_audioCoreRuntime.SetLocalPlaybackTuning(tuning);
+    Log(std::wstring(L"local tuning ") + reason + DescribeLocalTuning(tuning));
 }
 
 std::wstring FormatText(const WAVEFORMATEX* format) {
@@ -1838,6 +1883,14 @@ void AudioCoreRuntimeEventCallback(void*, const ammod::audio_v2::AudioCoreRuntim
             std::to_wstring(sourceBits) +
             (format.encoding == ammod::audio_v2::PcmEncoding::IeeeFloat
                 ? L" encoding=float interleaved=1}" : L" encoding=signed-int interleaved=1}"));
+        Log(L"audio core v2 local queue blocks=" +
+            std::to_wstring(g_audioCoreRuntime.Coordinator().QueueCapacity()) +
+            L" largePages=" + std::to_wstring(
+                g_audioCoreRuntime.Coordinator().QueueUsesLargePages() ? 1u : 0u) +
+            L" targetReservoirMs=" + std::to_wstring(
+                g_audioCoreRuntime.LocalTuning().reservoirMs) +
+            L" tuningEnabled=" + std::to_wstring(
+                g_audioCoreRuntime.LocalTuning().enabled ? 1u : 0u));
         Log(L"audio core v2 bound qpc=" + std::to_wstring(CurrentQpc()));
         SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
                        ammod::ipc::RuntimeState::Probing, true, {}, nullptr, S_OK,
@@ -2173,9 +2226,14 @@ bool DrainV2LocalQueue(void* converter, const std::shared_ptr<LocalPcmQueue>& qu
     thread_local std::array<float, ammod::audio_v2::kMaxBlockFrames * 2u> canonical{};
     bool forwarded{};
     for (;;) {
-        // Leave headroom in the proven fixed-capacity ACv2 queue. The local
-        // staging queue remains the lossless back-pressure reservoir.
-        if (g_audioCoreRuntime.Coordinator().BufferedBlocks() >= 240) break;
+        // Leave headroom in the ACv2 queue. The local deep reservoir widens
+        // that queue, so the limit follows its actual capacity; with the
+        // default 256 blocks this is still exactly the old 240-block limit.
+        // The local staging queue remains the lossless back-pressure reservoir.
+        const auto capacity = g_audioCoreRuntime.Coordinator().QueueCapacity();
+        const std::size_t limit = capacity > 16u ? capacity - 16u : 0u;
+        if (static_cast<std::size_t>(
+                g_audioCoreRuntime.Coordinator().BufferedBlocks()) >= limit) break;
         const auto available = V2LocalQueueAvailableFrames(queue);
         if (available == 0) break;
         const auto frames = std::min<std::uint32_t>(
@@ -3651,6 +3709,7 @@ DWORD WINAPI PipeClientLoop(void*) {
                 } else if (kindCode == 0u) {
                     profile.wasapiDeviceId = incoming.format;
                 }
+                ApplyLocalPlaybackTuning(L"reloaded");
                 g_audioCoreRuntime.SetOutputProfile(profile);
                 Log(L"output profile received kind=" + std::to_wstring(
                         static_cast<unsigned>(kindCode)) +
@@ -3721,6 +3780,9 @@ DWORD WINAPI InitializeHooks(void*) {
     g_iniPath = directory / L"am-exclusive.ini";
     g_logPath = directory / L"am-exclusive.log";
     LogEnvironmentSnapshot();
+    // Read [local] once at startup; SetOutputTarget re-reads it so a hand
+    // edit takes effect after saving once in the panel (no restart needed).
+    ApplyLocalPlaybackTuning(L"startup");
     g_nativeTraceEnabled.store(ReadBool(L"native_trace", false), std::memory_order_release);
     ammod::quality::SetEnabled(false);
     g_audioCoreGate.SetUiEnabled(false);

@@ -1,4 +1,5 @@
 #include "AsioExclusiveSink.h"
+#include "LocalPlaybackTuning.h"
 
 #include "../AudioErrors.h"
 #include "DlnaLog.h"
@@ -61,6 +62,7 @@ HRESULT AsioExclusiveSink::Open(const AudioSinkOpenParams& params) noexcept {
     Close();
     params_ = params;
     format_ = params.format;
+    threadTuningApplied_.store(false, std::memory_order_release);
     NotifyLifecycle(AudioSinkLifecycleEvent::OpenEnter, S_OK);
 
     submittedFrames_.store(0, std::memory_order_release);
@@ -493,6 +495,12 @@ void AsioExclusiveSink::WriteSilence(long bufferIndex) noexcept {
 }
 
 void AsioExclusiveSink::FillBuffer(long bufferIndex) noexcept {
+    // The driver created this thread, not us. Apply the optional local tuning
+    // once, before any sample fill; later callbacks only touch driver buffers.
+    if (!threadTuningApplied_.load(std::memory_order_acquire)) {
+        threadTuningApplied_.store(true, std::memory_order_release);
+        LocalPlaybackTuningRuntime::Instance().ApplyToCurrentThread();
+    }
     // Once the producer is sealed, let the driver play out both halves of its
     // double buffer before reporting the generation as drained.
     if (endOfStreamSubmitted_.load(std::memory_order_acquire)) {

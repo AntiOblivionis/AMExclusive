@@ -38,7 +38,8 @@ HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) n
     }
 
     try {
-        queue_ = std::make_unique<PcmQueue>(config.queueCapacity);
+        queue_ = std::make_unique<PcmQueue>(config.queueCapacity,
+                                            config.preferLargePages);
         // Pin the capture queue: the real-time P0 callback writes straight into
         // it, and a page fault there is an audible dropout. Best effort - the
         // queue works unchanged if the working-set quota refuses the lock.

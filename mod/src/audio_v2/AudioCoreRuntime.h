@@ -4,6 +4,7 @@
 #include "ApplePcmTap.h"
 #include "AudioCoreConverterRegistry.h"
 #include "AudioSink.h"
+#include "LocalPlaybackTuning.h"
 #include "WasapiExclusiveSink.h"
 #include "../ProcessLifetime.h"
 
@@ -137,6 +138,11 @@ public:
     void SetUiEnabled(bool enabled) noexcept;
     void SetHardwareBufferMilliseconds(std::uint32_t milliseconds) noexcept;
     void SetAllowResampling(bool enabled) noexcept;
+    // JPLAY-style local-only (WASAPI/ASIO) tuning. Inert by default. The
+    // control plane stores it; the next bound generation applies it. DLNA
+    // always reduces this to the default (all features off).
+    void SetLocalPlaybackTuning(const LocalPlaybackTuning& tuning) noexcept;
+    const LocalPlaybackTuning& LocalTuning() const noexcept { return localTuning_; }
     // Output target changes are deferred to the next media generation while a
     // graph is live. The current bridge cannot rebind an existing converter
     // after SetUiEnabled(false) clears its graph identity.
@@ -314,6 +320,8 @@ private:
     std::atomic<bool> abandoned_{};
     std::atomic<std::uint32_t> hardwareBufferMs_{20};
     std::atomic<bool> allowResampling_{};
+    // Guarded by controlMutex_; read on the worker while building a graph.
+    LocalPlaybackTuning localTuning_{};
     AudioSinkKind outputKind_{AudioSinkKind::Wasapi};
     DlnaTarget dlnaTarget_{};
     std::uint32_t streamBufferMs_{1500};

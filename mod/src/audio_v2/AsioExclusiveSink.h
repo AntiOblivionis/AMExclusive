@@ -104,6 +104,9 @@ private:
     std::atomic<bool> waitingForSource_{};
     std::atomic<bool> endOfStreamSubmitted_{};
     std::atomic<bool> endOfStreamComplete_{};
+    // The driver owns the bufferSwitch thread; apply local tuning exactly once
+    // per opened sink so the real-time callback stays allocation/lock free.
+    std::atomic<bool> threadTuningApplied_{};
     std::atomic<std::uint32_t> eosCallbacksRemaining_{};
 
     std::atomic<AudioSinkState> state_{AudioSinkState::Closed};

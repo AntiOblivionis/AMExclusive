@@ -25,6 +25,9 @@ struct AudioCoreCoordinatorConfig final {
     std::uint64_t mediaGeneration{1};
     PcmMappingPolicy mappingPolicy{PcmMappingPolicy::ExactSourceInteger};
     bool verifyBitPerfect{};
+    // Local WASAPI/ASIO deep reservoir: try MEM_LARGE_PAGES for the capture
+    // queue. Never set for DLNA.
+    bool preferLargePages{};
 };
 
 struct AudioCoreCoordinatorStats final {
@@ -70,6 +73,12 @@ public:
 
     bool ShouldSuppressNative() const noexcept;
     bool IsEnabled() const noexcept { return gate_.UiEnabled(); }
+    std::size_t QueueCapacity() const noexcept {
+        return queue_ ? queue_->Capacity() : 0u;
+    }
+    bool QueueUsesLargePages() const noexcept {
+        return queue_ ? queue_->UsesLargePages() : false;
+    }
     AudioCoreGatePhase Phase() const noexcept { return gate_.Phase(); }
     // Requested output until the endpoint opens, then its negotiated format.
     const PcmFormat& OutputFormat() const noexcept {
