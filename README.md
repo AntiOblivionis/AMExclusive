@@ -10,7 +10,19 @@
 
 ## Description
 
-AMExclusive (AME) is an open-source project designed specifically for Apple Music on Windows. It adds WASAPI exclusive audio output and forces Apple Music to use the highest available audio quality, with the goal of turning Apple Music into a more capable Hi-Fi player that can achieve bit-perfect output on supported hardware and configurations.
+AMExclusive (AME) is an open-source project for Apple Music on Windows. It taps
+PCM straight out of Apple's own decoder and submits it to the device itself,
+bypassing the Windows mixer, with four bit-perfect output paths:
+
+- **WASAPI exclusive** — the local endpoint, opened exclusively at the track's own rate
+- **ASIO** — any registered ASIO driver, sample rate followed per track
+- **OpenHome** — network renderers with playlist control (gapless auto-advance)
+- **DLNA / UPnP** — file-shaped WAV or FLAC stream with a real byte count, so the
+  renderer shows the correct duration and can seek inside the burst window
+
+It also forces Apple Music to request the highest available lossless tier instead
+of silently downgrading, turning it into a Hi-Fi player that can reach bit-perfect
+output on supported hardware and configurations.
 
 ## Development and Test Environment
 

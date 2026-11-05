@@ -10,7 +10,18 @@
 
 ## 描述
 
-AMExclusive（AME）是一个专为 Windows 版 Apple Music 设计的开源项目，旨在为 Apple Music 提供 WASAPI 独占音频输出以及强制最高音频规格输出的能力，并以此将 Apple Music 优化为一款在受支持硬件与配置下可实现 bit-perfect 输出的“专业”Hi-Fi 音乐播放器。
+AMExclusive（AME）是一个面向 Windows 版 Apple Music 的开源项目。它直接从 Apple
+自己的解码器里取出 PCM，自己提交给设备，绕过 Windows 混音器，提供四条
+bit-perfect 输出通路：
+
+- **WASAPI 独占** —— 本机输出端点，按曲目原始采样率独占打开
+- **ASIO** —— 任意已注册的 ASIO 驱动，采样率逐曲跟随
+- **OpenHome** —— 网播设备，带播放列表控制，支持连播无间隙滚动
+- **DLNA / UPnP** —— 文件形态的 WAV / FLAC 流，声明真实字节数，网播能显示
+  正确时长并在缓冲窗口内拖动
+
+同时强制 Apple Music 请求最高可用无损规格而不是悄悄降级，把它变成一台在受支持
+硬件与配置下可以做到 bit-perfect 的 Hi-Fi 播放器。
 
 ## 开发与测试环境
 
