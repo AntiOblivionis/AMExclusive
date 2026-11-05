@@ -2662,9 +2662,10 @@ Controls::Border CreateOutputTargetCard(
     bufferCombo.MinWidth(160.0);
     bufferCombo.VerticalAlignment(Xaml::VerticalAlignment::Center);
     {
-        const wchar_t* names[5][2] = {
-            {L"1.5 秒", L"1.5 s"}, {L"2 秒", L"2 s"}, {L"3 秒", L"3 s"},
-            {L"5 秒", L"5 s"}, {L"8 秒", L"8 s"}};
+        // Below 3 s a VEGA G2.2 refuses to leave its 200-probe loop, so the
+        // shorter options are not offered at all.
+        const wchar_t* names[3][2] = {
+            {L"3 秒", L"3 s"}, {L"5 秒", L"5 s"}, {L"8 秒", L"8 s"}};
         for (const auto& name : names) {
             Controls::ComboBoxItem item;
             item.Content(box_value(Localized(name[0], name[1])));
@@ -2672,11 +2673,11 @@ Controls::Border CreateOutputTargetCard(
         }
     }
     {
-        static constexpr int kBufferMs[5] = {1500, 2000, 3000, 5000, 8000};
-        const int saved = ReadIniInt(L"dlna", L"buffer_ms", 1500);
+        static constexpr int kBufferMs[3] = {3000, 5000, 8000};
+        const int saved = ReadIniInt(L"dlna", L"buffer_ms", 3000);
         int best = 0;
         int bestDistance = 0x7fffffff;
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < 3; ++i) {
             const int distance = saved > kBufferMs[i] ? saved - kBufferMs[i]
                                                       : kBufferMs[i] - saved;
             if (distance < bestDistance) {
@@ -2688,9 +2689,9 @@ Controls::Border CreateOutputTargetCard(
     }
     bufferCombo.SelectionChanged([](auto&& sender, auto&&) {
         try {
-            static constexpr int kBufferMs[5] = {1500, 2000, 3000, 5000, 8000};
+            static constexpr int kBufferMs[3] = {3000, 5000, 8000};
             const int index = sender.as<Controls::ComboBox>().SelectedIndex();
-            if (index < 0 || index > 4) return;
+            if (index < 0 || index > 2) return;
             WriteIniText(L"dlna", L"buffer_ms", std::to_wstring(kBufferMs[index]));
             const auto path = StreamFormatIniPath();
             if (!path.empty()) {

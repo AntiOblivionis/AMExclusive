@@ -165,7 +165,8 @@ std::wstring ReadDlnaValue(const wchar_t* key) {
 }
 
 std::uint32_t ReadDlnaBufferMs() {
-    const auto value = GetPrivateProfileIntW(L"dlna", L"buffer_ms", 1500,
+    // 3000: below that a VEGA G2.2 stays stuck in its probe loop.
+    const auto value = GetPrivateProfileIntW(L"dlna", L"buffer_ms", 3000,
                                              BrokerIniPath().c_str());
     // 10000 matches the panel dropdown and DlnaSink's own clamp.
     return static_cast<std::uint32_t>(
