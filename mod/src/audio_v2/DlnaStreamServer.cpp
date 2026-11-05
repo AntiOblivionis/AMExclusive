@@ -812,6 +812,15 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
         std::uint64_t bytesSent = 0;
         std::uint64_t chunksSent = 0;
         const std::uint64_t streamStartTick = GetTickCount64();
+        // Pace to exactly 1.0x real time, with a 1-second burst allowance.
+        // Manual track changes feed the renderer at exactly this rate (Apple
+        // decodes in real time), and auto-advance must be byte-for-byte
+        // identical: any sustained oversupply lets the renderer download the
+        // whole entity ahead of playback and stall instead of playing. The
+        // burst absorbs network jitter without changing the long-term rate.
+        const std::uint64_t pacedBytesPerSecond =
+            static_cast<std::uint64_t>(session->Format().sampleRate) *
+            session->Format().channels * (session->Format().containerBits / 8u);
         std::uint64_t firstChunkAt = 0;
         if (session->Shape() == DlnaStreamShape::WavFile &&
             position < DlnaStreamSession::kWavHeaderBytes) {
@@ -861,7 +870,24 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
                 remaining -= written;
                 bytesSent += written;
                 ++chunksSent;
+                // Real-time pacing: long-term rate is exactly 1.0x, plus a
+                // one-second burst that absorbs jitter without ever letting
+                // the renderer download ahead of its playback position.
+                const auto elapsedMs = GetTickCount64() - streamStartTick;
+                const auto allowedBytes =
+                    elapsedMs * pacedBytesPerSecond / 1000u + pacedBytesPerSecond;
+                if (bytesSent > allowedBytes) {
+                    const auto behindMs =
+                        (bytesSent - allowedBytes) * 1000u / pacedBytesPerSecond;
+                    Sleep(static_cast<DWORD>(std::min<std::uint64_t>(behindMs, 500u)));
+                }
             }
+        }
+        if (remaining == 0 && !session->Aborted()) {
+            // The renderer now holds the complete declared track. This is the
+            // signal the sink's auto-advance waits for before rolling over to
+            // the next track's session.
+            session->MarkDelivered();
         }
         LogDlnaLine(L"http stream closed token=" + token + L" bytes=" +
                     std::to_wstring(bytesSent) + L" firstChunkMs=" +

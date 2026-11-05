@@ -450,9 +450,8 @@ bool DlnaSink::SetupStream() noexcept {
                                           bigEndianPcm_ ? L"big" : L"little") +
             L" protocolInfo=" + protocolInfo_ +
             L" sinkProtocolInfo=" + sinkProtocolInfoText_);
-    const auto bytesPerFrame = static_cast<std::uint64_t>(format_.channels) *
-        (format_.containerBits / 8u);
-    const auto bytesPerSecond = static_cast<std::uint64_t>(format_.sampleRate) * bytesPerFrame;
+    const auto bytesPerSecond = static_cast<std::uint64_t>(format_.sampleRate) *
+        static_cast<std::uint64_t>(format_.channels) * (format_.containerBits / 8u);
     // The entity length has to be announced before the first byte is written,
     // so it is derived from the configured stream length rather than from what
     // the producer eventually emits. Overshooting is safe: the renderer simply
@@ -485,6 +484,19 @@ bool DlnaSink::SetupStream() noexcept {
                                                    contentFeatures_, totalBytes_);
     if (!wireMime.empty()) session_->SetMime(wireMime);
     server_.AddSession(session_);
+    // Auto-advance boundary for this session: the EXACT frame count of the
+    // track, not the declared entity length (which carries headroom and only
+    // caps what the HTTP layer may send). Reaching this count without a
+    // source EOF means the next track has already started inside the same
+    // Apple Music graph. Frames past the boundary belong to the next track
+    // and are appended to the next session, so the renderer hears an
+    // unbroken stream no matter how accurate the SMTC length was.
+    sessionFramesProduced_ = 0;
+    const auto boundaryMs = trackDurationMsExact_ != 0
+        ? static_cast<std::uint64_t>(trackDurationMsExact_)
+        : static_cast<std::uint64_t>(streamSeconds_) * 1000ull;
+    trackFramesExact_ = boundaryMs * format_.sampleRate / 1000ull;
+    if (trackFramesExact_ == 0) trackFramesExact_ = 1;
     // The HTTP reader thread and the producer both walk this ring; pinning it
     // keeps either of them from taking a page fault mid-transfer.
     DlnaLog(L"stream ring=" + std::to_wstring(capacity / 1024u) + L"KB locked=" +
@@ -501,6 +513,127 @@ void DlnaSink::CloseStream() noexcept {
         server_.RemoveSession(session_->Token());
         session_.reset();
     }
+}
+
+void DlnaSink::RefreshTrackDurationFromSmtc(const std::wstring& previousTitle) noexcept {
+    wchar_t value[16]{};
+    GetPrivateProfileStringW(L"dlna", L"follow_track_duration", L"1", value,
+                             static_cast<DWORD>(std::size(value)),
+                             IniPath().c_str());
+    if (_wtoi(value) == 0) {
+        // No SMTC following: the cut point falls back to the configured
+        // stream length, which SetupStream reads via trackDurationMsExact_=0.
+        trackDurationMsExact_ = 0;
+        return;
+    }
+    auto& monitor = TrackMonitor::Instance();
+    monitor.EnsureStarted();
+    // Just after a track change the SMTC pipeline can take a second or
+    // two to publish the new metadata; 900 ms made high-resolution
+    // tracks (where the wait matters most) fall back to the 600 s
+    // guess and declare a wildly wrong length.
+    auto info = monitor.Snapshot(2500);
+    if (!previousTitle.empty()) {
+        // Auto-advance: the watcher may still be showing the track that just
+        // ended. Give it a few seconds to publish the next title so the new
+        // session declares the new track's length, not the old one's. A
+        // repeated title (same song on repeat) is indistinguishable from a
+        // stale snapshot, so this wait is bounded and harmless either way.
+        const auto deadline = GetTickCount64() + 3000;
+        while (info.valid && info.title == previousTitle &&
+               GetTickCount64() < deadline) {
+            if (producerStop_.load(std::memory_order_acquire)) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            info = monitor.Snapshot(0);
+        }
+    }
+    const bool fresh = info.valid &&
+        GetTickCount64() - info.stampTick < 15000;
+    if (fresh && info.durationMs >= 10000 &&
+        info.durationMs <= 4ull * 3600ull * 1000ull) {
+        // A few seconds of headroom: Apple's timeline is the decoded
+        // length, and stopping short would cut the tail off.
+        streamSeconds_ = info.durationMs / 1000u + 3u;
+        // ...but the auto-advance cut point must be the exact length: the
+        // headroom exists only so the declared entity never truncates a
+        // track, not to decide where one track ends and the next begins.
+        trackDurationMsExact_ = info.durationMs;
+        lastTrackTitle_ = info.title;
+        DlnaLog(L"track duration from SMTC ms=" +
+                std::to_wstring(info.durationMs) + L" title=" + info.title);
+    } else {
+        trackDurationMsExact_ = 0;
+        DlnaLog(L"track duration unavailable, using stream_seconds=" +
+                std::to_wstring(streamSeconds_));
+    }
+}
+
+bool DlnaSink::AdvanceToNextTrack() noexcept {
+    // Seal the current session first: the HTTP layer stops feeding once the
+    // exact track bytes are sent (endedByStream), leaving the renderer with
+    // the complete track. The producer's source has NOT ended - Apple Music
+    // is already decoding the next track into the same graph - so
+    // endOfStreamSubmitted_ deliberately stays false and the runtime keeps
+    // this sink alive.
+    if (session_) {
+        FlushEncoderTail();
+        (void)session_->Append(nullptr, 0, true);
+    }
+    // No waiting for the renderer here: the gentle queueing path hands the
+    // next URL to the playlist while the current track is still playing, and
+    // any bytes the renderer has not pulled yet stay available on the old
+    // session's open connections. Blocking the producer would only build up
+    // the capture queue for nothing.
+    if (producerStop_.load(std::memory_order_acquire)) return false;
+    const auto previousTitle = lastTrackTitle_;
+    RefreshTrackDurationFromSmtc(previousTitle);
+    if (producerStop_.load(std::memory_order_acquire)) return false;
+    if (!SetupStream()) {
+        DlnaLog(L"auto-advance: stream setup failed");
+        return false;
+    }
+    DlnaLog(L"auto-advance: next track session url=" + streamUrl_);
+    return AppendNextTrackToDevice();
+}
+
+bool DlnaSink::AppendNextTrackToDevice() noexcept {
+    // Gentle gapless queueing: insert the next track right after the one the
+    // renderer is playing and DON'T touch transport state. The renderer
+    // finishes the current track (it already holds or is pulling all of its
+    // bytes) and rolls into the queued URL on its own, which is the OpenHome
+    // playlist's core contract. Stopping or re-Playing here would discard
+    // the renderer's buffered tail - the audible "next track loses its first
+    // seconds" failure.
+    if (target_.openHome && !target_.openHomePlaylist.empty() &&
+        lastOpenHomeId_ != 0) {
+        const auto duration = DlnaControlClient::TimeText(streamSeconds_) + L".000";
+        const std::uint64_t didlSize =
+            (shape_ == DlnaStreamShape::WavFile || shape_ == DlnaStreamShape::FlacFile)
+                ? totalBytes_ : 0;
+        const auto didl = upnp::BuildDidlLite(
+            L"ame-" + GuidToken(), L"Apple Music", streamUrl_, protocolInfo_,
+            duration, false, didlSize,
+            format_.sampleRate, format_.containerBits, format_.channels);
+        std::wstring error;
+        std::uint32_t newId = 0;
+        if (control_.OpenHomeInsert(target_, lastOpenHomeId_, streamUrl_, didl,
+                                    newId, error)) {
+            DlnaLog(L"auto-advance queued afterId=" + std::to_wstring(lastOpenHomeId_) +
+                    L" newId=" + std::to_wstring(newId) + L" url=" + streamUrl_);
+            lastOpenHomeId_ = newId;
+            // Watchdog: if the renderer does not start pulling the queued
+            // track within this window (no auto-continuation), escalate to an
+            // explicit Play. Checked from the producer loop, never blocking.
+            pendingPlayDeadlineTick_ = GetTickCount64() + 25000;
+            return true;
+        }
+        controlFailures_.fetch_add(1, std::memory_order_relaxed);
+        DlnaLog(L"auto-advance queue failed, forcing full send device=" +
+                target_.friendlyName + L" reason=" + error);
+    }
+    // Plain AVTransport renderers (or a failed queue) keep the old immediate
+    // behavior; SetNextAVTransportURI would be the gentle variant there.
+    return SendStreamToDevice();
 }
 
 bool DlnaSink::TryNextFormat() noexcept {
@@ -558,34 +691,7 @@ HRESULT DlnaSink::Open(const AudioSinkOpenParams& params) noexcept {
     // guess is either too short (truncates the song) or too long (progress bar
     // never reaches the end). SMTC knows the real value; the watcher process
     // caches it and this read never blocks the audio path.
-    {
-        wchar_t value[16]{};
-        GetPrivateProfileStringW(L"dlna", L"follow_track_duration", L"1", value,
-                                 static_cast<DWORD>(std::size(value)),
-                                 IniPath().c_str());
-        if (_wtoi(value) != 0) {
-            auto& monitor = TrackMonitor::Instance();
-            monitor.EnsureStarted();
-            // Just after a track change the SMTC pipeline can take a second or
-            // two to publish the new metadata; 900 ms made high-resolution
-            // tracks (where the wait matters most) fall back to the 600 s
-            // guess and declare a wildly wrong length.
-            const auto info = monitor.Snapshot(2500);
-            const bool fresh = info.valid &&
-                GetTickCount64() - info.stampTick < 15000;
-            if (fresh && info.durationMs >= 10000 &&
-                info.durationMs <= 4ull * 3600ull * 1000ull) {
-                // A few seconds of headroom: Apple's timeline is the decoded
-                // length, and stopping short would cut the tail off.
-                streamSeconds_ = info.durationMs / 1000u + 3u;
-                DlnaLog(L"track duration from SMTC ms=" +
-                        std::to_wstring(info.durationMs) + L" title=" + info.title);
-            } else {
-                DlnaLog(L"track duration unavailable, using stream_seconds=" +
-                        std::to_wstring(streamSeconds_));
-            }
-        }
-    }
+    RefreshTrackDurationFromSmtc(std::wstring());
     // An explicit value (self test) overrides both the ini guess and SMTC.
     if (params.streamSeconds != 0) {
         streamSeconds_ = params.streamSeconds;
@@ -748,6 +854,7 @@ bool DlnaSink::SendStreamToDevice() noexcept {
             DlnaLog(L"openhome Insert ok device=" + target_.friendlyName +
                     L" id=" + std::to_wstring(newId) +
                     L" metadataBytes=" + std::to_wstring(didl.size()));
+            lastOpenHomeId_ = newId;
             error.clear();
             if (control_.OpenHomePlaylistPlay(target_, error)) {
                 DlnaLog(L"openhome DeleteAll+Insert+Playlist.Play sent device=" +
@@ -774,6 +881,9 @@ bool DlnaSink::SendStreamToDevice() noexcept {
         // This is a compatibility fallback only - do not use it when Insert works.
         DlnaLog(L"openhome Insert failed, trying legacy Write device=" +
                 target_.friendlyName + L" reason=" + error);
+        // The legacy path has no playlist ids to queue behind; auto-advance
+        // will take the full-send fallback for this device.
+        lastOpenHomeId_ = 0;
         std::wstring writeError;
         if (!control_.OpenHomeWrite(target_, 0, streamUrl_, L"Apple Music", writeError)) {
             controlFailures_.fetch_add(1, std::memory_order_relaxed);
@@ -920,6 +1030,32 @@ void DlnaSink::ProducerMain() noexcept {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
+        // Gentle-queue watchdog: a renderer that does not auto-continue into
+        // the queued track would sit silent forever. Escalate to an explicit
+        // Play when nobody has come to read the queued session in time.
+        if (pendingPlayDeadlineTick_ != 0 &&
+            GetTickCount64() >= pendingPlayDeadlineTick_) {
+            pendingPlayDeadlineTick_ = 0;
+            if (session_ && session_->ReadersCreated() == 0) {
+                DlnaLog(L"auto-advance: renderer did not pull the queued track, "
+                        L"forcing play");
+                std::wstring error;
+                bool forced = false;
+                if (lastOpenHomeId_ != 0) {
+                    forced = control_.OpenHomePlaylistPlayId(target_, lastOpenHomeId_,
+                                                             error);
+                }
+                if (!forced) {
+                    error.clear();
+                    forced = control_.OpenHomePlaylistPlay(target_, error);
+                }
+                if (!forced) {
+                    controlFailures_.fetch_add(1, std::memory_order_relaxed);
+                    DlnaLog(L"auto-advance force play failed device=" +
+                            target_.friendlyName + L" reason=" + error);
+                }
+            }
+        }
         if (!source_) break;
         const HRESULT prepared = source_->Prepare(chunkFrames_);
         if (prepared == kAudioSourceWouldBlock) {
@@ -955,15 +1091,45 @@ void DlnaSink::ProducerMain() noexcept {
             continue;
         }
         waitingForSource_.store(false, std::memory_order_release);
-        if (written != 0 && !PackChunk(samples.data(), written, false, packed)) {
-            RecordError(E_FAIL);
-            break;
+        // Append the chunk, rolling over to the next track's session when the
+        // declared entity is exhausted. A chunk can straddle the boundary:
+        // frames past it already belong to the next track (Apple Music feeds
+        // gapless PCM through the same converter) and are appended after the
+        // rollover, so nothing is dropped or duplicated.
+        std::size_t offsetFrames = 0;
+        bool failed = false;
+        while (offsetFrames < written) {
+            if (trackFramesExact_ != 0 &&
+                sessionFramesProduced_ >= trackFramesExact_) {
+                if (!AdvanceToNextTrack()) {
+                    RecordError(ammod::audio::kDlnaStreamFailed);
+                    failed = true;
+                    break;
+                }
+            }
+            std::uint32_t allowed = static_cast<std::uint32_t>(written - offsetFrames);
+            if (trackFramesExact_ != 0) {
+                const auto remainingFrames = trackFramesExact_ - sessionFramesProduced_;
+                allowed = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    allowed, remainingFrames));
+            }
+            if (allowed == 0) continue;
+            if (!PackChunk(samples.data() + offsetFrames * channels, allowed,
+                           false, packed)) {
+                RecordError(E_FAIL);
+                failed = true;
+                break;
+            }
+            if (!session_->Append(packed.data(), packed.size(), false)) {
+                RecordError(ammod::audio::kDlnaStreamFailed);
+                failed = true;
+                break;
+            }
+            sessionFramesProduced_ += allowed;
+            submittedFrames_.fetch_add(allowed, std::memory_order_relaxed);
+            offsetFrames += allowed;
         }
-        if (written != 0 && !session_->Append(packed.data(), packed.size(), false)) {
-            RecordError(ammod::audio::kDlnaStreamFailed);
-            break;
-        }
-        submittedFrames_.fetch_add(written, std::memory_order_relaxed);
+        if (failed) break;
         if (eos) {
             FlushEncoderTail();
             (void)session_->Append(nullptr, 0, true);
@@ -1064,6 +1230,10 @@ void DlnaSink::Close() noexcept {
     server_.Stop();
     startedOnce_.store(false, std::memory_order_release);
     endOfStreamSubmitted_.store(false, std::memory_order_release);
+    lastOpenHomeId_ = 0;
+    pendingPlayDeadlineTick_ = 0;
+    trackDurationMsExact_ = 0;
+    lastTrackTitle_.clear();
     source_ = nullptr;
     state_.store(AudioSinkState::Closed, std::memory_order_release);
 }

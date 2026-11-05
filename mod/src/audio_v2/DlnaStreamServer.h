@@ -122,6 +122,13 @@ public:
     bool Finished() const noexcept {
         return endOfStream_.load(std::memory_order_acquire) && BufferedBytes() == 0;
     }
+    // Set by the HTTP sender once the whole declared entity has been written
+    // to the renderer (reason=complete). The sink's auto-advance uses this as
+    // the track boundary: the renderer owns the complete track from here on,
+    // so handing it the next URL can no longer truncate anything still in
+    // flight. Distinct from EndOfStream(), which marks the producer's EOF.
+    void MarkDelivered() noexcept { delivered_.store(true, std::memory_order_release); }
+    bool Delivered() const noexcept { return delivered_.load(std::memory_order_acquire); }
     std::uint32_t BytesPerFrame() const noexcept { return bytesPerFrame_; }
     std::uint32_t CapacityBytes() const noexcept { return capacityBytes_; }
 
@@ -162,6 +169,7 @@ private:
     std::condition_variable spaceReady_;
     std::atomic<bool> aborted_{false};
     std::atomic<bool> endOfStream_{false};
+    std::atomic<bool> delivered_{false};
     std::atomic<std::uint64_t> bytesServed_{0};
     std::atomic<std::uint64_t> bytesWritten_{0};
     std::atomic<std::uint64_t> readersCreated_{0};

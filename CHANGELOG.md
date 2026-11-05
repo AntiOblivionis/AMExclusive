@@ -6,6 +6,32 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.3] - 2026-11-05
+
+### Fixed
+
+- **DLNA 自动连播（同格式）从第二首起无声**。0.4.2 用 playerItem 变化驱动
+  换曲，但 Apple Music 在连播同格式曲目时会复用整条解码管线，playerItem
+  不会重建，换曲信号根本不触发（实测曲目边界无任何 converter 事件：PCM 持续
+  流入、旧网播流已 complete、新流永远不建立，队列积压到手动切歌为止）。
+  改写为在 DLNA 输出内部按曲目边界滚动会话：
+  - **精确边界**：切换点用 SMTC 报告的真实曲目时长。此前用「时长 +3 秒」的
+    声明长度作切换点，每首都会把下一首开头并入上一首，连播越久偏移越大
+    （第 N 首开头已被吃掉 3×N 秒）。+3 秒只保留在 HTTP 声明里防止截尾。
+  - **温和接续**：下一首以 OpenHome `Playlist.Insert(AfterId=当前曲目)` 排入
+    播放列表，不 Stop、不 DeleteAll、不重发 Play。设备放完当前曲自然接续，
+    不再丢弃已缓冲的尾部，也不必重新探测+预缓冲——此前表现为换曲后约
+    5 秒才出声。
+  - **兜底**：排队后 25 秒设备仍未来拉流，则强制 Play；纯 AVTransport 设备
+    回退到完整 Stop+Insert+Play 流程。
+  - 跨边界的 PCM 帧写入新会话，不丢不重；SMTC 时长不准只影响设备显示的
+    曲目边界，字节流始终连续。中途断连也会在下一曲边界自动换会话重推。
+
+### Changed
+
+- 网播「拉流缓冲」新增 **1 秒** 档（1 / 3 / 5 / 8 秒）。设备冷启动仍建议
+  不低于 3 秒；1 秒档主要缩短自动连播/首曲的起播等待。
+
 ## [0.4.2] - 2026-11-05
 
 ### Fixed

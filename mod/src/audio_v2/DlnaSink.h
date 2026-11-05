@@ -70,6 +70,28 @@ private:
     void FlushEncoderTail() noexcept;
     void JoinProducer() noexcept;
     void RecordError(HRESULT error) noexcept;
+    // Re-reads the SMTC track length into streamSeconds_ (declared length,
+    // headroom included) and trackDurationMsExact_ (the exact boundary used
+    // for auto-advance). When previousTitle is non-empty and the snapshot
+    // still carries that title, waits briefly for the watcher to publish the
+    // next track's metadata.
+    void RefreshTrackDurationFromSmtc(const std::wstring& previousTitle) noexcept;
+    // Automatic track rollover for gapless auto-advance. Apple Music keeps
+    // feeding PCM through the same converter at a track boundary, so no graph
+    // rebuild ever re-opens this sink. Once the exact track length has been
+    // produced, the producer calls this to seal the current session, create
+    // the next track's session and queue its URL behind the playing one.
+    // Runs on the producer thread; returns false on producerStop_ or when the
+    // next session could not be established.
+    bool AdvanceToNextTrack() noexcept;
+    // Queues the freshly created session behind the track the renderer is
+    // currently playing (OpenHome Playlist.Insert with AfterId), leaving the
+    // current track untouched so the renderer can gaplessly roll into the
+    // next URL. Falls back to the full Stop+DeleteAll+Insert+Play sequence
+    // for plain AVTransport renderers or when the insert fails. A watchdog
+    // (pendingPlayDeadlineTick_) escalates to an explicit Play if the
+    // renderer never starts pulling the queued track.
+    bool AppendNextTrackToDevice() noexcept;
 
     AudioSinkOpenParams params_{};
     DlnaTarget target_{};
@@ -98,6 +120,29 @@ private:
     // value comes from [dlna] stream_seconds (or the track duration once the
     // broker can supply it) and only affects the declared length.
     std::uint32_t streamSeconds_{600};
+    // Exact length of the current track in milliseconds as reported by SMTC,
+    // WITHOUT the headroom that streamSeconds_ adds for the declared entity.
+    // This is the auto-advance cut point: cutting at the declared (padded)
+    // length instead would hand the first seconds of every next track to the
+    // previous session, and the offset would grow by the padding on every
+    // track. 0 means "no exact value" and falls back to streamSeconds_.
+    std::uint32_t trackDurationMsExact_{0};
+    // Auto-advance bookkeeping, producer thread only. Frames belonging to the
+    // current track (exact length) and how many have been appended so far.
+    // Reaching the exact count without a source EOF means Apple Music has
+    // gaplessly advanced into the next track.
+    std::uint64_t trackFramesExact_{0};
+    std::uint64_t sessionFramesProduced_{0};
+    // Last title the SMTC watcher reported, used to wait for fresh metadata
+    // when rolling over to the next track.
+    std::wstring lastTrackTitle_;
+    // OpenHome playlist id of the most recently inserted track; auto-advance
+    // queues the next track right after it. 0 = unknown (legacy Write path).
+    std::uint32_t lastOpenHomeId_{0};
+    // Watchdog for the gentle queueing path: when nonzero, the producer
+    // checks after this tick whether the renderer started pulling the queued
+    // session and forces a Play if it did not.
+    std::uint64_t pendingPlayDeadlineTick_{0};
     // Verbatim GetProtocolInfo Sink value, kept only for diagnostics.
     std::wstring sinkProtocolInfoText_;
     // Network byte order for bare LPCM. On by default (RFC 3551/3190); the
