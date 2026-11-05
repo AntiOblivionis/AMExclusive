@@ -571,16 +571,34 @@ std::shared_ptr<DlnaStreamSession> DlnaStreamServer::FindSession(
 }
 
 void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
-    // Audio over TCP: Nagle batches small writes into bursts and a small send
-    // buffer makes send() block, both of which show up as jitter at the
-    // renderer. EF marking lets a QoS-aware switch prioritize the flow.
+    // Optional socket tuning, OFF by default: enabling it changed how a VEGA
+    // G2.2 consumed the stream (it read ~2 s then reset). Kept behind a bitmask
+    // so it can be re-tested: 1 = TCP_NODELAY, 2 = 512 KB send buffer,
+    // 4 = DSCP EF.
+    // Read per connection (not cached): flipping the bitmask in the ini then
+    // only needs a track change, not an Apple Music restart, which is what
+    // makes bit-by-bit A/B testing practical.
+    int socketTuning = 0;
     {
+        wchar_t publicPath[MAX_PATH]{};
+        const DWORD length = GetEnvironmentVariableW(L"PUBLIC", publicPath, MAX_PATH);
+        if (length != 0 && length < MAX_PATH) {
+            const std::wstring ini = std::wstring(publicPath) +
+                L"\\AMExclusive\\am-exclusive.ini";
+            socketTuning = GetPrivateProfileIntW(L"dlna", L"socket_tuning", 0, ini.c_str());
+        }
+    }
+    if ((socketTuning & 1) != 0) {
         int enabled = 1;
         (void)setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
                          reinterpret_cast<const char*>(&enabled), sizeof(enabled));
+    }
+    if ((socketTuning & 2) != 0) {
         int sendBuffer = 512 * 1024;
         (void)setsockopt(client, SOL_SOCKET, SO_SNDBUF,
                          reinterpret_cast<const char*>(&sendBuffer), sizeof(sendBuffer));
+    }
+    if ((socketTuning & 4) != 0) {
         int dscp = 0xB8; // DSCP EF (46) << 2
         (void)setsockopt(client, IPPROTO_IP, IP_TOS,
                          reinterpret_cast<const char*>(&dscp), sizeof(dscp));
@@ -830,8 +848,10 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
             }
             if (written != 0) {
                 if (!SendAll(client, body.data(), written)) {
+                    const int wsa = WSAGetLastError();
                     LogDlnaLine(L"http send failed token=" + token + L" afterBytes=" +
-                                std::to_wstring(bytesSent));
+                                std::to_wstring(bytesSent) + L" wsa=" +
+                                std::to_wstring(wsa));
                     break;
                 }
                 if (firstChunkAt == 0) firstChunkAt = GetTickCount64();
