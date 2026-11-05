@@ -46,6 +46,9 @@ struct PcmBlockAllocator final {
             void* raw = LocalPlaybackTuningRuntime::AllocateLargePages(
                 count * sizeof(PcmBlock), granted);
             if (raw) {
+                // Commit every page now: MEM_COMMIT alone leaves demand-zero
+                // pages, and the first touch on the audio thread would fault.
+                std::memset(raw, 0, granted);
                 pool->base = static_cast<PcmBlock*>(raw);
                 pool->count = count;
                 pool->largePages = true;
@@ -60,6 +63,9 @@ struct PcmBlockAllocator final {
             pool->largePages = false;
             pool->allocatedBytes = count * sizeof(PcmBlock);
         }
+        // Same reason as the large-page path: touch the whole pool once so the
+        // producer callback never takes a demand-zero fault.
+        std::memset(memory, 0, count * sizeof(PcmBlock));
         return memory;
     }
     void deallocate(PcmBlock* memory, std::size_t count) noexcept {

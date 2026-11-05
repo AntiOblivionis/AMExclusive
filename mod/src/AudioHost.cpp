@@ -6,6 +6,7 @@
 
 #include "audio_v2/AsioExclusiveSink.h"
 #include "audio_v2/LocalPlaybackTuning.h"
+#include "audio_v2/MemoryLock.h"
 #include "audio_v2/RemoteSink.h"
 #include "audio_v2/RingPcmSource.h"
 #include "audio_v2/SharedAudioRing.h"
@@ -13,7 +14,9 @@
 
 #include <windows.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 
@@ -65,12 +68,49 @@ struct HostState final {
     HANDLE pipe{INVALID_HANDLE_VALUE};
     HANDLE ringMapping{};
     void* ringView{};
+    std::size_t ringBytes{};
+    std::uint32_t ringCapacityFrames{};
     HANDLE dataEvent{};
     HANDLE spaceEvent{};
     SharedRingHeader* header{};
     RingPcmSource source{};
     std::unique_ptr<IAudioSink> sink;
 };
+
+#ifndef SEC_LARGE_PAGES
+#define SEC_LARGE_PAGES 0x80000000
+#endif
+
+// Same right the large-page allocation path needs. Kept local so the host's
+// dynamic imports stay independent of the hook module.
+bool EnableLockMemoryPrivilege() noexcept {
+    HMODULE advapi = LoadLibraryExW(L"advapi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!advapi) advapi = GetModuleHandleW(L"advapi32.dll");
+    if (!advapi) return false;
+    using OpenTokenFn = BOOL(WINAPI*)(HANDLE, DWORD, PHANDLE);
+    using LookupFn = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, PLUID);
+    using AdjustFn = BOOL(WINAPI*)(HANDLE, BOOL, PTOKEN_PRIVILEGES, DWORD,
+                                   PTOKEN_PRIVILEGES, PDWORD);
+    auto openToken = reinterpret_cast<OpenTokenFn>(GetProcAddress(advapi, "OpenProcessToken"));
+    auto lookup = reinterpret_cast<LookupFn>(GetProcAddress(advapi, "LookupPrivilegeValueW"));
+    auto adjust = reinterpret_cast<AdjustFn>(GetProcAddress(advapi, "AdjustTokenPrivileges"));
+    if (!openToken || !lookup || !adjust) return false;
+    HANDLE token = nullptr;
+    if (!openToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        return false;
+    }
+    TOKEN_PRIVILEGES privileges{};
+    bool ok = lookup(nullptr, L"SeLockMemoryPrivilege", &privileges.Privileges[0].Luid) != FALSE;
+    if (ok) {
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        SetLastError(ERROR_SUCCESS);
+        ok = adjust(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr) != FALSE &&
+             GetLastError() == ERROR_SUCCESS;
+    }
+    (void)CloseHandle(token);
+    return ok;
+}
 
 void CloseSink(HostState& state) noexcept {
     if (state.sink) {
@@ -131,6 +171,9 @@ HRESULT OpenTarget(HostState& state, const HostMessage& request) noexcept {
         std::uint32_t capacity = request.ringFrames;
         if (capacity < 4096u) capacity = 4096u;
         if (capacity > kSharedRingMaxFrames) capacity = kSharedRingMaxFrames;
+        if (state.ringCapacityFrames != 0 && capacity > state.ringCapacityFrames) {
+            capacity = state.ringCapacityFrames;
+        }
         ammod::audio_v2::SharedRingReset(
             state.header, params.format.sampleRate,
             params.format.validBits ? params.format.validBits : params.format.containerBits,
@@ -224,14 +267,58 @@ int wmain(int argc, wchar_t** argv) {
     const std::wstring spaceName = HostObjectName(kHostSpaceEventPrefix, session);
 
     HostState state{};
-    state.ringMapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                           0, static_cast<DWORD>(kSharedRingBytes),
-                                           ringName.c_str());
-    state.ringView = state.ringMapping ? MapViewOfFile(state.ringMapping, FILE_MAP_ALL_ACCESS,
-                                                       0, 0, 0) : nullptr;
+    ammod::audio_v2::SetHardWorkingSetFloorEnabled(true);
+    const bool largePagePrivilege = EnableLockMemoryPrivilege();
+    Log(largePagePrivilege ? L"lock-memory privilege enabled"
+                           : L"lock-memory privilege unavailable");
+    // Ladder: 16 -> 8 -> 4 -> 2 MB large-page sections, then ordinary pages.
+    // A smaller section just means a shorter reservoir; the hook reads the
+    // final capacity from the header. Large pages need the privilege above;
+    // without it we go straight to the ordinary section and rely on the hard
+    // working-set floor plus VirtualLock.
+    for (const std::size_t megabytes : {std::size_t{16}, std::size_t{8},
+                                        std::size_t{4}, std::size_t{2}}) {
+        if (!largePagePrivilege) break;
+        const std::size_t bytes = megabytes << 20;
+        state.ringMapping = CreateFileMappingW(
+            INVALID_HANDLE_VALUE, nullptr,
+            PAGE_READWRITE | SEC_COMMIT | SEC_LARGE_PAGES, 0,
+            static_cast<DWORD>(bytes), ringName.c_str());
+        if (state.ringMapping) {
+            state.ringBytes = bytes;
+            Log(L"ring uses large pages");
+            break;
+        }
+    }
+    if (!state.ringMapping) {
+        state.ringBytes = kSharedRingBytes;
+        state.ringMapping = CreateFileMappingW(
+            INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+            static_cast<DWORD>(state.ringBytes), ringName.c_str());
+        Log(L"ring falls back to ordinary pages");
+    }
+    state.ringView = state.ringMapping
+        ? MapViewOfFile(state.ringMapping, FILE_MAP_ALL_ACCESS, 0, 0, 0) : nullptr;
+    if (state.ringView && state.ringBytes != 0) {
+        // Commit and touch every page once so the render thread never takes a
+        // demand-zero fault on the audio path.
+        std::memset(state.ringView, 0, state.ringBytes);
+        state.ringCapacityFrames = static_cast<std::uint32_t>(
+            (state.ringBytes - sizeof(SharedRingHeader)) /
+            (ammod::audio_v2::kSharedRingChannels * sizeof(std::int32_t)));
+        // Ordinary pages still need to be pinned. The hard working-set floor
+        // is what makes VirtualLock cover the whole ring; if either step is
+        // refused the ring keeps working, just less protected.
+        const bool floor = ammod::audio_v2::EnsureLockableWorkingSet(state.ringBytes);
+        const bool locked = VirtualLock(state.ringView, state.ringBytes) != FALSE;
+        Log(locked ? L"ring locked in memory"
+                   : (floor ? L"ring not locked; working-set floor only"
+                            : L"ring not locked; no working-set floor"));
+    }
     state.dataEvent = CreateEventW(nullptr, FALSE, FALSE, dataName.c_str());
     state.spaceEvent = CreateEventW(nullptr, FALSE, FALSE, spaceName.c_str());
-    if (!state.ringView || !state.dataEvent || !state.spaceEvent) {
+    if (!state.ringView || !state.dataEvent || !state.spaceEvent ||
+        state.ringCapacityFrames == 0) {
         Log(L"init failed: ring or events unavailable");
         return 1;
     }
