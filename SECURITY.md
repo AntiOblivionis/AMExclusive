@@ -2,7 +2,7 @@
 
 ## Scope
 
-AMExclusive-Openhome is a local Windows DLL injected into the Apple Music process.
+AppleMusic-OpenHome is a local Windows DLL injected into the Apple Music process.
 It hosts a small HTTP server on the LAN for DLNA rendering, installs a scheduled
 task, and writes to `%PUBLIC%\AMExclusive`.
 
@@ -26,7 +26,7 @@ Out of scope:
 
 **Please do not open a public issue for a vulnerability.** Use GitHub's
 **Security → Report a vulnerability** (private vulnerability reporting) on
-[this repository](https://github.com/dxdxdxlm123/AMExclusive-Openhome/security/advisories/new),
+[this repository](https://github.com/dxdxdxlm123/AppleMusic-OpenHome/security/advisories/new),
 or contact the maintainer privately through their GitHub profile.
 
 Include:

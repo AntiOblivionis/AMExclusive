@@ -11,7 +11,7 @@ for the authoritative list.
 Original copyright: `Copyright (c) 2026 AMExclusive contributors` — preserved
 verbatim in [LICENSE](LICENSE).
 
-## This fork — AMExclusive-Openhome
+## This fork — AppleMusic-OpenHome
 
 **[@dxdxdxlm123](https://github.com/dxdxdxlm123)** — maintainer and author of
 the derivative work (7 commits in the `v0.2.0` release):

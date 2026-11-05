@@ -20,7 +20,7 @@ of the upstream name or logo and does not present itself as the upstream project
 
 ## Derivative work
 
-`AMExclusive-Openhome` is maintained independently by
+`AppleMusic-OpenHome` is maintained independently by
 [dxdxdxlm123](https://github.com/dxdxdxlm123). Changes relative to upstream:
 
 ### New subsystems
