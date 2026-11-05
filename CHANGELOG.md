@@ -6,6 +6,15 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.2] - 2026-11-05
+
+### Fixed
+
+- **同格式连播第二首无声**：曲目切换现在由 Apple 的 playerItem 变化驱动，
+  强制重开音频图与网络流（此前只在格式变化时重绑，Apple 复用解码管线时
+  网播第二首必然无声）。本地播放同样每曲重新对齐缓冲。
+- 首个正式版：v0.4.x 全部功能自本版脱离 preview。
+
 ## [0.4.1-preview] - 2026-11-05
 
 ### Removed
