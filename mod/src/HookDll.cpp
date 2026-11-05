@@ -3166,6 +3166,13 @@ const wchar_t* WasapiSinkLifecycleText(
     case Event::StopExit: return L"StopExit";
     case Event::CloseEnter: return L"CloseEnter";
     case Event::CloseExit: return L"CloseExit";
+    case Event::AsioDriverLoad: return L"AsioDriverLoad";
+    case Event::AsioSampleRate: return L"AsioSampleRate";
+    case Event::AsioBufferSize: return L"AsioBufferSize";
+    case Event::AsioBuffersCreated: return L"AsioBuffersCreated";
+    case Event::AsioStarted: return L"AsioStarted";
+    case Event::AsioStopped: return L"AsioStopped";
+    case Event::AsioBuffersDisposed: return L"AsioBuffersDisposed";
     }
     return L"Unknown";
 }
@@ -3624,19 +3631,32 @@ DWORD WINAPI PipeClientLoop(void*) {
                     L" hardwareBufferMs=" + std::to_wstring(hardwareBufferMs) +
                     L" allowResampling=" + std::to_wstring(incoming.allowResampling));
             } else if (incoming.type == MessageType::SetOutputTarget) {
-                ammod::audio_v2::DlnaTarget target{};
-                target.udn = incoming.endpointId;
-                target.friendlyName = incoming.endpointName;
-                target.location = incoming.detail;
-                const auto kind = incoming.enabledIntent
-                    ? ammod::audio_v2::AudioSinkKind::Dlna
-                    : ammod::audio_v2::AudioSinkKind::Wasapi;
-                const auto streamBufferMs = incoming.hardwareBufferMs
+                using ammod::audio_v2::AudioSinkKind;
+                // 0 = WASAPI endpoint, 1 = DLNA/OpenHome renderer, 2 = ASIO driver.
+                const std::uint8_t kindCode = incoming.enabledIntent > 2u
+                    ? 0u : incoming.enabledIntent;
+                ammod::audio_v2::OutputProfile profile{};
+                profile.kind = kindCode == 2u ? AudioSinkKind::Asio
+                    : kindCode == 1u ? AudioSinkKind::Dlna : AudioSinkKind::Wasapi;
+                profile.dlna.udn = incoming.endpointId;
+                profile.dlna.friendlyName = incoming.endpointName;
+                profile.dlna.location = incoming.detail;
+                profile.streamBufferMs = incoming.hardwareBufferMs
                     ? incoming.hardwareBufferMs : 1500u;
-                g_audioCoreRuntime.SetOutputTarget(kind, target, streamBufferMs);
-                Log(L"output target received kind=" + std::to_wstring(
-                        static_cast<unsigned>(kind)) + L" device=" + target.friendlyName +
-                    L" location=" + target.location);
+                // `format` carries the WASAPI endpoint id or ASIO driver CLSID;
+                // `endpointName` is the display name for a local selection.
+                if (kindCode == 2u) {
+                    profile.asioDriverClsid = incoming.format;
+                    profile.asioDriverName = incoming.endpointName;
+                } else if (kindCode == 0u) {
+                    profile.wasapiDeviceId = incoming.format;
+                }
+                g_audioCoreRuntime.SetOutputProfile(profile);
+                Log(L"output profile received kind=" + std::to_wstring(
+                        static_cast<unsigned>(kindCode)) +
+                    L" device=" + std::wstring(incoming.endpointName) +
+                    L" local=" + std::wstring(incoming.format) +
+                    L" location=" + std::wstring(incoming.detail));
             } else if (incoming.type == MessageType::TransportIntent) {
                 if (wcscmp(incoming.detail, L"play_pause") == 0) {
                     g_audioCoreRuntime.OnTransportPlayPause(incoming.generation);

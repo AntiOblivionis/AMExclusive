@@ -140,6 +140,8 @@ public:
     // Output target changes are deferred to the next media generation while a
     // graph is live. The current bridge cannot rebind an existing converter
     // after SetUiEnabled(false) clears its graph identity.
+    void SetOutputProfile(const OutputProfile& profile) noexcept;
+    // Retained for callers that only need the legacy target semantics.
     void SetOutputTarget(AudioSinkKind kind, const DlnaTarget& target,
                          std::uint32_t streamBufferMs) noexcept;
     bool UiEnabled() const noexcept { return uiEnabled_.load(std::memory_order_acquire); }
@@ -315,10 +317,11 @@ private:
     AudioSinkKind outputKind_{AudioSinkKind::Wasapi};
     DlnaTarget dlnaTarget_{};
     std::uint32_t streamBufferMs_{1500};
+    std::wstring wasapiDeviceId_;
+    std::wstring asioDriverClsid_;
+    std::wstring asioDriverName_;
     bool outputChangePending_{};
-    AudioSinkKind pendingOutputKind_{AudioSinkKind::Wasapi};
-    DlnaTarget pendingDlnaTarget_{};
-    std::uint32_t pendingStreamBufferMs_{1500};
+    OutputProfile pendingProfile_{};
     std::uint64_t nativePumpLowWaterFrames_{};
     std::uint64_t nativePumpHighWaterFrames_{};
     HANDLE wakeEvent_{};

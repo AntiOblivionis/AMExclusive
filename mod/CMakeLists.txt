@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(AMExclusive VERSION 0.2.3 LANGUAGES CXX RC)
+project(AMExclusive VERSION 0.3.0 LANGUAGES CXX RC)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "AMExclusive supports Windows x64 only")
@@ -74,7 +74,9 @@ add_custom_target(generate_winui_projection
 add_library(am_exclusive_hook SHARED
   src/HookDll.cpp
   src/IpcTransport.cpp
+  src/LocalOutputDevices.cpp
   src/LosslessQualityLock.cpp
+  src/audio_v2/AsioExclusiveSink.cpp
   src/audio_v2/AudioCoreCoordinator.cpp
   src/audio_v2/AudioCoreRuntime.cpp
   src/audio_v2/DlnaControlClient.cpp
@@ -94,7 +96,8 @@ target_link_libraries(am_exclusive_hook PRIVATE minhook ole32 oleaut32 uuid adva
   ws2_32 winhttp msxml6 bcrypt iphlpapi)
 set_target_properties(am_exclusive_hook PROPERTIES OUTPUT_NAME "am-exclusive-hook")
 
-add_library(am_exclusive_ui SHARED src/UiAdapter.cpp src/IpcTransport.cpp)
+add_library(am_exclusive_ui SHARED src/UiAdapter.cpp src/IpcTransport.cpp
+  src/LocalOutputDevices.cpp)
 add_dependencies(am_exclusive_ui generate_winui_projection)
 target_include_directories(am_exclusive_ui PRIVATE src "${WINRT_GENERATED_DIR}")
 target_compile_definitions(am_exclusive_ui PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)

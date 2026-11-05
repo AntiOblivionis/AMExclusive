@@ -14,6 +14,9 @@ namespace ammod::audio_v2 {
 enum class AudioSinkKind : std::uint8_t {
     Wasapi = 0,
     Dlna = 1,
+    // Native ASIO driver, bypassing the Windows audio engine entirely. The
+    // driver is chosen by CLSID and follows the track's sample rate.
+    Asio = 2,
 };
 
 enum class AudioSinkState : std::uint8_t {
@@ -65,6 +68,14 @@ enum class AudioSinkLifecycleEvent : std::uint8_t {
     StopExit,
     CloseEnter,
     CloseExit,
+    // ASIO-only diagnostics. The generic sinks never emit these.
+    AsioDriverLoad,
+    AsioSampleRate,
+    AsioBufferSize,
+    AsioBuffersCreated,
+    AsioStarted,
+    AsioStopped,
+    AsioBuffersDisposed,
 };
 
 using AudioSinkLifecycleCallback = void (*)(
@@ -99,6 +110,11 @@ struct AudioSinkOpenParams final {
     std::array<PcmFormat, kMaxFormatCandidates> formatCandidates{};
     std::uint32_t formatCandidateCount{};
     std::wstring endpointId;
+    // ASIO driver selected in the panel, as a "{....}" CLSID string. Empty
+    // means no driver was chosen; Open then fails instead of silently picking
+    // a hardcoded device.
+    std::wstring asioDriverClsid;
+    std::wstring asioDriverName;
     std::uint32_t periodFrames{};
     std::uint32_t alignmentRetries{2};
     bool allowResampling{};
@@ -112,6 +128,32 @@ struct AudioSinkOpenParams final {
     std::uint32_t streamSeconds{};
     DlnaStreamShape streamShape{DlnaStreamShape::WavFile};
     DlnaTarget dlna{};
+};
+
+// The single active output. Exactly one of these paths is live at any time:
+// WASAPI endpoint, ASIO driver, or a DLNA/OpenHome renderer. The UI persists
+// this profile and the broker relays it over IPC; the runtime compares the
+// whole struct so changing just the local device also triggers a rebind.
+struct OutputProfile final {
+    AudioSinkKind kind{AudioSinkKind::Wasapi};
+    DlnaTarget dlna{};
+    // Empty means "follow whatever endpoint Apple Music opened".
+    std::wstring wasapiDeviceId;
+    // ASIO driver CLSID in "{....}" form; only meaningful for kind == Asio.
+    std::wstring asioDriverClsid;
+    std::wstring asioDriverName;
+    std::uint32_t streamBufferMs{1500};
+
+    bool SameAs(const OutputProfile& other) const noexcept {
+        return kind == other.kind &&
+               dlna.udn == other.dlna.udn &&
+               dlna.friendlyName == other.dlna.friendlyName &&
+               dlna.location == other.dlna.location &&
+               wasapiDeviceId == other.wasapiDeviceId &&
+               asioDriverClsid == other.asioDriverClsid &&
+               asioDriverName == other.asioDriverName &&
+               streamBufferMs == other.streamBufferMs;
+    }
 };
 
 // Generic sink diagnostics. The first block intentionally preserves the names

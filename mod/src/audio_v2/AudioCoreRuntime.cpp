@@ -234,31 +234,51 @@ void AudioCoreRuntime::SetAllowResampling(bool enabled) noexcept {
 
 void AudioCoreRuntime::SetOutputTarget(AudioSinkKind kind, const DlnaTarget& target,
                                        std::uint32_t streamBufferMs) noexcept {
+    OutputProfile profile;
+    profile.kind = kind;
+    profile.dlna = target;
+    profile.streamBufferMs = streamBufferMs;
+    SetOutputProfile(profile);
+}
+
+void AudioCoreRuntime::SetOutputProfile(const OutputProfile& profile) noexcept {
     if (abandoned_.load(std::memory_order_acquire)) return;
-    if (streamBufferMs < 200) streamBufferMs = 200;
-    if (streamBufferMs > 3000) streamBufferMs = 3000;
+    OutputProfile requested = profile;
+    if (requested.streamBufferMs < 200) requested.streamBufferMs = 200;
+    if (requested.streamBufferMs > 3000) requested.streamBufferMs = 3000;
+
+    OutputProfile current;
+    current.kind = outputKind_;
+    current.dlna = dlnaTarget_;
+    current.streamBufferMs = streamBufferMs_;
+    current.wasapiDeviceId = wasapiDeviceId_;
+    current.asioDriverClsid = asioDriverClsid_;
+    current.asioDriverName = asioDriverName_;
+
     ControlScope lock(*this);
-    if (kind == outputKind_ && target.udn == dlnaTarget_.udn &&
-        target.friendlyName == dlnaTarget_.friendlyName &&
-        target.location == dlnaTarget_.location &&
-        streamBufferMs == streamBufferMs_) {
-        return;
-    }
+    if (requested.SameAs(current)) return;
+
+    const auto apply = [this](const OutputProfile& value) noexcept {
+        outputKind_ = value.kind;
+        dlnaTarget_ = value.dlna;
+        streamBufferMs_ = value.streamBufferMs;
+        wasapiDeviceId_ = value.wasapiDeviceId;
+        asioDriverClsid_ = value.asioDriverClsid;
+        asioDriverName_ = value.asioDriverName;
+    };
+
     if (graphBound_ || graphConverter_ ||
         boundConverter_.load(std::memory_order_acquire) != nullptr ||
         coordinator_.Phase() != AudioCoreGatePhase::Off) {
         // The bridge cannot rebind an existing converter after its graph
         // identity was cleared, so apply at the next natural converter item.
+        // A RestartCurrent request from the panel forces that boundary.
         outputChangePending_ = true;
-        pendingOutputKind_ = kind;
-        pendingDlnaTarget_ = target;
-        pendingStreamBufferMs_ = streamBufferMs;
+        pendingProfile_ = requested;
         Wake();
         return;
     }
-    outputKind_ = kind;
-    dlnaTarget_ = target;
-    streamBufferMs_ = streamBufferMs;
+    apply(requested);
 }
 
 void AudioCoreRuntime::OnTransportPlayPause(std::uint64_t revision) noexcept {
@@ -1662,9 +1682,12 @@ AudioCoreRuntimeStats AudioCoreRuntime::Stats() const noexcept {
 
 void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     if (outputChangePending_) {
-        outputKind_ = pendingOutputKind_;
-        dlnaTarget_ = pendingDlnaTarget_;
-        streamBufferMs_ = pendingStreamBufferMs_;
+        outputKind_ = pendingProfile_.kind;
+        dlnaTarget_ = pendingProfile_.dlna;
+        streamBufferMs_ = pendingProfile_.streamBufferMs;
+        wasapiDeviceId_ = pendingProfile_.wasapiDeviceId;
+        asioDriverClsid_ = pendingProfile_.asioDriverClsid;
+        asioDriverName_ = pendingProfile_.asioDriverName;
         outputChangePending_ = false;
     }
     if (!UiEnabled() || !graphUnit_ || graphRate_ < 8000 || graphRate_ > 768000 ||
@@ -1755,7 +1778,11 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
             PcmEncoding::SignedInteger, true,
             static_cast<std::uint16_t>(snapshot.registration.sourceBitDepth)};
     }
-    config.sink.endpointId = nativeEndpoint_;
+    // A WASAPI device chosen in the panel overrides the endpoint Apple Music
+    // itself opened; an empty selection keeps following the native endpoint.
+    config.sink.endpointId = wasapiDeviceId_.empty() ? nativeEndpoint_ : wasapiDeviceId_;
+    config.sink.asioDriverClsid = asioDriverClsid_;
+    config.sink.asioDriverName = asioDriverName_;
     config.sink.periodFrames = PeriodFrames(format.sampleRate);
     config.sink.alignmentRetries = 3;
     config.sink.lifecycleContext = callbacks_.context;

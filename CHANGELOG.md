@@ -6,6 +6,36 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0-preview] - 2026-11-05
+
+### Added
+
+- **The output panel is split into two tabs**: *Local playback* (WASAPI or ASIO)
+  and *Network playback* (OpenHome/DLNA). Exactly one output is active; saving
+  persists it in `am-exclusive.ini` and applies it immediately by restarting
+  the current track, so Apple Music never has to be closed. The tab and both
+  local selections are restored on the next launch.
+- **WASAPI endpoint list** and **ASIO driver list** are enumerated from the
+  machine (all active `eRender` endpoints via `IMMDeviceEnumerator`, all
+  drivers registered under `HKLM\SOFTWARE\ASIO`; 32-bit-only drivers are shown
+  but disabled). A WASAPI selection of "follow Apple Music default device"
+  keeps the previous behaviour.
+- **Native ASIO output** (`AudioSinkKind::Asio`): `AsioExclusiveSink` loads the
+  selected driver by CLSID, follows the track sample rate with
+  `setSampleRate`, and fills the driver-owned double buffer from
+  `bufferSwitch`. Derived from the MIT-licensed AMExclusiveASIO /
+  AM-ASIO-MAD work; see `THIRD_PARTY_NOTICES.md`.
+
+### Changed
+
+- `SetOutputTarget` now carries a full output profile: kind 0/1/2, the WASAPI
+  endpoint id or ASIO CLSID, and a display name. The broker persists
+  `[mod] output`, `output_tab`, `wasapi_device`, `asio_driver` and their names,
+  and re-broadcasts the whole profile when the ini changes.
+- Verified with an in-process mock ASIO driver: Open / Start / 20 bufferSwitch
+  callbacks / Stop / Close, 10,240 frames submitted, zero underruns, identical
+  left/right samples. WASAPI/ASIO enumeration was verified on a real machine.
+
 ## [0.2.3] - 2026-11-05
 
 ### Fixed

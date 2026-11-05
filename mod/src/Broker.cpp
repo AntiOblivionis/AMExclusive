@@ -87,11 +87,18 @@ std::atomic<bool> g_shutdown{};
 std::atomic<std::uint64_t> g_lastErrorDialogSignature{};
 std::vector<Client> g_clients;
 HANDLE g_authoritativeAgentPipe{INVALID_HANDLE_VALUE};
-std::uint8_t g_outputKind{}; // 0 = WASAPI, 1 = DLNA/OpenHome
+// 0 = WASAPI endpoint, 1 = DLNA/OpenHome renderer, 2 = ASIO driver.
+std::uint8_t g_outputKind{};
 std::wstring g_dlnaUdn;
 std::wstring g_dlnaName;
 std::wstring g_dlnaLocation;
 std::uint32_t g_dlnaBufferMs{1500};
+// Remembered local selections. The UI keeps both so switching tabs does not
+// lose the other backend's choice; the broker relays whichever one is active.
+std::wstring g_wasapiDeviceId;
+std::wstring g_wasapiName;
+std::wstring g_asioDriverClsid;
+std::wstring g_asioName;
 // Newest location SSDP reported for a renderer. LightningPlayer-class devices
 // re-bind their UPnP HTTP port every few minutes, so the location persisted in
 // the ini goes stale while the UDN stays valid. The broadcast worker records it
@@ -130,7 +137,24 @@ std::uint8_t ReadOutputKind() {
     wchar_t value[32]{};
     GetPrivateProfileStringW(L"mod", L"output", L"wasapi", value,
                              static_cast<DWORD>(std::size(value)), BrokerIniPath().c_str());
-    return _wcsicmp(value, L"dlna") == 0 ? 1u : 0u;
+    if (_wcsicmp(value, L"dlna") == 0) return 1u;
+    if (_wcsicmp(value, L"asio") == 0) return 2u;
+    return 0u;
+}
+
+std::wstring ReadModValue(const wchar_t* key) {
+    wchar_t value[512]{};
+    GetPrivateProfileStringW(L"mod", key, L"", value,
+                             static_cast<DWORD>(std::size(value)), BrokerIniPath().c_str());
+    return value;
+}
+
+std::wstring CurrentLocalDeviceId() {
+    return g_outputKind == 2u ? g_asioDriverClsid : g_wasapiDeviceId;
+}
+
+std::wstring CurrentLocalDeviceName() {
+    return g_outputKind == 2u ? g_asioName : g_wasapiName;
 }
 
 std::wstring ReadDlnaValue(const wchar_t* key) {
@@ -149,10 +173,18 @@ std::uint32_t ReadDlnaBufferMs() {
 
 void WriteOutputTarget(std::uint8_t kind, const std::wstring& udn,
                        const std::wstring& name, const std::wstring& location,
-                       std::uint32_t bufferMs) {
+                       std::uint32_t bufferMs, const std::wstring& localId,
+                       const std::wstring& localName) {
     const auto path = BrokerIniPath();
-    (void)WritePrivateProfileStringW(L"mod", L"output",
-                                     kind ? L"dlna" : L"wasapi", path.c_str());
+    const wchar_t* outputText = kind == 2u ? L"asio" : kind == 1u ? L"dlna" : L"wasapi";
+    (void)WritePrivateProfileStringW(L"mod", L"output", outputText, path.c_str());
+    if (kind == 2u) {
+        (void)WritePrivateProfileStringW(L"mod", L"asio_driver", localId.c_str(), path.c_str());
+        (void)WritePrivateProfileStringW(L"mod", L"asio_name", localName.c_str(), path.c_str());
+    } else if (kind == 0u) {
+        (void)WritePrivateProfileStringW(L"mod", L"wasapi_device", localId.c_str(), path.c_str());
+        (void)WritePrivateProfileStringW(L"mod", L"wasapi_name", localName.c_str(), path.c_str());
+    }
     (void)WritePrivateProfileStringW(L"dlna", L"device_udn", udn.c_str(), path.c_str());
     (void)WritePrivateProfileStringW(L"dlna", L"device_name", name.c_str(), path.c_str());
     (void)WritePrivateProfileStringW(L"dlna", L"location", location.c_str(), path.c_str());
@@ -240,8 +272,15 @@ Message OutputTargetMessage() {
     message.enabledIntent = g_outputKind;
     message.hardwareBufferMs = g_dlnaBufferMs;
     CopyText(message.endpointId, g_dlnaUdn);
-    CopyText(message.endpointName, g_dlnaName);
     CopyText(message.detail, g_dlnaLocation);
+    if (g_outputKind == 1u) {
+        CopyText(message.endpointName, g_dlnaName);
+    } else {
+        // `format` carries the WASAPI endpoint id or the ASIO driver CLSID;
+        // `endpointName` carries its display name for the hook's diagnostics.
+        CopyText(message.format, CurrentLocalDeviceId());
+        CopyText(message.endpointName, CurrentLocalDeviceName());
+    }
     return message;
 }
 
@@ -272,7 +311,8 @@ void IniWatchThread() {
                     const auto stale = g_dlnaLocation;
                     g_dlnaLocation = location;
                     (void)WriteOutputTarget(g_outputKind, g_dlnaUdn, g_dlnaName,
-                                            g_dlnaLocation, g_dlnaBufferMs);
+                                            g_dlnaLocation, g_dlnaBufferMs,
+                                            CurrentLocalDeviceId(), CurrentLocalDeviceName());
                     Log(L"renderer location refreshed device=" + g_dlnaName +
                         L" stale=" + stale + L" current=" + g_dlnaLocation);
                     Broadcast(OutputTargetMessage(), nullptr);
@@ -284,15 +324,25 @@ void IniWatchThread() {
         const auto name = ReadDlnaValue(L"device_name");
         const auto location = ReadDlnaValue(L"location");
         const auto bufferMs = ReadDlnaBufferMs();
+        const auto wasapiId = ReadModValue(L"wasapi_device");
+        const auto wasapiName = ReadModValue(L"wasapi_name");
+        const auto asioClsid = ReadModValue(L"asio_driver");
+        const auto asioName = ReadModValue(L"asio_name");
         const bool changed = kind != g_outputKind || udn != g_dlnaUdn ||
             name != g_dlnaName || location != g_dlnaLocation ||
-            bufferMs != g_dlnaBufferMs;
+            bufferMs != g_dlnaBufferMs || wasapiId != g_wasapiDeviceId ||
+            wasapiName != g_wasapiName || asioClsid != g_asioDriverClsid ||
+            asioName != g_asioName;
         if (!changed) continue;
         g_outputKind = kind;
         g_dlnaUdn = udn;
         g_dlnaName = name;
         g_dlnaLocation = location;
         g_dlnaBufferMs = bufferMs;
+        g_wasapiDeviceId = wasapiId;
+        g_wasapiName = wasapiName;
+        g_asioDriverClsid = asioClsid;
+        g_asioName = asioName;
         g_status.reserved[0] = g_outputKind;
         if (g_outputKind != 0) {
             CopyText(g_status.endpointId, g_dlnaUdn);
@@ -1204,8 +1254,11 @@ void HandleMessage(const Message& incoming, HANDLE source) {
         } else if (incoming.type == MessageType::SetOutputTarget &&
                    (incoming.role == Role::Ui || incoming.role == Role::Controller)) {
             if (incoming.minor < 3) return;
-            const std::uint8_t kind = incoming.enabledIntent ? 1u : 0u;
+            // 0 = WASAPI endpoint, 1 = DLNA/OpenHome renderer, 2 = ASIO driver.
+            const std::uint8_t kind = incoming.enabledIntent > 2u
+                ? 0u : incoming.enabledIntent;
             if (kind == 1u && incoming.endpointId[0] == L'\0') return;
+            if (kind == 2u && incoming.format[0] == L'\0') return;
             g_outputKind = kind;
             g_dlnaUdn = incoming.endpointId;
             g_dlnaName = incoming.endpointName;
@@ -1215,20 +1268,34 @@ void HandleMessage(const Message& incoming, HANDLE source) {
                                                                   : 1500u,
                                         300u),
                 3000u);
+            const std::wstring localId = incoming.format;
+            const std::wstring localName = incoming.endpointName;
+            if (kind == 2u) {
+                g_asioDriverClsid = localId;
+                g_asioName = localName;
+            } else if (kind == 0u) {
+                g_wasapiDeviceId = localId;
+                g_wasapiName = localName;
+            }
             (void)WriteOutputTarget(g_outputKind, g_dlnaUdn, g_dlnaName,
-                                    g_dlnaLocation, g_dlnaBufferMs);
-            if (g_outputKind == 1u && !g_status.enabledIntent) {
-                // Choosing a renderer is a request to route audio there, just
-                // like enabling exclusive mode. Persist the enable intent so a
-                // later restart does not silently fall back to local output.
+                                    g_dlnaLocation, g_dlnaBufferMs,
+                                    localId, localName);
+            if (!g_status.enabledIntent) {
+                // Saving any output in the panel is a request to route audio
+                // through AME, just like enabling exclusive mode.
                 g_status.enabledIntent = 1;
                 (void)WritePrivateProfileStringW(L"mod", L"mode", L"exclusive",
                                                  BrokerIniPath().c_str());
             }
             g_status.generation++;
             g_status.reserved[0] = g_outputKind;
-            CopyText(g_status.endpointName, g_dlnaName);
-            CopyText(g_status.endpointId, g_dlnaUdn);
+            if (g_outputKind == 1u) {
+                CopyText(g_status.endpointName, g_dlnaName);
+                CopyText(g_status.endpointId, g_dlnaUdn);
+            } else {
+                CopyText(g_status.endpointName, CurrentLocalDeviceName());
+                CopyText(g_status.endpointId, CurrentLocalDeviceId());
+            }
             g_status.error = ErrorCategory::None;
             g_status.hresult = S_OK;
             g_status.state = g_status.enabledIntent
@@ -1479,6 +1546,10 @@ int wmain() {
     g_dlnaName = ReadDlnaValue(L"device_name");
     g_dlnaLocation = ReadDlnaValue(L"location");
     g_dlnaBufferMs = ReadDlnaBufferMs();
+    g_wasapiDeviceId = ReadModValue(L"wasapi_device");
+    g_wasapiName = ReadModValue(L"wasapi_name");
+    g_asioDriverClsid = ReadModValue(L"asio_driver");
+    g_asioName = ReadModValue(L"asio_name");
     g_manualUrls = ReadDlnaValue(L"manual_urls");
     g_status.reserved[0] = g_outputKind;
     if (g_outputKind != 0) {

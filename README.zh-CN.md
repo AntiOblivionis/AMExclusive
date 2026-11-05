@@ -1,168 +1,81 @@
-# AMExclusive-Openhome
+<p align="center">
+  <img src="assets/ame-logo.svg" alt="AME." width="480">
+</p>
 
-### 让 Windows 版 Apple Music 输出到 WASAPI 独占设备 / OpenHome 网播
+# AMExclusive
 
-[English](README.md) · [上游项目](https://github.com/AntiOblivionis/AMExclusive) · [更新日志](CHANGELOG.md) · [署名声明](NOTICE.md) · [贡献者](CONTRIBUTORS.md)
+### Make Apple Music on Windows a “Pro” Hi-Fi Player
 
-**本分支由 [@dxdxdxlm123](https://github.com/dxdxdxlm123) 维护。** 上游与本分支的作者信息见
-[CONTRIBUTORS.md](CONTRIBUTORS.md)。
+[English](README.md)
 
-> **非官方分支。** 本仓库是 [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclusive)
-> （MIT License）的派生项目，由本仓库维护者独立维护，与 Apple Inc. 及上游作者均无关联，
-> 也未获得其许可或背书。`amexclusive.tgwgroup.ltd` 是**上游项目**的官网，不是本分支的官网。
+[官网](https://amexclusive.tgwgroup.ltd/zh/) · [使用文档](https://amexclusive.tgwgroup.ltd/zh/docs/)
 
-## 直接下载（无需编译）
+## 描述
 
-编译好的 Windows x64 安装包挂在
-[GitHub Releases](https://github.com/dxdxdxlm123/AMExclusive-Openhome/releases) 上，
-**不需要** Visual Studio、CMake，也不需要下载源码。
-
-| 下载 | 说明 |
-|---|---|
-| **[最新版 Release](https://github.com/dxdxdxlm123/AMExclusive-Openhome/releases/latest)** | 推荐，始终指向最新构建 |
-| **[AMExclusive-Setup-0.2.0-20261104.exe](https://github.com/dxdxdxlm123/AMExclusive-Openhome/releases/download/v0.2.0/AMExclusive-Setup-0.2.0-20261104.exe)** | 2.7 MB 安装程序（v0.2.0 直链） |
-| **[AMExclusive-0.2.0-20261104.zip](https://github.com/dxdxdxlm123/AMExclusive-Openhome/releases/download/v0.2.0/AMExclusive-0.2.0-20261104.zip)** | 安装程序 + 中文《使用说明.txt》 |
-
-安装程序 SHA-256：
-`3676D1A28C58FF3A3F6ADD45D1786C5593BC63DCB29E5BEC1F352408547E5EE9`
-
-**安装步骤**：完全退出 Apple Music → 右键安装程序 →
-**以管理员身份运行** → 重新打开 Apple Music → 在应用内面板选择输出
-（本机 DAC 选 WASAPI 独占，网播选 DLNA 并先扫描设备）。
-需要 Windows 10/11 x64 与 Microsoft Store 版 Apple Music。
-
-安装包**未做代码签名**，Windows SmartScreen 会提示「未知发布者」；请先核对上面的
-校验值，再点「更多信息 → 仍要运行」。
-
-想自己从源码编译请看[编译与安装](#编译与安装)。
-
-## 本分支增加了什么
-
-上游项目提供 WASAPI 独占输出和强制最高音质无损流。本分支完整保留这些能力，并新增
-**DLNA / OpenHome 输出**，让同一路捕获到的 PCM 可以送往网络播放器，而不只是本机 DAC。
-
-| | 上游 | 本分支 |
-|---|---|---|
-| WASAPI 独占输出 | ✅ | ✅（保持不变） |
-| 强制最高音质无损 | ✅ 单一 CoreMedia 版本 | ✅ 两个已验证版本，不匹配则安全降级 |
-| 无外接 DAC 时强制高解析档 | — | ✅ `force_hires=1` |
-| DLNA / OpenHome 网播输出 | — | ✅ |
-| 每首歌新链接 + 真实曲长 | — | ✅ 通过 Windows 媒体会话获取 |
-| 音频缓冲锁页 + 生产者线程提权 | — | ✅ |
+AMExclusive（AME）是一个专为 Windows 版 Apple Music 设计的开源项目，旨在为 Apple Music 提供 WASAPI 独占音频输出以及强制最高音频规格输出的能力，并以此将 Apple Music 优化为一款在受支持硬件与配置下可实现 bit-perfect 输出的“专业”Hi-Fi 音乐播放器。
 
 ## 开发与测试环境
 
-- Windows 11 x64、Visual Studio 2022 MSVC Build Tools、CMake 3.24+、PowerShell 5.1
-- **本分支实测**：Apple Music `1.1792.39682.0` / CoreMedia `1.2 (3365.13)` x64
-- **沿用上游已验证环境**：Apple Music `1.6.4.90` / 包框架 `1.1540.23042.0` x64
-- 实测网播：AURALiC VEGA G2.2（`LightningPlayer`，OpenHome），
-  播放 `WAV 96 kHz / 24-bit / 双声道`，`converted=0`（无重采样、无位深转换）
+- Windows 11 x64
+- Windows 版 Apple Music 文件版本 `1.6.4.90`
+- 已验证包/框架版本 `1.1540.23042.0` x64
 
-质量锁依赖与具体 Apple Music 构建绑定的私有镜像指纹。遇到其他版本时会**安全降级**：
-播放与 DLNA 输出照常工作，但音质档位由 Apple Music 自行决定。查看
-`am-exclusive.log` 中是否出现 `Highest ALAC quality filter matched build profile`
-即可确认是否生效。其他版本与设备不保证可用。
+本项目仅在上述开发与测试版本中完成验证，不保证在其他 Apple Music 版本上的运行效果。
 
-## 功能
+## 特性
 
-### 沿用上游
+1. **WASAPI 独占输出**  
+   以独占模式直接向当前 Windows 输出设备提交音频，绕过常规共享模式下的 Windows 音频混音路径。
 
-1. **WASAPI 独占输出** —— 直接向选定端点提交音频，绕开 Windows 共享模式混音路径。
-2. **强制最高音频规格** —— 拒绝 Apple Music 的低带宽降级，等待最高可用无损流，
-   不自动回退到 AAC。
-3. **Bit-perfect 输出** —— 音源、设备与端点格式匹配时，整数 PCM 原样提交给 WASAPI。
-4. **可选格式转换以兼容设备** —— 升／降采样、位深转换、float32 输出，使用 TPDF
-   抖动与饱和舍入；共享模式永不作为兜底，转换输出会明确标注。
+2. **强制最高音频规格**  
+   去除 Apple Music 原生“低带宽自动降低音频规格”的逻辑，在最高可用无损规格尚未就绪时继续加载等待，而不是自动回退到更低音频规格。
 
-### 本分支新增
+3. **Bit-perfect 输出**  
+   在受支持的播放路径中保持源音频规格，并将整数 PCM 直接提交给 WASAPI；当音源、输出设备与目标格式匹配时，可实现 bit-perfect 播放。
 
-5. **DLNA / OpenHome 输出** —— SSDP 发现、`ConnectionManager.GetSinkProtocolInfo`
-   格式协商、OpenHome `Playlist.DeleteAll + Insert + Play` 控制。网播通过 HTTP 从
-   Apple Music 进程内的服务器拉取 WAV/LPCM 流。每首歌开启新 URL，并重新协商采样率与位深。
-   网播以 **UDN 而非地址**作为身份：这类设备每隔几分钟就会重新绑定 HTTP 端口，
-   因此开流失败时会按 UDN 重新发 M-SEARCH 解析描述地址，而不是反复重试已失效的旧地址。
-6. **文件形态的实时流** —— `LightningPlayer` 一类网播遇到没有总长度的响应体会直接报
-   "不支持此类格式"。因此本分支声明 `Content-Length`、支持 `Accept-Ranges: bytes`，
-   对 `Range: bytes=N-` 返回 `206 + Content-Range`。音频仍然是实时产生的，声明长度只是上限。
-7. **真实曲目时长** —— 由辅助程序读取 Windows 媒体会话（SMTC）时间线，使声明长度与
-   网播进度条与歌曲一致；拿不到时间线时回退到 `[dlna] stream_seconds`。
-8. **强制高解析档** —— `force_hires=1` 把请求档位提升到 20（最高 24-bit/192 kHz），
-   即使 Apple Music 没有检测到外接 DAC。严格过滤器仍只取"条目里实际存在的最高采样率"：
-   96 kHz 曲目走 96 kHz，只有 44.1 kHz ALAC 就落到 44.1 kHz；只要条目里有无损版本，
-   AAC 候选就被剔除。条目本身只有 AAC 时仍可播放。
-9. **多版本质量锁** —— 两个已验证 CoreMedia profile，使用 SHA-256 指纹；镜像不匹配时
-   直接关闭质量锁，不会去 hook 未知代码。
-10. **实时链路加固** —— 两级音频缓冲 `VirtualLock`（配合工作集配额提升），
-    DLNA 生产者线程提升到 `THREAD_PRIORITY_ABOVE_NORMAL`。
+4. **可选采样率与位深转换以兼容设备**
 
-## 已知限制
+   开启兼容开关后，先尝试原采样率的无损输出；设备不支持时，允许升／降采样、位深转换及 float32 输出，保留 WASAPI 独占和现有音质锁定。例如，44.1 kHz/24-bit 和 96 kHz/24-bit 音源都可转换至仅支持 48 kHz/16-bit 的设备。每个输出格式都必须通过驱动的独占支持检查与初始化，不回退到共享模式。探测覆盖常见整数容器、float32、WAVEFORMATEX／EXTENSIBLE 格式声明；设备的混音采样率也会作为候选，不能直接当作独占支持的证据。
 
-- **实时流不可拖动进度条。** 网播端拖动会请求尚未产出的音频，无法实现。请在
-  Apple Music 里拖动：它会重建音频图，本分支会跟着换 URL 重新推送（约 1~2 秒重连）。
-- **声明长度 = 曲目时长 + 3 秒。** 播完时网播会停在最后几秒等待，属显示问题。
-- Apple Music 启动后的第一首歌，如果 SMTC 辅助程序还没吐出第一条时间线，会回退到
-  `stream_seconds`（默认 600 秒）。
-- `force_hires=1` 配合 WASAPI 独占、而本机 DAC 最高只支持 48 kHz 时，96/192 kHz 曲目
-  可能打不开端点（表现为没声音）。请设 `force_hires=0`，或打开 `allow_resampling=1`。
-  DLNA 输出不受影响：格式会按网播上报的能力协商。
+   在 44.1 kHz 及以上（音源更低时以原采样率为准），优先保留音源精度，再尝试 float32／24-bit、16-bit；同一精度组先原采样率，再从最近的更高采样率尝试，最后从高到低尝试更低采样率。更低带宽的输出作为最后选择。升采样使用带限插值抑制频谱镜像，降采样抑制混叠；降低位深使用 TPDF 抖动和饱和舍入。兼容模式也允许本地 int32 音频通过 Apple 解码后的 float32 数据播放，不宣称恢复原始 int32 的 bit-perfect。转换后的输出会明确标注。关闭开关时保留现有无损格式策略与 PCM 路径。
 
-## 配置
+## 推荐设置
 
-安装程序会写入 `%PUBLIC%\AMExclusive\am-exclusive.ini`。升级安装会保留你改过的值。
+在 Apple Music 的 **设置 > 播放** 中：
 
-```ini
-[mod]
-mode=exclusive
-period_100ns=200000
-allow_resampling=0
-output=wasapi        ; wasapi | dlna
-force_hires=1        ; 设为 0 恢复 Apple 原生档位选择
+- 关闭 **交叉渐入渐出**。
+- 关闭 **声音增强器**。
+- 关闭 **音量平衡**。
+- 开启 **无损音频**。
+- 将无损音频下方的两项音频规格均设为 **高解析度无损（ALAC）**。
+- 关闭 **杜比全景声**。
+- 开启 **独占模式**。
+- 在 **硬件缓冲区** 中输入 `1`–`100` 毫秒的整数并点击 **确定**。该数值会在下一首歌曲打开独占输出时应用。默认值为 `20` 毫秒，遇到播放问题时可尝试增加数值。
+- 设备无法播放原规格时，可开启 **设备不支持原规格时允许兼容格式转换**，下次打开歌曲时生效。
+- 关闭 **空间音效**。
 
-[dlna]
-device_udn=          ; 在应用内扫描设备后自动填写
-device_name=
-location=
-buffer_ms=1500       ; 预缓冲目标，调大可容忍更多网络抖动
-format_pref=lpcm
-max_bits=24
-manual_urls=
-pcm_byte_order=big   ; 裸 audio/L16、audio/L24 按 RFC 3551/3190 为大端
-stream_seconds=600   ; 拿不到 SMTC 时间线时的兜底声明长度
-follow_track_duration=1
-```
-
-## Apple Music 推荐设置
-
-在 **设置 > 播放** 中：关闭 **交叉渐入渐出**、**声音增强器**、**音量平衡**、
-**杜比全景声**、**空间音效**；开启 **无损音频** 和 **独占模式**；无损音频下方两项
-规格都设为 **高解析度无损（ALAC）**。**硬件缓冲区** 填 `1`–`100` 毫秒整数
-（默认 `20` 毫秒，播放有问题可增大）并点击 **确定**。仅在设备无法播放原规格时
-开启 **设备不支持原规格时允许兼容格式转换**。
-
-使用独立 DAC 与放大器时，把应用内音量、Windows 输出音量、DAC 输出音量保持最大，
-只在放大器上调音量。首次应用这些设置前，请先降低硬件音量，避免突然出现过高声压。
+使用独立 DAC 和放大器时，将 Apple Music 应用内音量、Windows 输出音量和 DAC 输出音量保持在最大值，只通过放大器调整实际播放音量。使用 DAC/AMP 一体机时，将 Apple Music 应用内音量和 Windows 输出音量保持在最大值，通过 DAC/AMP 一体机的硬件音量控制调整实际播放音量。首次应用这些设置前，请先降低放大器或 DAC/AMP 一体机的硬件音量，避免突然出现过高声压。
 
 ## 编译与安装
 
-### GitHub Actions
+### 使用 GitHub Actions 编译
 
-在自己的 fork 中打开 **Actions → Build Setup → Run workflow**（先启用 Actions），
-成功后从 Artifacts 下载 `AMExclusive-Setup-x64`。工作流只手动触发，编译 Windows x64
-Release 并校验安装器内嵌载荷，不自动发布 Release。构建机不需要安装 Apple Music：
-固定版本的 Windows App SDK / WinUI 元数据来自 NuGet，并在编译前用 SHA-256 校验
-`Microsoft.UI.Xaml.winmd`。构建产物保留 14 天。
+1. 打开 [Actions → Build Setup](https://github.com/AntiOblivionis/AMExclusive/actions/workflows/build-setup.yml)。编译自己的修改时，先 Fork 仓库，并在自己的仓库中启用 Actions。
+2. 点击 **Run workflow**，选择分支并运行。
+3. 成功后，在该次运行的 **Artifacts** 中下载 **AMExclusive-Setup-x64**，解压得到 `AMExclusive-Setup.exe`。
+
+工作流仅手动触发，编译 Windows x64 Release 并检查安装器内嵌文件，不自动发布 Release。构建机不需要安装 Apple Music：工作流会从 NuGet 下载固定版本的 Microsoft Windows App SDK / WinUI 元数据包，并在编译前使用固定 SHA-256 校验 `Microsoft.UI.Xaml.winmd`。安装 AMExclusive 的电脑仍需安装 Apple Music。构建产物保留 14 天，下载需登录 GitHub。
 
 ### 本地编译
 
-需要 Visual Studio 2022 或更新版本的 MSVC Build Tools、Windows 11 SDK、
-CMake 3.24+、PowerShell。
+从源码编译需要 Visual Studio 2022 或更新版本的 MSVC Build Tools、Windows 11 SDK、CMake 3.24 或更新版本和 PowerShell。默认情况下，构建脚本会从本机安装的 Windows 版 Apple Music 中读取所需 WinUI 元数据：
 
 ```powershell
 cd mod
 .\scripts\Build-Mod.ps1 -Configuration Release
 ```
 
-构建机没有 Apple Music 时：
+构建机没有安装 Apple Music 时，也可以先准备独立元数据目录再编译：
 
 ```powershell
 cd mod
@@ -170,57 +83,33 @@ cd mod
 .\scripts\Build-Mod.ps1 -Configuration Release -WinUIMetadataDirectory .\build\winui-metadata
 ```
 
-安装器输出：`mod\build\dist\AMExclusive-Setup.exe`。
+安装器输出位置：
 
-**请以管理员身份运行安装程序。** 伴生程序需要把计划任务注册到任务根目录，
-非提权进程会收到 Access denied。安装完成后**完全退出并重新打开 Apple Music**，
-然后在应用内面板选择输出：本机 DAC 选 **WASAPI 独占**，网播选 **DLNA** 并先扫描设备。
+```text
+mod\build\dist\AMExclusive-Setup.exe
+```
 
-卸载：再次运行 Setup 选 `2`，或从 **Windows 设置 > 应用 > 已安装的应用** 卸载，
-也可运行 `%PUBLIC%\AMExclusive\Uninstall.cmd`。
+安装或升级时，运行 `AMExclusive-Setup.exe` 并选择 `1`。随后打开 Apple Music，进入 **设置 > 播放**，开启 **独占模式**。
 
-### 日志
-
-日志位于 `%PUBLIC%\AMExclusive\`：
-
-| 文件 | 内容 |
-|---|---|
-| `am-exclusive.log` | hook、质量锁、音频链路 telemetry |
-| `am-exclusive-dlna.log` | 开流、HTTP 请求、格式协商 |
-| `am-exclusive-broker.log` | SSDP 发现与配置 |
-
-提 Issue 时请附上日志，见 [CONTRIBUTING.md](CONTRIBUTING.md)。
-
-## 开发说明
-
-本分支部分改动在 AI 辅助下完成。所有改动均经过人工审阅、编译，并在实体
-AURALiC VEGA G2.2 网播上验证后才提交；上游项目自身的提交历史中也有类似的
-AI 协作署名。
+卸载时，运行同一个 Setup 并选择 `2`，或在 **Windows 设置 > 应用 > 已安装的应用** 中卸载 **AMExclusive**。
 
 ## 致谢
 
-- [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclusive) —— 原项目及其贡献者，MIT License。
-- [LINUX DO 社区](https://linux.do/) —— 上游开发测试过程中的交流与反馈。
-- [MinHook](https://github.com/TsudaKageyu/minhook) —— Windows API Hook 基础能力。
-- [rigtorp/SPSCQueue](https://github.com/rigtorp/SPSCQueue) —— 实时音频路径上的有界 SPSC 队列。
+感谢 [LINUX DO 社区](https://linux.do/) 在项目开发与测试过程中提供的交流、支持与反馈。
 
-完整版本、版权与许可证信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
-与 [NOTICE.md](NOTICE.md)。
+本项目使用了以下开源项目：
+
+- [MinHook](https://github.com/TsudaKageyu/minhook) — 提供 Windows x64/x86 API Hook 基础能力。
+- [rigtorp/SPSCQueue](https://github.com/rigtorp/SPSCQueue) — 提供音频实时路径使用的单生产者、单消费者有界队列。
+
+感谢上述项目及其贡献者。完整版本、版权和许可证信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 协议与声明
 
-项目自行编写的源码使用 [MIT License](LICENSE)，第三方组件继续遵循各自的上游许可证。
-原版权声明与许可声明在 `LICENSE` 中原样保留；本分支的改动清单见 [NOTICE.md](NOTICE.md)。
+项目自行编写的源码使用 [MIT License](LICENSE)。第三方组件继续遵循其各自的上游许可证，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-AMExclusive-Openhome 是独立且非官方的开源项目，与 Apple Inc. 没有任何关联，
-也未获得其许可或背书。Apple Music 是 Apple Inc. 的商标。对第三方闭源应用进行
-hook 可能受该应用软件许可条款限制：本项目仅供个人互操作性使用，使用者需自行确认
-是否符合当地法律及 Apple 的相关条款。
+AMExclusive 是一个独立且非官方的开源项目，与 Apple Inc. 没有任何关联，也未获得其许可或背书。Apple Music 是 Apple Inc. 的商标。
 
-本项目不保证在不同软件、硬件、驱动程序或音频设备条件下正常运行。使用本项目可能造成
-不可预知的后果，使用者应自行承担相关风险。
+本项目不保证在不同软件、硬件、驱动程序或音频设备条件下能够正常运行。使用本项目可能造成不可预知的后果，使用者应自行承担相关风险。
 
-本项目不分发 Apple 软件、Apple 二进制文件、解密后的媒体或 DRM-free 参考文件，
-也不提供用于绕过 DRM 保护的功能。`mod/src/ApplePrivateOffsets.h` 中的版本指纹只是
-短指令序列的 SHA-256 摘要，用于确认已加载镜像是否为审阅过的构建；本仓库不包含
-任何 Apple 代码或二进制文件。
+本项目不分发 Apple 软件、Apple 二进制文件、解密后的媒体或 DRM-free 参考文件，也不提供用于绕过 DRM 保护的功能。

@@ -1,6 +1,7 @@
 #include "BoundedLog.h"
 #include "IpcProtocol.h"
 #include "IpcTransport.h"
+#include "LocalOutputDevices.h"
 #include "UiRefreshState.h"
 #include "UiPlaybackState.h"
 
@@ -99,8 +100,17 @@ winrt::weak_ref<Controls::ToggleSwitch> g_toggle;
 winrt::weak_ref<Controls::TextBox> g_hardwareBufferBox;
 winrt::weak_ref<Controls::ToggleSwitch> g_resamplingToggle;
 winrt::weak_ref<Controls::Border> g_outputFormatCard;
-winrt::weak_ref<Controls::ComboBox> g_outputCombo;
+winrt::weak_ref<Controls::ComboBox> g_outputCombo;       // network (DLNA) devices
+winrt::weak_ref<Controls::ComboBox> g_localBackendCombo;  // WASAPI / ASIO
+winrt::weak_ref<Controls::ComboBox> g_localDeviceCombo;   // endpoints / drivers
+winrt::weak_ref<Controls::Button> g_localTabButton;
+winrt::weak_ref<Controls::Button> g_networkTabButton;
+winrt::weak_ref<Controls::StackPanel> g_localPanel;
+winrt::weak_ref<Controls::StackPanel> g_networkPanel;
 winrt::weak_ref<Controls::TextBlock> g_outputTargetStatus;
+std::atomic<int> g_activeOutputTab{0}; // 0 = local, 1 = network
+std::mutex g_localDevicesMutex;
+std::vector<ammod::local_devices::Device> g_localDevices;
 
 struct OutputDeviceEntry final {
     std::wstring udn;
@@ -127,6 +137,7 @@ std::mutex g_pendingOutputMutex;
 std::wstring g_pendingOutputUdn;
 std::wstring g_pendingOutputName;
 std::wstring g_pendingOutputLocation;
+std::wstring g_pendingOutputLocalId;
 std::mutex g_stagedOutputMutex;
 std::wstring g_stagedOutputUdn;
 std::wstring g_stagedOutputName;
@@ -754,18 +765,25 @@ void ApplyStatus(const Controls::ToggleSwitch& toggle) {
 void ApplyOutputTargetStatus() {
     if (g_outputSelectionStaged.load()) return;
     const auto status = StatusSnapshot();
-    const bool network = status.reserved[0] != 0;
+    const std::uint8_t kind = status.reserved[0];
     std::wstring text;
-    if (network) {
-        text = Localized(L"当前：", L"Current: ");
+    if (kind == 1u) {
+        text = Localized(L"当前：网播 ", L"Current: renderer ");
         text += status.endpointName[0]
             ? std::wstring(status.endpointName)
             : Localized(L"DLNA/OpenHome 设备", L"DLNA/OpenHome device");
         text += Localized(L"（已应用，延迟约 1–2 秒）",
                           L" (applied, approx. 1-2 s latency)");
+    } else if (kind == 2u) {
+        text = Localized(L"当前：ASIO ", L"Current: ASIO ");
+        text += status.endpointName[0]
+            ? std::wstring(status.endpointName)
+            : Localized(L"驱动", L"driver");
     } else {
-        text = Localized(L"当前：本机 WASAPI 独占输出",
-                         L"Current: local WASAPI exclusive output");
+        text = Localized(L"当前：WASAPI ", L"Current: WASAPI ");
+        text += status.endpointName[0]
+            ? std::wstring(status.endpointName)
+            : Localized(L"本机独占输出", L"local exclusive output");
     }
     if (auto statusText = g_outputTargetStatus.get()) {
         try {
@@ -775,7 +793,7 @@ void ApplyOutputTargetStatus() {
     }
     if (auto box = g_hardwareBufferBox.get()) {
         try {
-            box.IsEnabled(!network);
+            box.IsEnabled(kind != 1u);
         } catch (...) {
         }
     }
@@ -1824,167 +1842,320 @@ std::wstring StreamFormatIniPath() {
     return path;
 }
 
-void CommitOutputSelection(const Controls::ComboBox& combo) {
-    if (!combo || g_suppressOutputSelection.load()) return;
-    // A ComboBox raises SelectionChanged for programmatic SelectedIndex changes
-    // too, sometimes after the rebuild suppression flag has been cleared. Only
-    // a real user gesture (dropdown/Tapped) may stage a new target.
-    if (!g_outputComboUserInteraction.exchange(false)) {
-        Log(L"ui output selection ignored: no user interaction");
-        return;
+// ---------------- Output settings persisted in am-exclusive.ini ----------------
+//
+// Exactly one output is active. The UI keeps both local selections (WASAPI
+// endpoint and ASIO driver) and the renderer selection in the ini, so switching
+// tabs never loses the other choice. Restarting Apple Music restores the saved
+// output and the tab the user was last on.
+
+struct OutputSettings final {
+    int kind{0}; // 0 = WASAPI, 1 = DLNA/OpenHome, 2 = ASIO
+    int tab{-1}; // -1 = derive from kind
+    std::wstring wasapiId;
+    std::wstring wasapiName;
+    std::wstring asioClsid;
+    std::wstring asioName;
+    std::wstring dlnaUdn;
+    std::wstring dlnaName;
+    std::wstring dlnaLocation;
+};
+
+std::wstring ReadIniText(const wchar_t* section, const wchar_t* key,
+                         const wchar_t* fallback = L"") {
+    wchar_t value[512]{};
+    const auto path = StreamFormatIniPath();
+    if (path.empty()) return fallback;
+    GetPrivateProfileStringW(section, key, fallback, value,
+                             static_cast<DWORD>(std::size(value)), path.c_str());
+    return value;
+}
+
+void WriteIniText(const wchar_t* section, const wchar_t* key,
+                  const std::wstring& value) {
+    const auto path = StreamFormatIniPath();
+    if (path.empty()) return;
+    (void)WritePrivateProfileStringW(section, key, value.c_str(), path.c_str());
+}
+
+OutputSettings ReadOutputSettings() {
+    OutputSettings settings;
+    const auto output = ReadIniText(L"mod", L"output", L"wasapi");
+    settings.kind = _wcsicmp(output.c_str(), L"dlna") == 0 ? 1
+        : _wcsicmp(output.c_str(), L"asio") == 0 ? 2 : 0;
+    const auto tab = ReadIniText(L"mod", L"output_tab", L"");
+    settings.tab = _wcsicmp(tab.c_str(), L"network") == 0 ? 1
+        : _wcsicmp(tab.c_str(), L"local") == 0 ? 0 : -1;
+    settings.wasapiId = ReadIniText(L"mod", L"wasapi_device");
+    settings.wasapiName = ReadIniText(L"mod", L"wasapi_name");
+    settings.asioClsid = ReadIniText(L"mod", L"asio_driver");
+    settings.asioName = ReadIniText(L"mod", L"asio_name");
+    settings.dlnaUdn = ReadIniText(L"dlna", L"device_udn");
+    settings.dlnaName = ReadIniText(L"dlna", L"device_name");
+    settings.dlnaLocation = ReadIniText(L"dlna", L"location");
+    return settings;
+}
+
+void PersistOutputSettings(const OutputSettings& settings) {
+    WriteIniText(L"mod", L"output", settings.kind == 2 ? L"asio"
+        : settings.kind == 1 ? L"dlna" : L"wasapi");
+    WriteIniText(L"mod", L"output_tab", settings.tab == 1 ? L"network" : L"local");
+    WriteIniText(L"mod", L"wasapi_device", settings.wasapiId);
+    WriteIniText(L"mod", L"wasapi_name", settings.wasapiName);
+    WriteIniText(L"mod", L"asio_driver", settings.asioClsid);
+    WriteIniText(L"mod", L"asio_name", settings.asioName);
+    WriteIniText(L"dlna", L"device_udn", settings.dlnaUdn);
+    WriteIniText(L"dlna", L"device_name", settings.dlnaName);
+    WriteIniText(L"dlna", L"location", settings.dlnaLocation);
+    const auto path = StreamFormatIniPath();
+    if (!path.empty()) {
+        (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
     }
-    const int index = combo.SelectedIndex();
-    if (index < 0) return;
-    if (index == 0) {
-        {
-            std::lock_guard lock(g_stagedOutputMutex);
-            g_stagedOutputKind = 0;
-            g_stagedOutputUdn.clear();
-            g_stagedOutputName.clear();
-            g_stagedOutputLocation.clear();
-        }
-        g_outputSelectionStaged.store(true);
-        if (auto status = g_outputTargetStatus.get()) {
-            status.Text(Localized(L"已选择：本机 WASAPI 独占 · 点击“应用”生效",
-                                  L"Selected: local WASAPI exclusive · press Apply"));
-        }
-        Log(L"ui output target staged local WASAPI");
-        return;
-    }
-    const auto devices = CopyOutputDevices();
-    std::wstring selectedUdn;
-    if (auto item = combo.SelectedItem().try_as<Controls::ComboBoxItem>()) {
-        const auto tag = winrt::unbox_value_or<winrt::hstring>(item.Tag(), L"");
-        selectedUdn = tag.c_str();
-    }
-    auto deviceIt = std::find_if(devices.begin(), devices.end(),
-        [&selectedUdn](const OutputDeviceEntry& entry) { return entry.udn == selectedUdn; });
-    if (deviceIt == devices.end()) {
-        Log(L"ui output selection ignored: selected item has no matching UDN");
-        return;
-    }
-    const auto& device = *deviceIt;
-    if (!device.online) {
-        g_suppressOutputSelection.store(true);
-        combo.SelectedIndex(0);
-        g_suppressOutputSelection.store(false);
-        if (auto status = g_outputTargetStatus.get()) {
-            status.Text(Localized(L"设备当前离线，无法选择",
-                                  L"Device is offline and cannot be selected"));
-        }
-        return;
-    }
-    {
-        std::lock_guard lock(g_stagedOutputMutex);
-        g_stagedOutputKind = 1;
-        g_stagedOutputUdn = device.udn;
-        g_stagedOutputName = device.name;
-        g_stagedOutputLocation = device.location;
-    }
-    g_outputSelectionStaged.store(true);
+}
+
+void SetOutputStatusText(const std::wstring& text) {
     if (auto status = g_outputTargetStatus.get()) {
-        status.Text(Localized(L"已选择：", L"Selected: ") + device.name +
-                    Localized(L" · 点击“应用”生效", L" · press Apply"));
+        try {
+            status.Text(text);
+        } catch (...) {
+        }
     }
-    Log(L"ui output target staged DLNA device=" + device.name + L" udn=" + device.udn);
+}
+
+std::vector<ammod::local_devices::Device> CopyLocalDevices() {
+    std::lock_guard lock(g_localDevicesMutex);
+    return g_localDevices;
+}
+
+void RefreshLocalDevices() {
+    auto devices = ammod::local_devices::Enumerate();
+    const auto count = devices.size();
+    {
+        std::lock_guard lock(g_localDevicesMutex);
+        g_localDevices = std::move(devices);
+    }
+    Log(L"ui local devices enumerated count=" + std::to_wstring(count));
+}
+
+int CurrentLocalBackend() {
+    if (auto combo = g_localBackendCombo.get()) {
+        return combo.SelectedIndex() == 1 ? 1 : 0;
+    }
+    return 0;
+}
+
+void RebuildLocalDeviceCombo() {
+    auto combo = g_localDeviceCombo.get();
+    if (!combo || !combo.DispatcherQueue().HasThreadAccess()) return;
+    const int backend = CurrentLocalBackend();
+    const auto settings = ReadOutputSettings();
+    const std::wstring selected = backend == 1 ? settings.asioClsid : settings.wasapiId;
+    const auto devices = CopyLocalDevices();
+    g_suppressOutputSelection.store(true);
+    combo.Items().Clear();
+    int selectedIndex = 0;
+    if (backend == 0) {
+        Controls::ComboBoxItem follow;
+        follow.Content(box_value(Localized(
+            L"跟随 Apple Music 默认设备", L"Follow Apple Music default device")));
+        follow.Tag(box_value(winrt::hstring(L"")));
+        combo.Items().Append(follow);
+        for (const auto& device : devices) {
+            if (device.backend != ammod::local_devices::Backend::Wasapi) continue;
+            Controls::ComboBoxItem item;
+            item.Content(box_value(device.name));
+            item.Tag(box_value(winrt::hstring(device.id)));
+            item.IsEnabled(device.usable);
+            combo.Items().Append(item);
+            if (!selected.empty() && device.id == selected) {
+                selectedIndex = static_cast<int>(combo.Items().Size()) - 1;
+            }
+        }
+    } else {
+        for (const auto& device : devices) {
+            if (device.backend != ammod::local_devices::Backend::Asio) continue;
+            Controls::ComboBoxItem item;
+            std::wstring text = device.name;
+            if (!device.usable) {
+                text += Localized(L"（32 位驱动，不可用）", L" (32-bit, unavailable)");
+            }
+            item.Content(box_value(text));
+            item.Tag(box_value(winrt::hstring(device.id)));
+            item.IsEnabled(device.usable);
+            combo.Items().Append(item);
+            if (!selected.empty() && device.id == selected) {
+                selectedIndex = static_cast<int>(combo.Items().Size()) - 1;
+            }
+        }
+        if (combo.Items().Size() == 0) {
+            Controls::ComboBoxItem none;
+            none.Content(box_value(Localized(
+                L"未检测到 64 位 ASIO 驱动", L"No 64-bit ASIO driver found")));
+            none.Tag(box_value(winrt::hstring(L"")));
+            combo.Items().Append(none);
+        }
+    }
+    combo.SelectedIndex(selectedIndex);
+    g_suppressOutputSelection.store(false);
+}
+
+void SelectOutputTab(int tab) {
+    g_activeOutputTab.store(tab);
+    if (auto panel = g_localPanel.get()) {
+        panel.Visibility(tab == 0 ? Xaml::Visibility::Visible : Xaml::Visibility::Collapsed);
+    }
+    if (auto panel = g_networkPanel.get()) {
+        panel.Visibility(tab == 1 ? Xaml::Visibility::Visible : Xaml::Visibility::Collapsed);
+    }
+    if (auto button = g_localTabButton.get()) {
+        button.Content(box_value(Localized(
+            tab == 0 ? L"● 本地播放" : L"本地播放",
+            tab == 0 ? L"● Local playback" : L"Local playback")));
+    }
+    if (auto button = g_networkTabButton.get()) {
+        button.Content(box_value(Localized(
+            tab == 1 ? L"● 网播播放" : L"网播播放",
+            tab == 1 ? L"● Network playback" : L"Network playback")));
+    }
+    Log(L"ui output tab selected=" + std::to_wstring(tab));
 }
 
 void ApplyOutputSelection() {
-    if (!g_outputSelectionStaged.load()) {
-        if (auto status = g_outputTargetStatus.get()) {
-            status.Text(Localized(L"请先选择一个输出目标", L"Select an output target first"));
+    auto settings = ReadOutputSettings();
+    const int tab = g_activeOutputTab.load();
+    settings.tab = tab;
+    std::wstring localId;
+    std::wstring displayName;
+
+    if (tab == 0) {
+        const int backend = CurrentLocalBackend();
+        if (auto combo = g_localDeviceCombo.get()) {
+            if (auto item = combo.SelectedItem().try_as<Controls::ComboBoxItem>()) {
+                localId = winrt::unbox_value_or<winrt::hstring>(item.Tag(), L"").c_str();
+                displayName = winrt::unbox_value_or<winrt::hstring>(item.Content(), L"").c_str();
+            }
         }
-        return;
+        if (backend == 1) {
+            if (localId.empty()) {
+                SetOutputStatusText(Localized(
+                    L"请先安装并选择一个 64 位 ASIO 驱动",
+                    L"Install and select a 64-bit ASIO driver first"));
+                return;
+            }
+            settings.kind = 2;
+            settings.asioClsid = localId;
+            settings.asioName = displayName;
+        } else {
+            settings.kind = 0;
+            settings.wasapiId = localId;
+            settings.wasapiName = localId.empty()
+                ? Localized(L"默认设备", L"Default device")
+                : displayName;
+        }
+        settings.dlnaUdn.clear();
+        settings.dlnaName.clear();
+        settings.dlnaLocation.clear();
+    } else {
+        std::wstring udn;
+        if (auto combo = g_outputCombo.get()) {
+            if (auto item = combo.SelectedItem().try_as<Controls::ComboBoxItem>()) {
+                udn = winrt::unbox_value_or<winrt::hstring>(item.Tag(), L"").c_str();
+            }
+        }
+        if (udn.empty()) {
+            SetOutputStatusText(Localized(
+                L"请先扫描并选择一个网播设备",
+                L"Scan for and select a renderer first"));
+            return;
+        }
+        const auto devices = CopyOutputDevices();
+        auto it = std::find_if(devices.begin(), devices.end(),
+            [&udn](const OutputDeviceEntry& entry) { return entry.udn == udn; });
+        if (it == devices.end() || !it->online) {
+            SetOutputStatusText(Localized(
+                L"所选设备当前离线", L"The selected renderer is offline"));
+            return;
+        }
+        settings.kind = 1;
+        settings.dlnaUdn = udn;
+        settings.dlnaName = it->name;
+        settings.dlnaLocation = it->location;
     }
-    int kind = 0;
-    std::wstring udn, name, location;
-    {
-        std::lock_guard lock(g_stagedOutputMutex);
-        kind = g_stagedOutputKind;
-        udn = g_stagedOutputUdn;
-        name = g_stagedOutputName;
-        location = g_stagedOutputLocation;
-    }
+
+    PersistOutputSettings(settings);
     {
         std::lock_guard lock(g_pendingOutputMutex);
-        g_pendingOutputUdn = udn;
-        g_pendingOutputName = name;
-        g_pendingOutputLocation = location;
+        g_pendingOutputUdn = settings.dlnaUdn;
+        g_pendingOutputName = settings.kind == 1 ? settings.dlnaName : displayName;
+        g_pendingOutputLocation = settings.dlnaLocation;
+        g_pendingOutputLocalId = settings.kind == 0 ? settings.wasapiId
+            : settings.kind == 2 ? settings.asioClsid : std::wstring();
     }
     g_pendingOutputBufferMs.store(1500);
-    g_pendingOutputKind.store(kind);
-    g_outputSelectionStaged.store(false);
-    if (auto status = g_outputTargetStatus.get()) {
-        status.Text(Localized(
-            L"已应用。正在播放的曲目会在下一首生效；可点“立即重开当前曲目”。",
-            L"Applied. The current track takes effect on the next track; use Restart current track."));
-    }
-    Log(L"ui output target apply kind=" + std::to_wstring(kind) +
-        L" device=" + name + L" udn=" + udn + L" location=" + location);
+    g_pendingOutputKind.store(settings.kind);
+    // Restart the current track so the new sink is bound now, not only on the
+    // next track. No Apple Music restart is required.
+    g_pendingRestartCurrent.store(1);
+    SetOutputStatusText(Localized(
+        L"已保存并应用，正在重开当前曲目…",
+        L"Saved and applied. Restarting the current track…"));
+    Log(L"ui output saved kind=" + std::to_wstring(settings.kind) +
+        L" tab=" + std::to_wstring(tab) + L" local=" + localId +
+        L" device=" + settings.dlnaName);
+}
+
+void CommitOutputSelection(const Controls::ComboBox&) {
+    if (g_suppressOutputSelection.load()) return;
+    SetOutputStatusText(Localized(
+        L"已选择网播设备 · 点击「保存并应用」生效",
+        L"Renderer selected · press Save & apply"));
 }
 
 void RequestRestartCurrent() {
     g_pendingRestartCurrent.store(1);
-    if (auto status = g_outputTargetStatus.get()) {
-        status.Text(Localized(L"正在重开当前曲目以使输出目标立即生效…",
-                              L"Restarting the current track to apply the output target…"));
-    }
+    SetOutputStatusText(Localized(
+        L"正在重开当前曲目以应用输出设置…",
+        L"Restarting the current track to apply the output…"));
     Log(L"ui request restart current track");
 }
 
 void RebuildOutputCombo(const Controls::ComboBox& combo) {
     if (!combo || !combo.DispatcherQueue().HasThreadAccess()) return;
-    std::wstring selectedUdn;
-    bool haveSelected = false;
+    const auto settings = ReadOutputSettings();
+    std::wstring selectedUdn = settings.dlnaUdn;
     if (g_outputSelectionStaged.load()) {
         std::lock_guard lock(g_stagedOutputMutex);
         selectedUdn = g_stagedOutputUdn;
-        haveSelected = true;
-    }
-    if (!haveSelected) {
-        const int previous = combo.SelectedIndex();
-        if (previous > 0) {
-            const auto devices = CopyOutputDevices();
-            const auto index = static_cast<std::size_t>(previous - 1);
-            if (index < devices.size()) {
-                selectedUdn = devices[index].udn;
-                haveSelected = true;
-            }
-        }
-    }
-    if (!haveSelected) {
-        const auto status = StatusSnapshot();
-        haveSelected = true;
-        if (status.reserved[0] != 0) selectedUdn = status.endpointId;
     }
     const auto devices = CopyOutputDevices();
     g_suppressOutputSelection.store(true);
-    // Any gesture that predates this programmatic rebuild must not be consumed
-    // by the SelectionChanged event raised by SelectedIndex below.
     g_outputComboUserInteraction.store(false);
     combo.Items().Clear();
-    Controls::ComboBoxItem local;
-    local.Content(box_value(Localized(L"本机 WASAPI 独占", L"Local WASAPI exclusive")));
-    combo.Items().Append(local);
     int selectedIndex = 0;
-    for (std::size_t index = 0; index < devices.size(); ++index) {
-        const auto& device = devices[index];
+    if (devices.empty()) {
+        Controls::ComboBoxItem placeholder;
+        placeholder.Content(box_value(Localized(
+            L"尚未发现网播设备，点「刷新设备」", L"No renderer found, press Refresh")));
+        placeholder.Tag(box_value(winrt::hstring(L"")));
+        combo.Items().Append(placeholder);
+    }
+    for (const auto& device : devices) {
         Controls::ComboBoxItem item;
         std::wstring text = device.name;
         text += device.openHome ? L" · OpenHome" : L" · DLNA";
         if (!device.online) text += Localized(L"（离线）", L" (offline)");
         item.Content(box_value(text));
-        item.Tag(box_value(device.udn));
+        item.Tag(box_value(winrt::hstring(device.udn)));
         item.IsEnabled(device.online);
         combo.Items().Append(item);
-        if (device.udn == selectedUdn) selectedIndex = static_cast<int>(index) + 1;
+        if (!selectedUdn.empty() && device.udn == selectedUdn) {
+            selectedIndex = static_cast<int>(combo.Items().Size()) - 1;
+        }
     }
     combo.SelectedIndex(selectedIndex);
     g_suppressOutputSelection.store(false);
-    Log(L"ui output combo rebuilt selectedUdn=" + selectedUdn +
-        L" index=" + std::to_wstring(selectedIndex) +
+    Log(L"ui renderer combo rebuilt selectedUdn=" + selectedUdn +
         L" devices=" + std::to_wstring(devices.size()));
-    ApplyOutputTargetStatus();
 }
 
 void UpdateOutputDevice(const Message& message, bool found) {
@@ -2032,11 +2203,11 @@ Controls::Border CreateOutputTargetCard(
     const Controls::Border& appearance,
     const std::vector<Controls::TextBlock>& nativeText) {
     Controls::TextBlock title;
-    title.Text(Localized(L"输出目标", L"Output target"));
+    title.Text(Localized(L"输出方式", L"Output"));
     Controls::TextBlock description;
     description.Text(Localized(
-        L"选择本机 WASAPI 独占，或局域网内支持 OpenHome/DLNA 的播放设备。网络输出约有 1–2 秒延迟。",
-        L"Choose local WASAPI exclusive or a LAN OpenHome/DLNA renderer. Network output adds roughly 1–2 s latency."));
+        L"本地播放（WASAPI / ASIO）与网播播放（OpenHome / DLNA）只能选择一种。保存后立即生效，无需重启 Apple Music。",
+        L"Choose exactly one: local playback (WASAPI / ASIO) or network playback (OpenHome / DLNA). Saving applies immediately, no Apple Music restart."));
     description.TextWrapping(Xaml::TextWrapping::Wrap);
     Controls::TextBlock status;
     status.Name(L"AMExclusiveOutputTargetStatus");
@@ -2047,17 +2218,162 @@ Controls::Border CreateOutputTargetCard(
         status.Style(nativeText[1].Style());
     }
 
-    Controls::StackPanel labels;
-    labels.VerticalAlignment(Xaml::VerticalAlignment::Center);
-    labels.Children().Append(title);
-    labels.Children().Append(description);
-    labels.Children().Append(status);
+    // ---- tab strip -------------------------------------------------------
+    Controls::StackPanel tabStrip;
+    tabStrip.Orientation(Controls::Orientation::Horizontal);
+    tabStrip.Spacing(8.0);
+    tabStrip.Margin(Xaml::Thickness{0, 6, 0, 4});
+    Controls::Button localTabButton;
+    localTabButton.Name(L"AMExclusiveLocalTab");
+    localTabButton.MinWidth(140.0);
+    localTabButton.Click([](auto&&, auto&&) {
+        try { SelectOutputTab(0); } catch (...) {}
+    });
+    Controls::Button networkTabButton;
+    networkTabButton.Name(L"AMExclusiveNetworkTab");
+    networkTabButton.MinWidth(140.0);
+    networkTabButton.Click([](auto&&, auto&&) {
+        try { SelectOutputTab(1); } catch (...) {}
+    });
+    tabStrip.Children().Append(localTabButton);
+    tabStrip.Children().Append(networkTabButton);
+    g_localTabButton = winrt::make_weak(localTabButton);
+    g_networkTabButton = winrt::make_weak(networkTabButton);
 
+    // ---- local tab -------------------------------------------------------
+    Controls::StackPanel localPanel;
+    localPanel.Name(L"AMExclusiveLocalOutputPanel");
+    localPanel.Margin(Xaml::Thickness{0, 4, 0, 0});
+
+    Controls::StackPanel backendRow;
+    backendRow.Orientation(Controls::Orientation::Horizontal);
+    backendRow.Spacing(8.0);
+    Controls::TextBlock backendLabel;
+    backendLabel.Text(Localized(L"接口", L"Interface"));
+    backendLabel.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    backendLabel.MinWidth(120.0);
+    Controls::ComboBox backendCombo;
+    backendCombo.Name(L"AMExclusiveLocalBackendCombo");
+    backendCombo.MinWidth(220.0);
+    {
+        for (const auto* name : {L"WASAPI", L"ASIO"}) {
+            Controls::ComboBoxItem item;
+            item.Content(box_value(std::wstring(name)));
+            backendCombo.Items().Append(item);
+        }
+    }
+    backendCombo.SelectionChanged([](auto&&, auto&&) {
+        try { RebuildLocalDeviceCombo(); } catch (...) {}
+    });
+    backendRow.Children().Append(backendLabel);
+    backendRow.Children().Append(backendCombo);
+    localPanel.Children().Append(backendRow);
+
+    Controls::StackPanel localDeviceRow;
+    localDeviceRow.Orientation(Controls::Orientation::Horizontal);
+    localDeviceRow.Spacing(8.0);
+    localDeviceRow.Margin(Xaml::Thickness{0, 4, 0, 0});
+    Controls::TextBlock localDeviceLabel;
+    localDeviceLabel.Text(Localized(L"设备 / 驱动", L"Device / driver"));
+    localDeviceLabel.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    localDeviceLabel.MinWidth(120.0);
+    Controls::ComboBox localDeviceCombo;
+    localDeviceCombo.Name(L"AMExclusiveLocalDeviceCombo");
+    localDeviceCombo.MinWidth(300.0);
+    Controls::Button refreshLocal;
+    refreshLocal.Content(box_value(Localized(L"刷新", L"Refresh")));
+    refreshLocal.MinWidth(72.0);
+    refreshLocal.Click([](auto&&, auto&&) {
+        try {
+            RefreshLocalDevices();
+            RebuildLocalDeviceCombo();
+        } catch (...) {
+        }
+    });
+    localDeviceRow.Children().Append(localDeviceLabel);
+    localDeviceRow.Children().Append(localDeviceCombo);
+    localDeviceRow.Children().Append(refreshLocal);
+    localPanel.Children().Append(localDeviceRow);
+
+    Controls::StackPanel localButtons;
+    localButtons.Orientation(Controls::Orientation::Horizontal);
+    localButtons.Spacing(8.0);
+    localButtons.Margin(Xaml::Thickness{0, 6, 0, 0});
+    Controls::Button localSave;
+    localSave.Content(box_value(Localized(L"保存并应用", L"Save & apply")));
+    localSave.MinWidth(112.0);
+    localSave.Click([](auto&&, auto&&) {
+        try { ApplyOutputSelection(); } catch (...) {}
+    });
+    Controls::Button localRestart;
+    localRestart.Content(box_value(Localized(L"重开当前曲目", L"Restart current track")));
+    localRestart.MinWidth(132.0);
+    localRestart.Click([](auto&&, auto&&) {
+        try { RequestRestartCurrent(); } catch (...) {}
+    });
+    localButtons.Children().Append(localSave);
+    localButtons.Children().Append(localRestart);
+    localPanel.Children().Append(localButtons);
+
+    Controls::TextBlock localHint;
+    localHint.Text(Localized(
+        L"ASIO 会独占驱动，其他程序不能同时使用；采样率按曲目自动跟随。",
+        L"ASIO takes the driver exclusively; no other app can use it. Sample rate follows each track."));
+    localHint.TextWrapping(Xaml::TextWrapping::Wrap);
+    localHint.Margin(Xaml::Thickness{0, 4, 0, 0});
+    if (nativeText.size() > 1) localHint.Style(nativeText[1].Style());
+    localPanel.Children().Append(localHint);
+
+    // ---- network tab -----------------------------------------------------
+    Controls::StackPanel networkPanel;
+    networkPanel.Name(L"AMExclusiveNetworkOutputPanel");
+    networkPanel.Margin(Xaml::Thickness{0, 4, 0, 0});
+
+    Controls::StackPanel networkDeviceRow;
+    networkDeviceRow.Orientation(Controls::Orientation::Horizontal);
+    networkDeviceRow.Spacing(8.0);
+    Controls::TextBlock networkDeviceLabel;
+    networkDeviceLabel.Text(Localized(L"网播设备", L"Renderer"));
+    networkDeviceLabel.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    networkDeviceLabel.MinWidth(120.0);
+    Controls::ComboBox combo;
+    combo.Name(L"AMExclusiveOutputTargetCombo");
+    combo.MinWidth(300.0);
+    combo.DropDownOpened([](auto&&, auto&&) {
+        g_outputComboUserInteraction.store(true);
+    });
+    combo.Tapped([](auto&&, auto&&) {
+        g_outputComboUserInteraction.store(true);
+    });
+    combo.SelectionChanged([](auto&& sender, auto&&) {
+        try {
+            CommitOutputSelection(sender.as<Controls::ComboBox>());
+        } catch (...) {
+        }
+    });
+    Controls::Button refresh;
+    refresh.Content(box_value(Localized(L"刷新设备", L"Refresh devices")));
+    refresh.MinWidth(96.0);
+    refresh.Click([](auto&&, auto&&) {
+        g_pendingRefreshDevices.store(true);
+        SetOutputStatusText(Localized(
+            L"正在发现局域网设备…", L"Discovering LAN devices…"));
+    });
+    networkDeviceRow.Children().Append(networkDeviceLabel);
+    networkDeviceRow.Children().Append(combo);
+    networkDeviceRow.Children().Append(refresh);
+    networkPanel.Children().Append(networkDeviceRow);
+
+    Controls::StackPanel manualRow;
+    manualRow.Orientation(Controls::Orientation::Horizontal);
+    manualRow.Spacing(8.0);
+    manualRow.Margin(Xaml::Thickness{0, 4, 0, 0});
     Controls::TextBox manualInput;
     manualInput.Name(L"AMExclusiveManualDeviceInput");
     manualInput.Width(300.0);
-    manualInput.PlaceholderText(Localized(L"http://IP:port/device.xml 或 IP:port",
-                                          L"http://IP:port/device.xml or IP:port"));
+    manualInput.PlaceholderText(Localized(
+        L"http://IP:port/device.xml 或 IP:port",
+        L"http://IP:port/device.xml or IP:port"));
     manualInput.VerticalAlignment(Xaml::VerticalAlignment::Center);
     Controls::Button manualAdd;
     manualAdd.Content(box_value(Localized(L"手动添加", L"Add manually")));
@@ -2074,38 +2390,16 @@ Controls::Border CreateOutputTargetCard(
                 g_pendingManualUrl = text;
             }
             g_pendingAddDevice.store(1);
-            if (auto status = g_outputTargetStatus.get()) {
-                status.Text(Localized(L"正在添加设备…", L"Adding device…"));
-            }
+            SetOutputStatusText(Localized(L"正在添加设备…", L"Adding device…"));
         } catch (...) {
         }
     });
-    Controls::Button restartButton;
-    restartButton.Content(box_value(Localized(L"立即重开当前曲目",
-                                              L"Restart current track")));
-    restartButton.MinWidth(132.0);
-    restartButton.VerticalAlignment(Xaml::VerticalAlignment::Center);
-    restartButton.Click([](auto&&, auto&&) {
-        try {
-            RequestRestartCurrent();
-        } catch (...) {
-        }
-    });
-    Automation::AutomationProperties::SetName(
-        restartButton, Localized(L"立即重开当前曲目以应用输出目标",
-                                 L"Restart the current track to apply the output target"));
-    Controls::StackPanel manualRow;
-    manualRow.Orientation(Controls::Orientation::Horizontal);
-    manualRow.Spacing(8.0);
-    manualRow.Margin(Xaml::Thickness{0, 4, 0, 0});
     manualRow.Children().Append(manualInput);
     manualRow.Children().Append(manualAdd);
-    manualRow.Children().Append(restartButton);
-    labels.Children().Append(manualRow);
+    networkPanel.Children().Append(manualRow);
 
     // Stream format. Persisted straight into the shared ini: the hook reads it
-    // when the next track opens, so a change needs no restart and no IPC round
-    // trip. WAV keeps the existing file-shaped behaviour.
+    // when the next track opens, so a change needs no restart.
     Controls::StackPanel shapeRow;
     shapeRow.Orientation(Controls::Orientation::Horizontal);
     shapeRow.Spacing(8.0);
@@ -2116,13 +2410,9 @@ Controls::Border CreateOutputTargetCard(
     shapeLabel.MinWidth(120.0);
     Controls::ComboBox shapeCombo;
     shapeCombo.Name(L"AMExclusiveStreamFormatCombo");
-    shapeCombo.MinWidth(200.0);
+    shapeCombo.MinWidth(220.0);
     shapeCombo.VerticalAlignment(Xaml::VerticalAlignment::Center);
     {
-        // Only the two file shapes are exposed. The chunked shapes remain in
-        // the code (settable through the ini) but no renderer tested here
-        // accepts them, so offering them in the panel only invites a silent
-        // "no sound" that looks like a bug in this app.
         const std::wstring names[2] = {
             Localized(L"WAV\uff08\u6587\u4ef6\u5f62\u6001\uff09", L"WAV (file)"),
             Localized(L"FLAC\uff08\u6587\u4ef6\u5f62\u6001\uff09", L"FLAC (file)")};
@@ -2157,77 +2447,49 @@ Controls::Border CreateOutputTargetCard(
         shapeCombo, Localized(L"\u6d41\u683c\u5f0f", L"Stream format"));
     shapeRow.Children().Append(shapeLabel);
     shapeRow.Children().Append(shapeCombo);
-    labels.Children().Append(shapeRow);
+    networkPanel.Children().Append(shapeRow);
 
-    Controls::ComboBox combo;
-    combo.Name(L"AMExclusiveOutputTargetCombo");
-    combo.MinWidth(240.0);
-    combo.VerticalAlignment(Xaml::VerticalAlignment::Center);
-    Controls::ComboBoxItem local;
-    local.Content(box_value(Localized(L"本机 WASAPI 独占", L"Local WASAPI exclusive")));
-    combo.Items().Append(local);
-    combo.SelectedIndex(0);
-    combo.DropDownOpened([](auto&&, auto&&) {
-        g_outputComboUserInteraction.store(true);
+    Controls::StackPanel networkButtons;
+    networkButtons.Orientation(Controls::Orientation::Horizontal);
+    networkButtons.Spacing(8.0);
+    networkButtons.Margin(Xaml::Thickness{0, 6, 0, 0});
+    Controls::Button networkSave;
+    networkSave.Content(box_value(Localized(L"保存并应用", L"Save & apply")));
+    networkSave.MinWidth(112.0);
+    networkSave.Click([](auto&&, auto&&) {
+        try { ApplyOutputSelection(); } catch (...) {}
     });
-    combo.Tapped([](auto&&, auto&&) {
-        g_outputComboUserInteraction.store(true);
+    Controls::Button restartButton;
+    restartButton.Content(box_value(Localized(L"立即重开当前曲目",
+                                              L"Restart current track")));
+    restartButton.MinWidth(132.0);
+    restartButton.Click([](auto&&, auto&&) {
+        try { RequestRestartCurrent(); } catch (...) {}
     });
-    combo.SelectionChanged([](auto&& sender, auto&&) {
-        try {
-            CommitOutputSelection(sender.as<Controls::ComboBox>());
-        } catch (...) {
-        }
-    });
+    networkButtons.Children().Append(networkSave);
+    networkButtons.Children().Append(restartButton);
+    networkPanel.Children().Append(networkButtons);
+
     Automation::AutomationProperties::SetName(
         combo, Localized(L"输出目标设备", L"Output target device"));
-    g_outputCombo = winrt::make_weak(combo);
-    g_outputTargetStatus = winrt::make_weak(status);
-    RebuildOutputCombo(combo);
-
-    Controls::Button applyButton;
-    applyButton.Content(box_value(Localized(L"应用", L"Apply")));
-    applyButton.MinWidth(64.0);
-    applyButton.VerticalAlignment(Xaml::VerticalAlignment::Center);
-    applyButton.Click([](auto&&, auto&&) {
-        try {
-            ApplyOutputSelection();
-        } catch (...) {
-        }
-    });
     Automation::AutomationProperties::SetName(
-        applyButton, Localized(L"应用输出目标", L"Apply output target"));
+        localDeviceCombo, Localized(L"本地输出设备", L"Local output device"));
 
-    Controls::Button refresh;
-    refresh.Content(box_value(Localized(L"刷新设备", L"Refresh devices")));
-    refresh.MinWidth(96.0);
-    refresh.VerticalAlignment(Xaml::VerticalAlignment::Center);
-    refresh.Click([](auto&&, auto&&) {
-        g_pendingRefreshDevices.store(true);
-        if (auto status = g_outputTargetStatus.get()) {
-            status.Text(Localized(L"正在发现局域网设备…", L"Discovering LAN devices…"));
-        }
-    });
-    Automation::AutomationProperties::SetName(
-        refresh, Localized(L"刷新 DLNA 设备", L"Refresh DLNA devices"));
+    // ---- assemble --------------------------------------------------------
+    Controls::StackPanel labels;
+    labels.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    labels.Children().Append(title);
+    labels.Children().Append(description);
+    labels.Children().Append(status);
+    labels.Children().Append(tabStrip);
+    labels.Children().Append(localPanel);
+    labels.Children().Append(networkPanel);
 
     Controls::ColumnDefinition labelColumn;
     labelColumn.Width(Xaml::GridLength{1.0, Xaml::GridUnitType::Star});
-    Controls::ColumnDefinition actionColumn;
-    actionColumn.Width(Xaml::GridLength{1.0, Xaml::GridUnitType::Auto});
     Controls::Grid content;
     content.ColumnDefinitions().Append(labelColumn);
-    content.ColumnDefinitions().Append(actionColumn);
     content.Children().Append(labels);
-    Controls::StackPanel rightSide;
-    rightSide.Orientation(Controls::Orientation::Horizontal);
-    rightSide.Spacing(8.0);
-    rightSide.VerticalAlignment(Xaml::VerticalAlignment::Center);
-    rightSide.Children().Append(combo);
-    rightSide.Children().Append(applyButton);
-    rightSide.Children().Append(refresh);
-    Controls::Grid::SetColumn(rightSide, 1);
-    content.Children().Append(rightSide);
 
     Controls::Border card;
     card.Name(L"AMExclusiveOutputTargetCard");
@@ -2242,6 +2504,23 @@ Controls::Border CreateOutputTargetCard(
     card.VerticalAlignment(appearance.VerticalAlignment());
     card.MinHeight(appearance.MinHeight());
     card.MaxWidth(appearance.MaxWidth());
+
+    // Restore persisted state before the card is shown.
+    g_outputCombo = winrt::make_weak(combo);
+    g_localBackendCombo = winrt::make_weak(backendCombo);
+    g_localDeviceCombo = winrt::make_weak(localDeviceCombo);
+    g_localPanel = winrt::make_weak(localPanel);
+    g_networkPanel = winrt::make_weak(networkPanel);
+    g_outputTargetStatus = winrt::make_weak(status);
+
+    const auto settings = ReadOutputSettings();
+    backendCombo.SelectedIndex(settings.kind == 2 ? 1 : 0);
+    RefreshLocalDevices();
+    RebuildLocalDeviceCombo();
+    RebuildOutputCombo(combo);
+    // Reopening Apple Music shows the tab that matches the saved output, not
+    // whichever tab the user happened to browse last.
+    SelectOutputTab(settings.kind == 1 ? 1 : 0);
     return card;
 }
 
@@ -2801,19 +3080,6 @@ DWORD WINAPI PipeThread(void*) {
                     break;
                 }
             }
-            if (g_pendingRestartCurrent.exchange(0)) {
-                auto message = NewMessage(MessageType::RestartCurrent, Role::Ui);
-                message.uiPid = GetCurrentProcessId();
-                bool written{};
-                {
-                    std::lock_guard writeLock(g_pipeWriteMutex);
-                    written = WriteMessage(pipe, message);
-                }
-                if (!written) {
-                    g_pendingRestartCurrent.store(1);
-                    break;
-                }
-            }
             if (g_pendingAddDevice.exchange(0)) {
                 auto message = NewMessage(MessageType::AddDevice, Role::Ui);
                 message.uiPid = GetCurrentProcessId();
@@ -2835,7 +3101,9 @@ DWORD WINAPI PipeThread(void*) {
             if (pendingOutputKind >= 0) {
                 auto message = NewMessage(MessageType::SetOutputTarget, Role::Ui);
                 message.uiPid = GetCurrentProcessId();
-                message.enabledIntent = pendingOutputKind ? 1u : 0u;
+                // 0 = WASAPI, 1 = DLNA/OpenHome, 2 = ASIO. `format` carries the
+                // selected WASAPI endpoint id or ASIO driver CLSID.
+                message.enabledIntent = static_cast<std::uint8_t>(pendingOutputKind);
                 message.hardwareBufferMs = static_cast<std::uint32_t>(
                     g_pendingOutputBufferMs.load());
                 {
@@ -2843,6 +3111,7 @@ DWORD WINAPI PipeThread(void*) {
                     CopyMessageText(message.endpointId, g_pendingOutputUdn);
                     CopyMessageText(message.endpointName, g_pendingOutputName);
                     CopyMessageText(message.detail, g_pendingOutputLocation);
+                    CopyMessageText(message.format, g_pendingOutputLocalId);
                 }
                 bool written{};
                 {
@@ -2851,6 +3120,19 @@ DWORD WINAPI PipeThread(void*) {
                 }
                 if (!written) {
                     g_pendingOutputKind.store(pendingOutputKind);
+                    break;
+                }
+            }
+            if (g_pendingRestartCurrent.exchange(0)) {
+                auto message = NewMessage(MessageType::RestartCurrent, Role::Ui);
+                message.uiPid = GetCurrentProcessId();
+                bool written{};
+                {
+                    std::lock_guard writeLock(g_pipeWriteMutex);
+                    written = WriteMessage(pipe, message);
+                }
+                if (!written) {
+                    g_pendingRestartCurrent.store(1);
                     break;
                 }
             }
