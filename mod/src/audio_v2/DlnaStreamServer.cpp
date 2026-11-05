@@ -593,11 +593,9 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
         (void)setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
                          reinterpret_cast<const char*>(&enabled), sizeof(enabled));
     }
-    if ((socketTuning & 2) != 0) {
-        int sendBuffer = 512 * 1024;
-        (void)setsockopt(client, SOL_SOCKET, SO_SNDBUF,
-                         reinterpret_cast<const char*>(&sendBuffer), sizeof(sendBuffer));
-    }
+    // Bit 2 (512 KB SO_SNDBUF) is gone for good: at 44.1 kHz it made a VEGA
+    // G2.2 reset the 206 connection after ~500 KB. Sending is left to the
+    // TCP window, which is the backpressure the renderer expects.
     if ((socketTuning & 4) != 0) {
         int dscp = 0xB8; // DSCP EF (46) << 2
         (void)setsockopt(client, IPPROTO_IP, IP_TOS,
