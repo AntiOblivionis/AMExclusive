@@ -64,20 +64,47 @@ function Resolve-ReleaseDirectory([string]$Requested) {
     throw (Get-InstallerText '找不到发布文件，请通过 -SourceDirectory 指定目录。' 'Could not locate a Release payload. Pass -SourceDirectory explicitly.')
 }
 
-function Stop-AppleMusicRuntime {
-    # Get-Process spans every logon session. Only this session's Apple Music
-    # is ours to stop; another user's instance would fail with access denied
-    # (aborting the install) or, if it could be stopped, be killed under them.
+# Every process that can hold one of the payload files open. Apple's own
+# processes are session-scoped - Get-Process spans every logon session, and
+# another user's player must not be killed. Our helpers have unique names, so
+# a stray instance in any session is ours and would still lock the files.
+function Get-AmeRuntimeProcesses {
     $sessionId = (Get-Process -Id $PID).SessionId
-    foreach ($name in @('AppleMusic', 'AMPLibraryAgent', 'am-exclusive-broker')) {
-        $processes = @(Get-Process $name -ErrorAction SilentlyContinue |
-            Where-Object { $_.SessionId -eq $sessionId })
-        $processes | Stop-Process -Force
-        $processes | Wait-Process -Timeout 5 -ErrorAction Stop
-        if (Get-Process $name -ErrorAction SilentlyContinue |
-                Where-Object { $_.SessionId -eq $sessionId }) {
-            throw (Get-InstallerText "运行进程未停止：$name" "Runtime did not stop: $name")
+    $apple = @(Get-Process -Name 'AppleMusic', 'AMPLibraryAgent' -ErrorAction SilentlyContinue |
+        Where-Object { $_.SessionId -eq $sessionId })
+    $ours = @(Get-Process -Name 'am-exclusive-broker', 'am-exclusive-audiohost',
+                                 'am_exclusive_media_control' -ErrorAction SilentlyContinue)
+    return @($apple) + @($ours)
+}
+
+function Stop-AppleMusicRuntime {
+    # The broker owns the audiohost watchdog and respawns the host about five
+    # seconds after it dies. Stop Apple Music first, then the broker, then the
+    # host/helper - and re-check, because a watchdog that was already pending
+    # can bring the host back once more.
+    $order = @{
+        'AppleMusic' = 0
+        'AMPLibraryAgent' = 0
+        'am-exclusive-broker' = 1
+        'am-exclusive-audiohost' = 2
+        'am_exclusive_media_control' = 2
+    }
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        foreach ($process in @(Get-AmeRuntimeProcesses |
+                Sort-Object { $order[$_.ProcessName] })) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         }
+        for ($tick = 0; $tick -lt 25; $tick++) {
+            if (@(Get-AmeRuntimeProcesses).Count -eq 0) { return }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    $remaining = @(Get-AmeRuntimeProcesses |
+        ForEach-Object { "$($_.ProcessName)($($_.Id))" })
+    if ($remaining.Count -gt 0) {
+        throw (Get-InstallerText `
+            "无法关闭正在运行的程序：$($remaining -join ', ')。请退出 Apple Music 及其后台进程后重新运行安装程序。" `
+            "Unable to stop running processes: $($remaining -join ', '). Close Apple Music and its background processes, then run the installer again.")
     }
 }
 
@@ -112,6 +139,13 @@ function Assert-SessionUser {
     }
 }
 Assert-SessionUser
+# Clear the runtime before anything else. A loaded hook DLL or a live
+# audiohost locks its file and makes Copy-Item fail with "in use", which used
+# to force a reboot and a second install attempt. The user never has to close
+# Apple Music (or our helpers) by hand anymore.
+$wasRunning = [bool](Get-Process AppleMusic -ErrorAction SilentlyContinue |
+    Where-Object { $_.SessionId -eq (Get-Process -Id $PID).SessionId })
+Stop-AppleMusicRuntime
 $source = Resolve-ReleaseDirectory $SourceDirectory
 $install = [IO.Path]::GetFullPath($InstallDirectory)
 $expectedInstall = [IO.Path]::GetFullPath((Join-Path $env:PUBLIC 'AMExclusive'))
@@ -166,9 +200,6 @@ $expectedHashes['THIRD_PARTY_NOTICES.md'] = Get-Sha256Hex $thirdPartyNoticeSourc
 $installedVersion = (Get-Item -LiteralPath (Join-Path $source 'am-exclusive-broker.exe')).VersionInfo.ProductVersion
 if (-not $installedVersion) { throw (Get-InstallerText '伴生程序发布文件缺少产品版本信息。' 'Release broker is missing product version metadata.') }
 
-$wasRunning = [bool](Get-Process AppleMusic -ErrorAction SilentlyContinue |
-    Where-Object { $_.SessionId -eq (Get-Process -Id $PID).SessionId })
-Stop-AppleMusicRuntime
 Write-ProgressMilestone 32 'stop_runtime'
 
 $preservedMode = $null
@@ -231,7 +262,24 @@ $previousIni = if (Test-Path -LiteralPath $iniPath -PathType Leaf) {
 
 foreach ($name in $payloadFiles) {
     $destination = Join-Path $install $name
-    Copy-Item -LiteralPath (Join-Path $source $name) -Destination $destination -Force
+    $copied = $false
+    for ($attempt = 1; $attempt -le 3 -and -not $copied; $attempt++) {
+        try {
+            Copy-Item -LiteralPath (Join-Path $source $name) -Destination $destination -Force -ErrorAction Stop
+            $copied = $true
+        } catch {
+            if ($attempt -eq 3) {
+                throw (Get-InstallerText `
+                    "文件被占用，重新停止后台进程后仍无法覆盖：$name。请重启电脑后再运行安装程序。" `
+                    "File is still locked after stopping background processes again: $name. Restart Windows and run the installer again.")
+            }
+            # A companion task or the audiohost watchdog may have respawned a
+            # helper between the initial stop and this copy. Clear and retry
+            # instead of making the user reboot and start over.
+            Stop-AppleMusicRuntime
+            Start-Sleep -Milliseconds 500
+        }
+    }
     if ((Get-Sha256Hex $destination) -ne $expectedHashes[$name]) { throw (Get-InstallerText "发布文件验证失败：$name" "Payload verification failed: $name") }
 }
 

@@ -39,17 +39,42 @@ function Get-SessionProcess([string]$Name) {
         Where-Object { $_.SessionId -eq $sessionId })
 }
 
+function Get-AmeRuntimeProcesses {
+    $sessionId = (Get-Process -Id $PID).SessionId
+    $apple = @(Get-Process -Name 'AppleMusic', 'AMPLibraryAgent' -ErrorAction SilentlyContinue |
+        Where-Object { $_.SessionId -eq $sessionId })
+    $ours = @(Get-Process -Name 'am-exclusive-broker', 'am-exclusive-audiohost',
+                                 'am_exclusive_media_control' -ErrorAction SilentlyContinue)
+    return @($apple) + @($ours)
+}
+
 function Stop-AppleMusicRuntime {
-    Get-SessionProcess AppleMusic | Stop-Process -Force
-    for ($i = 0; $i -lt 50 -and (Get-SessionProcess AppleMusic).Count -gt 0; $i++) {
-        Start-Sleep -Milliseconds 100
+    # The broker owns the audiohost watchdog, so it must die before the host.
+    # Re-check afterwards: a pending watchdog tick can respawn the host once.
+    $order = @{
+        'AppleMusic' = 0
+        'AMPLibraryAgent' = 0
+        'am-exclusive-broker' = 1
+        'am-exclusive-audiohost' = 2
+        'am_exclusive_media_control' = 2
     }
-    Get-SessionProcess AMPLibraryAgent | Stop-Process -Force
-    for ($i = 0; $i -lt 50 -and (Get-SessionProcess AMPLibraryAgent).Count -gt 0; $i++) {
-        Start-Sleep -Milliseconds 100
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        foreach ($process in @(Get-AmeRuntimeProcesses |
+                Sort-Object { $order[$_.ProcessName] })) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        }
+        for ($tick = 0; $tick -lt 25; $tick++) {
+            if (@(Get-AmeRuntimeProcesses).Count -eq 0) { return }
+            Start-Sleep -Milliseconds 200
+        }
     }
-    Get-SessionProcess am-exclusive-broker | Stop-Process -Force
-    Get-SessionProcess am-exclusive-audiohost | Stop-Process -Force
+    $remaining = @(Get-AmeRuntimeProcesses |
+        ForEach-Object { "$($_.ProcessName)($($_.Id))" })
+    if ($remaining.Count -gt 0) {
+        throw (Get-InstallerText `
+            "无法关闭正在运行的程序：$($remaining -join ', ')。请退出 Apple Music 及其后台进程后重新运行卸载程序。" `
+            "Unable to stop running processes: $($remaining -join ', '). Close Apple Music and its background processes, then run the uninstaller again.")
+    }
 }
 
 # Mirror of the installer's check: an uninstall under a different (elevated)
