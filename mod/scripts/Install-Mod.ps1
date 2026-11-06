@@ -139,13 +139,6 @@ function Assert-SessionUser {
     }
 }
 Assert-SessionUser
-# Clear the runtime before anything else. A loaded hook DLL or a live
-# audiohost locks its file and makes Copy-Item fail with "in use", which used
-# to force a reboot and a second install attempt. The user never has to close
-# Apple Music (or our helpers) by hand anymore.
-$wasRunning = [bool](Get-Process AppleMusic -ErrorAction SilentlyContinue |
-    Where-Object { $_.SessionId -eq (Get-Process -Id $PID).SessionId })
-Stop-AppleMusicRuntime
 $source = Resolve-ReleaseDirectory $SourceDirectory
 $install = [IO.Path]::GetFullPath($InstallDirectory)
 $expectedInstall = [IO.Path]::GetFullPath((Join-Path $env:PUBLIC 'AMExclusive'))
@@ -200,6 +193,13 @@ $expectedHashes['THIRD_PARTY_NOTICES.md'] = Get-Sha256Hex $thirdPartyNoticeSourc
 $installedVersion = (Get-Item -LiteralPath (Join-Path $source 'am-exclusive-broker.exe')).VersionInfo.ProductVersion
 if (-not $installedVersion) { throw (Get-InstallerText '伴生程序发布文件缺少产品版本信息。' 'Release broker is missing product version metadata.') }
 
+# Validation is done, so it is now safe to take the user's player down: a
+# failed check above leaves Apple Music running untouched. A loaded hook DLL
+# or a live audiohost would otherwise lock its payload file and force a
+# reboot plus a second install attempt.
+$wasRunning = [bool](Get-Process AppleMusic -ErrorAction SilentlyContinue |
+    Where-Object { $_.SessionId -eq (Get-Process -Id $PID).SessionId })
+Stop-AppleMusicRuntime
 Write-ProgressMilestone 32 'stop_runtime'
 
 $preservedMode = $null
