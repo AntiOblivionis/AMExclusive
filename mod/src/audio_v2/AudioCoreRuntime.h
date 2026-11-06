@@ -150,6 +150,11 @@ public:
     // Retained for callers that only need the legacy target semantics.
     void SetOutputTarget(AudioSinkKind kind, const DlnaTarget& target,
                          std::uint32_t streamBufferMs) noexcept;
+    // Called by the quality hooks when Apple Music starts a new player item.
+    // A track change must reopen the physical stream even when Apple reuses
+    // the converter: the DLNA sink finished its previous session, so without
+    // this the second track of an auto-advancing queue would be silent.
+    void NotifyTrackChanged(std::uint64_t playerItem) noexcept;
     bool UiEnabled() const noexcept { return uiEnabled_.load(std::memory_order_acquire); }
 
     // UI transport intents are control-plane only. They gate when the exact
@@ -177,6 +182,11 @@ public:
     void RequestLocalSuccessorBind(void* converter) noexcept;
     void OnConverterDisposed(void* converter) noexcept;
     bool TryBindLocalSuccessor(void* converter) noexcept;
+    // A bound local-LPCM generation that has captured nothing is fed by a dead
+    // probe-time converter (Apple Music's device-probe orphans win graph
+    // resolution before the live local chain registers). The successor whose
+    // staging queue is already receiving PCM takes the binding over.
+    bool ReplaceStarvedLocalBindingLocked(void* successor) noexcept;
 
     void OnAudioUnitInitialized(void* unit, void* candidateConverter,
                                 std::uint32_t sampleRate, std::uint32_t channels,
@@ -330,6 +340,11 @@ private:
     std::wstring asioDriverName_;
     bool outputChangePending_{};
     OutputProfile pendingProfile_{};
+    // Track-change signal from the quality hooks. Guarded by controlMutex_
+    // together with the rest of the bind state; the item id is atomic because
+    // the hooks call from Apple Music threads before taking the lock.
+    std::atomic<std::uint64_t> lastTrackItem_{0};
+    bool trackChangePending_{};
     std::uint64_t nativePumpLowWaterFrames_{};
     std::uint64_t nativePumpHighWaterFrames_{};
     HANDLE wakeEvent_{};
@@ -421,6 +436,15 @@ private:
     std::atomic<ULONGLONG> directSelectionArmDeadlineTick_{};
     void* pendingLocalSuccessor_{};
     std::atomic<void*> pendingLocalRebindConverter_{};
+    // True while the bound registration is a local (raw-LPCM) source. Only
+    // such a binding may be replaced by a starving-successor rebind; the
+    // compressed streaming path never sets it.
+    bool boundLocalPcm_{};
+    // Worker-maintained mirror of "graphBound_ && boundLocalPcm_ && nothing
+    // captured && not Active". Read from the Fill callback thread so a live
+    // local successor can request a rebind without waking the worker for
+    // requests that could never be served.
+    std::atomic<bool> boundLocalReplaceable_{};
     std::uint64_t nextMediaGeneration_{1};
     std::atomic<std::uint64_t> boundMediaGeneration_{};
     std::uint32_t requiredPrebufferFrames_{};

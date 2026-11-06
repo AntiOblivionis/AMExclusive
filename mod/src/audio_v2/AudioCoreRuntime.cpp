@@ -100,6 +100,7 @@ bool AudioCoreRuntime::Start(const AudioCoreRuntimeCallbacks& callbacks) noexcep
     directSelectionArmDeadlineTick_.store(0, std::memory_order_release);
     pendingLocalSuccessor_ = nullptr;
     pendingLocalRebindConverter_.store(nullptr, std::memory_order_release);
+    boundLocalReplaceable_.store(false, std::memory_order_release);
     wakeEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!wakeEvent_) return false;
     workerStop_.store(false, std::memory_order_release);
@@ -213,6 +214,7 @@ void AudioCoreRuntime::SetUiEnabled(bool enabled) noexcept {
     directSelectionArmDeadlineTick_.store(0, std::memory_order_release);
     pendingLocalSuccessor_ = nullptr;
     pendingLocalRebindConverter_.store(nullptr, std::memory_order_release);
+    boundLocalReplaceable_.store(false, std::memory_order_release);
     latestSeekEpoch_ = 0;
     seekFenceReleaseTick_ = 0;
     nativeInitialized_ = false;
@@ -299,6 +301,25 @@ void AudioCoreRuntime::SetOutputProfile(const OutputProfile& profile) noexcept {
         return;
     }
     apply(requested);
+}
+
+void AudioCoreRuntime::NotifyTrackChanged(std::uint64_t playerItem) noexcept {
+    if (playerItem == 0) return;
+    if (abandoned_.load(std::memory_order_acquire)) return;
+    // Same item fires several hooks; only the first one for a given track
+    // matters. Apple threads race here, hence the exchange.
+    if (lastTrackItem_.exchange(playerItem, std::memory_order_acq_rel) == playerItem) {
+        return;
+    }
+    if (!UiEnabled()) return;
+    ControlScope lock(*this);
+    // Nothing bound yet (or already torn down): the next bind will start the
+    // stream from scratch anyway.
+    if (!graphBound_ && coordinator_.Phase() == AudioCoreGatePhase::Off) return;
+    // Queue the reopen at the next converter item boundary. The bridge applies
+    // it as soon as the new track's fill path registers.
+    trackChangePending_ = true;
+    Wake();
 }
 
 void AudioCoreRuntime::OnTransportPlayPause(std::uint64_t revision) noexcept {
@@ -783,7 +804,14 @@ void AudioCoreRuntime::SetPendingLocalSuccessor(void* converter) noexcept {
 
 void AudioCoreRuntime::RequestLocalSuccessorBind(void* converter) noexcept {
     if (!UiEnabled() || !converter) return;
-    if (boundConverter_.load(std::memory_order_acquire) != nullptr) return;
+    // A converter is normally only bound once. The exception is a starved
+    // local binding: the graph resolved to one of Apple Music's probe-time
+    // orphan converters and has captured nothing since, while this request
+    // comes from a local queue that is actually receiving PCM. The worker
+    // re-validates everything before replacing, so accepting the request here
+    // is always safe.
+    if (boundConverter_.load(std::memory_order_acquire) != nullptr &&
+        !boundLocalReplaceable_.load(std::memory_order_acquire)) return;
     pendingLocalRebindConverter_.store(converter, std::memory_order_release);
     Wake();
 }
@@ -831,6 +859,46 @@ bool AudioCoreRuntime::TryBindLocalSuccessor(void* converter) noexcept {
     TryBindGraphLocked();
     const bool bound = graphBound_ &&
         boundConverter_.load(std::memory_order_acquire) == converter;
+    if (bound) Wake();
+    return bound;
+}
+
+bool AudioCoreRuntime::ReplaceStarvedLocalBindingLocked(void* successor) noexcept {
+    ConverterRegistrationSnapshot snapshot{};
+    if (!successor || !graphBound_ || !boundLocalPcm_ || !graphUnit_ || !graphStarted_ ||
+        !registry_.Snapshot(successor, snapshot) ||
+        snapshot.registration.encodedFormat != kAppleLinearPcm ||
+        successor == boundConverter_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    // Only a generation that has captured nothing may be replaced. Once PCM
+    // flows (or the sink reached Active) the binding is live and stays put.
+    if (coordinator_.Stats().capturedFrames != 0 ||
+        coordinator_.Phase() == AudioCoreGatePhase::Active) {
+        return false;
+    }
+    const auto starved = boundConverter_.load(std::memory_order_acquire);
+    // Observable in the main log as a second consecutive "bound active" line
+    // (the starved bind carried the probe-time float format, the successor
+    // carries the real local source format) followed by the hook-side
+    // "v2 pre-SRC PCM staging promoted converter=<successor>" line.
+    // Tear the dead generation down but keep the graph identity (unit, rate,
+    // channels); the successor reuses it and TryBindGraphLocked mints a new
+    // generation from the snapshot fields below.
+    RetireCaptureLocked(true);
+    boundLocalReplaceable_.store(false, std::memory_order_release);
+    // The replaced candidate provably never delivered PCM. Drop it from the
+    // registry so the next track-change resolution cannot bind the same
+    // orphan again and starve a second time.
+    if (starved) registry_.Retire(starved);
+    graphConverter_ = successor;
+    graphRate_ = snapshot.registration.outputFormat.sampleRate;
+    graphChannels_ = snapshot.registration.outputFormat.channels;
+    graphSourceBits_ = snapshot.registration.sourceBitDepth;
+    graphObservationId_ = snapshot.registration.observationId;
+    TryBindGraphLocked();
+    const bool bound = graphBound_ &&
+        boundConverter_.load(std::memory_order_acquire) == successor;
     if (bound) Wake();
     return bound;
 }
@@ -1537,6 +1605,24 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
                                                            std::memory_order_release);
                     }
                 }
+            } else {
+                // Mirror "bound to a local source that has captured nothing"
+                // into the lock-free gate the Fill callback reads. Once PCM
+                // flows or the sink is Active this goes false for the rest of
+                // the generation and the successor request behaves exactly
+                // like the old drop-on-bound rule.
+                boundLocalReplaceable_.store(
+                    boundLocalPcm_ &&
+                    coordinator_.Stats().capturedFrames == 0 &&
+                    coordinator_.Phase() != AudioCoreGatePhase::Active,
+                    std::memory_order_release);
+                if (boundLocalReplaceable_.load(std::memory_order_acquire) &&
+                    pendingLocalRebindConverter_.load(std::memory_order_acquire) != nullptr) {
+                    if (void* pendingLocal =
+                            pendingLocalRebindConverter_.exchange(nullptr, std::memory_order_acq_rel)) {
+                        (void)ReplaceStarvedLocalBindingLocked(pendingLocal);
+                    }
+                }
             }
             if (resumePrebufferPending_) TryResumePausedSinkLocked();
             TryActivateLocked();
@@ -1739,7 +1825,11 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
         return;
     }
 
-    if (graphBound_ && boundConverter_.load(std::memory_order_acquire) == graphConverter_) {
+    // A track change must reopen the stream even when Apple reuses the same
+    // converter for the next song: the DLNA sink's previous session is already
+    // finished, so keeping the old graph would leave the renderer silent.
+    if (graphBound_ && boundConverter_.load(std::memory_order_acquire) == graphConverter_ &&
+        !trackChangePending_) {
         return;
     }
 
@@ -1768,6 +1858,7 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     }
 
     const auto generation = ++nextMediaGeneration_;
+    trackChangePending_ = false;
     registry_.UpdateMediaGeneration(graphConverter_, generation);
     if (!registry_.Snapshot(graphConverter_, snapshot)) return;
 
@@ -1853,6 +1944,10 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     boundConverter_.store(graphConverter_, std::memory_order_release);
     boundMediaGeneration_.store(generation, std::memory_order_release);
     graphBound_ = true;
+    // Only local (raw-LPCM) sources are eligible for the starved-binding
+    // replacement; compressed streaming generations never are.
+    boundLocalPcm_ = snapshot.registration.encodedFormat == kAppleLinearPcm;
+    boundLocalReplaceable_.store(false, std::memory_order_release);
     if (!PromotePendingPcmLocked(graphConverter_)) {
         const HRESULT error = E_OUTOFMEMORY;
         Emit(AudioCoreRuntimeEvent::Faulted, error);
@@ -2113,6 +2208,28 @@ void AudioCoreRuntime::FinalizeEndOfStreamDrainLocked() noexcept {
         }
     }
     TryBindPendingGraphLocked();
+
+    // Apple Music 1.7.0.156 keeps the same P0 converter across a track
+    // boundary instead of disposing and rebuilding it (no AudioConverterNew /
+    // Dispose / AudioUnitStart appears in the log after a natural EOF). The
+    // drain above retires the generation and leaves nothing to re-arm that
+    // converter, so the next track is still captured but never reaches a sink:
+    // capturedFrames climbs while submittedFrames stalls and the renderer goes
+    // silent. Re-arm the drained converter here. OpenEndpoint still requires
+    // real PCM before it touches a sink, so a genuine stop stays quiet.
+    if (!graphBound_ && drainedConverter && graphUnit_) {
+        ConverterRegistrationSnapshot snapshot{};
+        if (registry_.Snapshot(drainedConverter, snapshot) &&
+            IsP0Converter(drainedConverter) &&
+            snapshot.registration.sourceBitDepth != 0) {
+            graphConverter_ = drainedConverter;
+            graphRate_ = snapshot.registration.outputFormat.sampleRate;
+            graphChannels_ = snapshot.registration.outputFormat.channels;
+            graphSourceBits_ = snapshot.registration.sourceBitDepth;
+            graphObservationId_ = snapshot.registration.observationId;
+            TryBindGraphLocked();
+        }
+    }
 }
 
 void AudioCoreRuntime::RetireCompletedCaptureLocked(void* converter) noexcept {
@@ -2174,6 +2291,8 @@ void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph, bool keepPendingCaptu
     endOfStreamDrainConverter_ = nullptr;
     pendingLocalSuccessor_ = nullptr;
     pendingLocalRebindConverter_.store(nullptr, std::memory_order_release);
+    boundLocalPcm_ = false;
+    boundLocalReplaceable_.store(false, std::memory_order_release);
     const bool hasCapture = graphBound_ ||
         boundConverter_.load(std::memory_order_acquire) != nullptr ||
         coordinator_.Phase() != AudioCoreGatePhase::Off;

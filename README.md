@@ -27,8 +27,8 @@ output on supported hardware and configurations.
 ## Development and Test Environment
 
 - Windows 11 x64
-- Apple Music for Windows file version `1.6.4.90`
-- Verified package/framework build `1.1540.23042.0` x64
+- Apple Music for Windows file version `1.6.4.90` (original development build) and `1.7.0.156` (re-verified)
+- Verified package/framework builds `1.1540.23042.0`, `1.1792.39682.0` and `1.1792.39942.0` x64
 
 This project has only been validated with the development and test versions listed above. Its behavior on other Apple Music versions is not guaranteed.
 

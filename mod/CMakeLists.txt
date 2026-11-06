@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(AMExclusive VERSION 0.4.3 LANGUAGES CXX RC)
+project(AMExclusive VERSION 0.4.5 LANGUAGES CXX RC)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "AMExclusive supports Windows x64 only")
@@ -42,8 +42,11 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
+# Fallback only: Build-Mod.ps1 resolves the installed package dynamically and
+# passes -DAPPLE_MUSIC_PACKAGE_DIR. Update this default when the verified
+# package changes; anyone building by hand can override the cache variable.
 set(APPLE_MUSIC_PACKAGE_DIR
-    "C:/Program Files/WindowsApps/AppleInc.AppleMusicWin_1.1540.23042.0_x64__nzyj5cx40ttqa"
+    "C:/Program Files/WindowsApps/AppleInc.AppleMusicWin_1.1792.39942.0_x64__nzyj5cx40ttqa"
     CACHE PATH "Supported Apple Music package used to generate WinUI projections")
 find_program(CPPWINRT_EXECUTABLE cppwinrt.exe)
 if(NOT CPPWINRT_EXECUTABLE)

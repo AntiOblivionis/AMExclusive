@@ -49,10 +49,29 @@ $registered = $folder.RegisterTaskDefinition($taskName, $task, 6, $sid, $null, 3
 # Read back the persisted task, including the event and lifetime policy.
 $registered = $folder.GetTask($taskName)
 $definition = $registered.Definition
-$registeredPrincipal = $definition.Principal.UserId
-if ($registeredPrincipal -notmatch '^S-1-') {
-    $registeredPrincipal = (New-Object Security.Principal.NTAccount($registeredPrincipal)).Translate(
-        [Security.Principal.SecurityIdentifier]).Value
+# Task Scheduler returns the principal as a SID on some systems and as an account
+# or display name on others (Microsoft accounts, renamed/localized accounts,
+# non-ASCII names). NTAccount.Translate throws IdentityNotMappedException for
+# several of those forms even though the task was registered successfully with
+# the current user's SID. Resolve defensively: never let this cosmetic lookup
+# abort the whole install.
+$registeredPrincipal = [string]$definition.Principal.UserId
+$principalSid = $null
+if ($registeredPrincipal -match '^S-1-') {
+    $principalSid = $registeredPrincipal
+} elseif (-not [string]::IsNullOrWhiteSpace($registeredPrincipal)) {
+    try {
+        $principalSid = (New-Object Security.Principal.NTAccount($registeredPrincipal)).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        # Account name cannot be mapped to a SID: fall back to a name comparison.
+        $currentName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $shortName = $currentName.Split('\')[-1]
+        if ($registeredPrincipal -ieq $currentName -or $registeredPrincipal -ieq $shortName -or
+            $registeredPrincipal.EndsWith("\$shortName", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $principalSid = $sid
+        }
+    }
 }
 if (-not $registered.Enabled -or $definition.Actions.Count -ne 1 -or
     $definition.Actions.Item(1).Path -ne $broker -or
@@ -60,7 +79,9 @@ if (-not $registered.Enabled -or $definition.Actions.Count -ne 1 -or
     -not [string]::IsNullOrEmpty($definition.Actions.Item(1).Arguments) -or
     $definition.Settings.MultipleInstances -ne 3 -or
     $definition.Settings.ExecutionTimeLimit -ne 'PT0S' -or
-    $registeredPrincipal -ne $sid -or
+    # An unresolvable principal name is not a failure by itself: registration
+    # explicitly passed $sid, and every other task property is still checked.
+    ($null -ne $principalSid -and $principalSid -ne $sid) -or
     $definition.Principal.LogonType -ne 3 -or $definition.Principal.RunLevel -ne 0 -or
     $definition.Triggers.Count -ne 1 -or $definition.Triggers.Item(1).Type -ne 0 -or
     -not $definition.Triggers.Item(1).Enabled -or

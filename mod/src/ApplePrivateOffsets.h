@@ -4,16 +4,24 @@
 #include <cstddef>
 #include <cstdint>
 
-// Apple-private ABI inventory for the verified Apple Music 1.6.4.90 /
-// package-framework 1.1540.23042.0 x64 build. Each entry records the semantic
-// role and the fingerprint that must accompany it. Public API constants live
-// elsewhere; private RVAs, object fields, call-stack fingerprints and observed
-// binary layouts are kept here so a package update has one review surface.
+// Apple-private ABI inventory for the verified Apple Music builds. Each entry
+// records the semantic role and the fingerprint that must accompany it.
+// Public API constants live elsewhere; private RVAs, object fields, call-stack
+// fingerprints and observed binary layouts are kept here so a package update
+// has one review surface.
+//
+// Verified builds:
+//   1.6.4.90   / package 1.1540.23042.0  - CoreMedia 1.2 (3310.2)
+//   1.1792.39682.0 / package 1.1792.39682.0 - CoreMedia 1.2 (3365.13)
+//   1.7.0.156  / package 1.1792.39942.0  - CoreMedia 1.2 (3365.13)
+// The 1.1792.39942.0 package ships the same CoreMedia 3365.13 prologues at the
+// recorded RVAs; both 16-byte digests were re-verified on 2026-11-06, so the
+// quality lock needs no new profile for it.
 namespace ammod::apple_private {
 
 namespace verified_build {
-inline constexpr wchar_t kAppleMusicFileVersion[] = L"1.6.4.90";
-inline constexpr wchar_t kPackageVersion[] = L"1.1540.23042.0";
+inline constexpr wchar_t kAppleMusicFileVersion[] = L"1.7.0.156";
+inline constexpr wchar_t kPackageVersion[] = L"1.1792.39942.0";
 inline constexpr wchar_t kArchitecture[] = L"x64";
 } // namespace verified_build
 
@@ -46,6 +54,8 @@ inline constexpr BuildProfile kBuildProfiles[] = {
     // simple apply is the unique 16-byte prologue match; the tree apply was
     // identified by its own string references (ftreefilter_applyReturningInfo,
     // ftreefilter_appendAndReleaseLeafInfo) inside the verified function body.
+    // Apple Music 1.7.0.156 / package 1.1792.39942.0 reuses this same image:
+    // both prologues hash to the digests below, so it needs no third profile.
     {L"CoreMedia 1.2 (3365.13) / AM 1.1792.39682.0", 0x007DC3A0, 0x007F4A60},
 };
 // Image fingerprint. Both verified CoreMedia builds share the same function
@@ -73,6 +83,21 @@ namespace agent_stack {
 // GetModuleHandleW(nullptr)). These are image-relative return-address RVAs,
 // not absolute process addresses. The third frame has two observed compiler
 // paths. Each RVA sits directly after an E8 CALL in the verified build.
+//
+// Status (2026-11-06): these RVAs were recorded from an earlier agent build
+// and have drifted in Apple Music 1.7.0.156 / package 1.1792.39942.0. None of
+// the four offsets now sits after an E8 CALL in AMPLibraryAgent.exe.
+//
+// Runtime measurement with native_trace=1 during a DLNA streaming seek shows
+// the Reset stacks contain no AMPLibraryAgent frame at all: they are
+// CoreAudioToolbox / CoreMedia internal calls. The numeric gate can therefore
+// never fire on that path. HookDll.cpp deliberately carries no heuristic
+// fallback: queue depth cannot separate a seek from a natural tail while
+// [local] reservoir_ms keeps roughly two seconds of PCM queued. Until these
+// RVAs are re-calibrated against a local-file seek, an unmatched stack is
+// treated as a natural tail - nothing is discarded, and the worst case is a
+// short residual of the previous position after a seek rather than silence or
+// a truncated ending.
 inline constexpr std::size_t kLocalSeekResetFrames = 3;
 inline constexpr std::uintptr_t kLocalSeekResetFrame0 = 0x0040B9FA;
 inline constexpr std::uintptr_t kLocalSeekResetFrame1 = 0x0082F6BC;

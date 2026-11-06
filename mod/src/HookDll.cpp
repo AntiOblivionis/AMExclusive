@@ -1357,6 +1357,11 @@ bool StrictLosslessRequested() {
 
 void __cdecl HookAVCFSetPreferredMaximumSampleRate(void* playerItem, double sampleRate) {
     if (ammod::ProcessExiting()) { if (g_originalAVCFSetPreferredMaximumSampleRate) g_originalAVCFSetPreferredMaximumSampleRate(playerItem, sampleRate); return; }
+    // A new player item means a new track: reopen the audio graph (and with it
+    // the network stream) even when Apple reuses the converter. This runs
+    // before the sample-rate logic because it is per-item, not per-call.
+    g_audioCoreRuntime.NotifyTrackChanged(
+        reinterpret_cast<std::uintptr_t>(playerItem));
     RefreshConfiguredAudioQuality();
     const auto ceiling = ammod::quality::ProfileCeiling(true,
         g_configuredQualityKnown.load(), g_configuredLosslessEnabled.load(),
@@ -2757,6 +2762,15 @@ AppleOSStatus __cdecl HookV2AudioConverterReset(void* converter) {
             rva(resetStack[1]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame1 &&
             (rva(resetStack[2]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame2[0] ||
              rva(resetStack[2]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame2[1]);
+        // Deliberately no heuristic fallback here. Queue depth cannot separate
+        // a seek from a natural tail once [local] reservoir_ms is in play: the
+        // reservoir keeps ~2 s of captured PCM queued during ordinary
+        // playback, so a depth test would classify every natural end as a seek
+        // and discard the real tail. Until these RVAs are re-calibrated
+        // against a local-file seek, an unmatched stack stays localSeekReset =
+        // false, i.e. the Reset is treated as a natural tail: nothing is
+        // discarded, and the worst case is a short residual of the previous
+        // position after a seek instead of silence or a truncated ending.
     }
     const bool trackedP0 = g_nativeP0Puller.Tracks(converter);
     if (trackedP0) g_nativeP0Puller.PauseForReset(converter);

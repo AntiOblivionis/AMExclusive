@@ -6,6 +6,27 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.5] - 2026-11-06
+
+### Fixed
+
+- **曲目边界后永久静音（Apple Music 1.7）**。1.7.0.156 / 包
+  `1.1792.39942.0` 起，曲目自然结束时不再 `AudioConverterDispose` +
+  `AudioConverterNew`，而是跨曲目复用同一个 P0 converter。旧实现在 EOF 排空
+  后退役整个捕获世代并 `coordinator_.Disable()`，依赖下一次 converter 重建
+  重新绑定；复用之后该前提不成立，状态机永久停在 Disabled：
+  `capturedFrames` 继续增长、`submittedFrames` 停止，网播 renderer 反复请求
+  过期 URL（HTTP 410）。现在 EOF 收尾时若该 converter 仍有效且仍是 P0 解码
+  器，主动重新武装并开启新世代；`OpenEndpoint` 仍要求队列有真实 PCM 才打开
+  输出，真停止时不会凭空开流。
+- 本地文件 seek 判定不再使用不可靠的队列深度启发式（`[local] reservoir_ms`
+  会让自然曲尾也命中），未匹配栈按自然尾部保守处理：不丢数据、不静音。
+
+### Verified
+
+- Apple Music 文件版本 `1.7.0.156` / 包 `1.1792.39942.0`；CoreMedia 质量锁
+  指纹与 `1.1792.39682.0` 完全一致，无需新增 profile。
+
 ## [0.4.3] - 2026-11-05
 
 ### Fixed
