@@ -4,6 +4,7 @@
 #include "../AudioFormatPolicy.h"
 
 #include <algorithm>
+#include <string>
 #include <cmath>
 
 namespace ammod::audio_v2 {
@@ -35,6 +36,24 @@ bool IsLossyAacFormat(std::uint32_t formatId) noexcept {
 bool IsCandidateEncodedFormat(std::uint32_t formatId) noexcept {
     return formatId == kAlac || formatId == kQlac || IsLossyAacFormat(formatId) ||
         formatId == kAppleLinearPcm;
+}
+
+// Diagnostic-only tracing of the format-change rebind state machine.
+// All arguments are scalars so this cannot throw across a noexcept boundary.
+void RebindDiag(const AudioCoreRuntimeCallbacks& cb, const wchar_t* tag,
+                std::uint64_t a = 0, std::uint64_t b = 0, std::uint64_t c = 0,
+                std::uint64_t d = 0, std::uint64_t e = 0,
+                std::uint64_t f = 0) noexcept {
+    if (!cb.logDiagnostic) return;
+    try {
+        std::wstring text = L"v2 rebind ";
+        text += tag;
+        text += L" a=" + std::to_wstring(a) + L" b=" + std::to_wstring(b) +
+                L" c=" + std::to_wstring(c) + L" d=" + std::to_wstring(d) +
+                L" e=" + std::to_wstring(e) + L" f=" + std::to_wstring(f);
+        cb.logDiagnostic(cb.context, text.c_str());
+    } catch (...) {
+    }
 }
 
 } // namespace
@@ -733,6 +752,7 @@ bool AudioCoreRuntime::BeginEndOfStreamDrainLocked(void* converter,
     if (!coordinator_.SealEndOfStream()) return false;
     endOfStreamDrainPending_ = true;
     endOfStreamDrainConverter_ = converter;
+    endOfStreamDrainStartTick_ = GetTickCount64();
     return true;
 }
 
@@ -1060,6 +1080,9 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
     graphSourceBits_ = sourceBitDepth;
     graphObservationId_ = observationId;
     graphStarted_ = false;
+    RebindDiag(callbacks_, L"init", graphRate_, reinterpret_cast<std::uintptr_t>(candidateConverter),
+               graphIdentityChanged, endOfStreamDrainPending_,
+               streamingProducerDrainPending_, reinterpret_cast<std::uintptr_t>(graphUnit_));
     TryBindGraphLocked();
     Wake();
 }
@@ -1145,6 +1168,9 @@ void AudioCoreRuntime::OnAudioUnitUninitialized(void* unit) noexcept {
     ControlScope lock(*this);
     ExtendSeekQuietPeriodLocked();
     if (graphUnit_ != unit) return;
+    RebindDiag(callbacks_, L"uninit", reinterpret_cast<std::uintptr_t>(unit), endOfStreamDrainPending_,
+               streamingProducerDrainPending_, reinterpret_cast<std::uintptr_t>(graphUnit_),
+               reinterpret_cast<std::uintptr_t>(graphConverter_), graphBound_);
     (void)RetireDirectSelectionLocked();
     pendingGraphBind_ = {};
     ClearPendingCaptureLocked();
@@ -1256,6 +1282,11 @@ void* AudioCoreRuntime::OnNativeClientStopped(void* client, HRESULT result) noex
     if (endOfStreamDrainPending_) return nullptr;
 
     const auto converter = boundConverter_.load(std::memory_order_acquire);
+    RebindDiag(callbacks_, L"native-stop", reinterpret_cast<std::uintptr_t>(converter),
+               endOfStreamDrainPending_, streamingProducerDrainPending_,
+               reinterpret_cast<std::uintptr_t>(streamingEofCandidateConverter_.load(std::memory_order_acquire)),
+               coordinator_.HasPendingAudio(),
+               static_cast<std::uint64_t>(coordinator_.Phase()));
     if (!seekFence_ && converter && IsP0Converter(converter) &&
         coordinator_.Phase() == AudioCoreGatePhase::Active) {
         // A successful zero-packet P0 Fill is only an EOF candidate. Repeat One
@@ -1307,6 +1338,11 @@ void* AudioCoreRuntime::OnNativeClientStopped(void* client, HRESULT result) noex
 bool AudioCoreRuntime::OnStreamingProducerEndOfStream(void* converter) noexcept {
     if (!UiEnabled() || !converter) return false;
     ControlScope lock(*this);
+    RebindDiag(callbacks_, L"producer-eof", reinterpret_cast<std::uintptr_t>(converter),
+               endOfStreamDrainPending_, streamingProducerDrainPending_,
+               reinterpret_cast<std::uintptr_t>(boundConverter_.load(std::memory_order_acquire)),
+               static_cast<std::uint64_t>(coordinator_.Phase()),
+               coordinator_.HasPendingAudio());
     if (endOfStreamDrainPending_ && endOfStreamDrainConverter_ == converter) {
         streamingProducerDrainPending_ = false;
         streamingProducerDrainConverter_ = nullptr;
@@ -1813,6 +1849,14 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
             pendingGraphBind_ = {graphUnit_, graphConverter_, snapshot.registration.observationId,
                                  snapshot.registrationId};
             ArmPendingCaptureLocked(snapshot);
+            RebindDiag(callbacks_, L"defer-pending-set", graphRate_,
+                       reinterpret_cast<std::uintptr_t>(graphConverter_), reinterpret_cast<std::uintptr_t>(boundConverter_.load(std::memory_order_acquire)),
+                       endOfStreamDrainPending_, streamingProducerDrainPending_,
+                       reinterpret_cast<std::uintptr_t>(pendingGraphBind_.converter));
+        } else {
+            RebindDiag(callbacks_, L"defer-same-converter", graphRate_,
+                       reinterpret_cast<std::uintptr_t>(graphConverter_), endOfStreamDrainPending_,
+                       streamingProducerDrainPending_);
         }
         return;
     }
@@ -1822,6 +1866,10 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
         !IsSupportedSourceDepth(static_cast<std::uint16_t>(
             snapshot.registration.sourceBitDepth)) ||
         (graphSourceBits_ != 0 && graphSourceBits_ != snapshot.registration.sourceBitDepth)) {
+        RebindDiag(callbacks_, L"reject-format", graphRate_,
+                   snapshot.registration.outputFormat.sampleRate,
+                   snapshot.registration.sourceBitDepth, graphSourceBits_,
+                   reinterpret_cast<std::uintptr_t>(graphConverter_));
         return;
     }
 
@@ -1830,12 +1878,17 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     // finished, so keeping the old graph would leave the renderer silent.
     if (graphBound_ && boundConverter_.load(std::memory_order_acquire) == graphConverter_ &&
         !trackChangePending_) {
+        RebindDiag(callbacks_, L"skip-same-bound", graphRate_,
+                   reinterpret_cast<std::uintptr_t>(graphConverter_), trackChangePending_);
         return;
     }
 
     if (pendingCaptureOwner_ && callbacks_.tryAcquireProducer && !pendingProducerLeaseHeld_) {
         // A native Fill/Dispose may already own the producer. The worker takes
         // a nonblocking lease before publishing the new queue and moving PCM.
+        RebindDiag(callbacks_, L"lease-blocked", graphRate_,
+                   reinterpret_cast<std::uintptr_t>(graphConverter_), reinterpret_cast<std::uintptr_t>(pendingCaptureOwner_.get()),
+                   pendingProducerLeaseHeld_);
         Wake();
         return;
     }
@@ -1998,6 +2051,9 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
         static_cast<std::uint64_t>(coordinator_.BufferedFrames()),
         std::memory_order_release);
     if (callbacks_.onConverterBound) callbacks_.onConverterBound(callbacks_.context, graphConverter_);
+    RebindDiag(callbacks_, L"bound", graphRate_,
+               reinterpret_cast<std::uintptr_t>(graphConverter_), reinterpret_cast<std::uintptr_t>(boundConverter_.load(std::memory_order_acquire)),
+               format.containerBits);
     Emit(AudioCoreRuntimeEvent::Bound, S_OK);
 }
 
@@ -2182,7 +2238,32 @@ void AudioCoreRuntime::TryActivateLocked() noexcept {
 }
 
 void AudioCoreRuntime::FinalizeEndOfStreamDrainLocked() noexcept {
-    if (!endOfStreamDrainPending_ || !coordinator_.EndOfStreamComplete()) return;
+    if (!endOfStreamDrainPending_) return;
+    const auto now = GetTickCount64();
+    const bool complete = coordinator_.EndOfStreamComplete();
+    // The sink normally reports completion after its tail drains. A live
+    // stream is never sealed at a track boundary, and Apple can tear down the
+    // audio graph without ever delivering S_FALSE, so the sink may never
+    // report completion. Bound the wait so a pending format-change rebind can
+    // still be applied (otherwise the whole second track stays silent).
+    const bool timedOut = endOfStreamDrainStartTick_ != 0 &&
+                          now - endOfStreamDrainStartTick_ > 3000;
+    if (!complete && !timedOut) {
+        if (now >= nextFinalizeDiagTick_) {
+            nextFinalizeDiagTick_ = now + 1000;
+            RebindDiag(callbacks_, L"finalize-wait", complete,
+                       reinterpret_cast<std::uintptr_t>(endOfStreamDrainConverter_),
+                       reinterpret_cast<std::uintptr_t>(pendingGraphBind_.converter), graphBound_,
+                       static_cast<std::uint64_t>(coordinator_.Phase()),
+                       reinterpret_cast<std::uintptr_t>(graphConverter_));
+        }
+        return;
+    }
+    RebindDiag(callbacks_, L"finalize-run", complete, timedOut,
+               reinterpret_cast<std::uintptr_t>(pendingGraphBind_.converter), graphBound_,
+               endOfStreamDrainStartTick_ ? now - endOfStreamDrainStartTick_ : 0);
+    endOfStreamDrainStartTick_ = 0;
+    nextFinalizeDiagTick_ = 0;
 
     const auto drainedConverter = endOfStreamDrainConverter_;
     const auto localSuccessor = pendingLocalSuccessor_;
@@ -2249,6 +2330,10 @@ void AudioCoreRuntime::RetireCompletedCaptureLocked(void* converter) noexcept {
 void AudioCoreRuntime::TryBindPendingGraphLocked() noexcept {
     if (graphBound_ || !pendingGraphBind_.converter) return;
     const auto successor = pendingGraphBind_;
+    RebindDiag(callbacks_, L"pending-try", reinterpret_cast<std::uintptr_t>(successor.converter),
+               reinterpret_cast<std::uintptr_t>(successor.unit), reinterpret_cast<std::uintptr_t>(graphUnit_),
+               reinterpret_cast<std::uintptr_t>(graphConverter_), successor.observationId,
+               successor.registrationId);
     ConverterRegistrationSnapshot snapshot{};
     if (UiEnabled() && successor.unit == graphUnit_ &&
         successor.converter == graphConverter_ &&
@@ -2268,14 +2353,22 @@ void AudioCoreRuntime::TryBindPendingGraphLocked() noexcept {
         pendingProducerLeaseHeld_ = true;
         // One attempt only. Missing precision is retried by its existing
         // observation callback; a rejected item must not fault every tick.
+        RebindDiag(callbacks_, L"pending-apply", reinterpret_cast<std::uintptr_t>(successor.converter),
+                   reinterpret_cast<std::uintptr_t>(graphUnit_), reinterpret_cast<std::uintptr_t>(graphConverter_));
         TryBindGraphLocked();
     } else {
+        RebindDiag(callbacks_, L"pending-cleared", reinterpret_cast<std::uintptr_t>(successor.converter),
+                   reinterpret_cast<std::uintptr_t>(successor.unit), reinterpret_cast<std::uintptr_t>(graphUnit_),
+                   reinterpret_cast<std::uintptr_t>(graphConverter_), graphStarted_);
         pendingGraphBind_ = {};
         ClearPendingCaptureLocked();
     }
 }
 
 void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph, bool keepPendingCapture) noexcept {
+    RebindDiag(callbacks_, L"retire", keepGraph, keepPendingCapture, graphBound_,
+               reinterpret_cast<std::uintptr_t>(boundConverter_.load(std::memory_order_acquire)),
+               endOfStreamDrainPending_, streamingProducerDrainPending_);
     resumePrebufferPending_ = false;
     resumeProducerPending_ = false;
     resumeProducerFrames_ = 0;

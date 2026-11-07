@@ -19,6 +19,8 @@ constexpr wchar_t kOhTransport[] = L"urn:av-openhome-org:service:Transport:1";
 constexpr wchar_t kOhTime[] = L"urn:av-openhome-org:service:Time:1";
 constexpr wchar_t kOhVolume[] = L"urn:av-openhome-org:service:Volume:1";
 constexpr wchar_t kOhInfo[] = L"urn:av-openhome-org:service:Info:1";
+constexpr wchar_t kOhReceiver[] = L"urn:av-openhome-org:service:Receiver:1";
+constexpr wchar_t kOhProduct[] = L"urn:av-openhome-org:service:Product:1";
 
 struct HttpResult final {
     DWORD status{};
@@ -209,6 +211,11 @@ bool DlnaControlClient::LoadDescription(DlnaTarget& target, std::wstring& error)
     target.volume = find(kRenderingControl, target.renderingControl);
     if (!find(kConnectionManager, target.connectionManager)) target.connectionManager.clear();
     target.openHome = find(kOhPlaylist, target.openHomePlaylist);
+    // Songcast endpoints exist on devices with or without a Playlist (a pure
+    // Songcast receiver has Receiver + Product and nothing else), so these are
+    // always probed rather than gated on target.openHome.
+    (void)find(kOhReceiver, target.openHomeReceiver);
+    (void)find(kOhProduct, target.openHomeProduct);
     if (target.openHome) {
         (void)find(kOhTransport, target.openHomeTransport);
         (void)find(kOhTime, target.openHomeTime);
@@ -217,7 +224,10 @@ bool DlnaControlClient::LoadDescription(DlnaTarget& target, std::wstring& error)
     }
     target.nextUri = target.avTransport;
     target.seek = target.avTransport || target.openHome;
-    return !target.avTransportControl.empty() || !target.openHomePlaylist.empty();
+    // Receiver-only devices (pure Songcast endpoints) have neither Playlist
+    // nor AVTransport; they are still valid targets.
+    return !target.avTransportControl.empty() || !target.openHomePlaylist.empty() ||
+           !target.openHomeReceiver.empty();
 }
 
 bool DlnaControlClient::PostSoap(const std::wstring& controlUrl,
@@ -555,6 +565,79 @@ bool DlnaControlClient::OpenHomeInfo(const DlnaTarget& target,
     return Call(target.openHomeInfo, kOhInfo, L"Track", {}, values, error);
 }
 
+bool DlnaControlClient::OpenHomeReceiverSetSender(const DlnaTarget& target,
+                                                  const std::wstring& uri,
+                                                  const std::wstring& metadata,
+                                                  std::wstring& error) noexcept {
+    std::vector<upnp::SoapValue> values;
+    const std::wstring body =
+        L"<Uri>" + upnp::EscapeXml(uri) + L"</Uri>"
+        L"<Metadata>" + upnp::EscapeXml(metadata) + L"</Metadata>";
+    return Call(target.openHomeReceiver, kOhReceiver, L"SetSender", body, values, error);
+}
+
+bool DlnaControlClient::OpenHomeReceiverPlay(const DlnaTarget& target,
+                                             std::wstring& error) noexcept {
+    std::vector<upnp::SoapValue> values;
+    return Call(target.openHomeReceiver, kOhReceiver, L"Play", {}, values, error);
+}
+
+bool DlnaControlClient::OpenHomeReceiverStop(const DlnaTarget& target,
+                                              std::wstring& error) noexcept {
+    std::vector<upnp::SoapValue> values;
+    return Call(target.openHomeReceiver, kOhReceiver, L"Stop", {}, values, error);
+}
+
+bool DlnaControlClient::OpenHomeReceiverTransportState(const DlnaTarget& target,
+                                                        std::wstring& state,
+                                                        std::wstring& error) noexcept {
+    std::vector<upnp::SoapValue> values;
+    if (!Call(target.openHomeReceiver, kOhReceiver, L"TransportState", {}, values, error)) {
+        return false;
+    }
+    return FindValue(values, L"Value", state);
+}
+
+bool DlnaControlClient::OpenHomeProductSourceXml(const DlnaTarget& target,
+                                                  std::wstring& xml,
+                                                  std::wstring& error) noexcept {
+    std::vector<upnp::SoapValue> values;
+    if (!Call(target.openHomeProduct, kOhProduct, L"SourceXml", {}, values, error)) {
+        return false;
+    }
+    // OpenHome Product:1 defines the output argument as "SourceXml", but every
+    // AURALiC-class device observed returns it inside a generic <Value>
+    // element. Accept both; a strict reader would silently get an empty
+    // document and skip source selection entirely (which is exactly what
+    // happened on a VEGA G2.2 before this fallback).
+    if (FindValue(values, L"SourceXml", xml) && !xml.empty()) return true;
+    return FindValue(values, L"Value", xml);
+}
+
+bool DlnaControlClient::OpenHomeProductSourceIndex(const DlnaTarget& target,
+                                                   std::uint32_t& index,
+                                                   std::wstring& error) noexcept {
+    std::vector<upnp::SoapValue> values;
+    if (!Call(target.openHomeProduct, kOhProduct, L"SourceIndex", {}, values, error)) {
+        return false;
+    }
+    std::wstring text;
+    if (!FindValue(values, L"Value", text)) {
+        error = L"Product SourceIndex response lacks Value";
+        return false;
+    }
+    index = static_cast<std::uint32_t>(_wtoi(text.c_str()));
+    return true;
+}
+
+bool DlnaControlClient::OpenHomeProductSetSourceIndex(const DlnaTarget& target,
+                                                      std::uint32_t index,
+                                                      std::wstring& error) noexcept {
+    std::vector<upnp::SoapValue> values;
+    return Call(target.openHomeProduct, kOhProduct, L"SetSourceIndex",
+                L"<Value>" + std::to_wstring(index) + L"</Value>", values, error);
+}
+
 std::wstring DlnaControlClient::ProtocolInfoFor(DlnaStreamShape shape,
                                                 const PcmFormat& format,
                                                 bool converted) {
@@ -570,6 +653,12 @@ std::wstring DlnaControlClient::ProtocolInfoFor(DlnaStreamShape shape,
         L"DLNA.ORG_CI=" + ci +
         L";DLNA.ORG_FLAGS=01700000000000000000000000000000";
     switch (shape) {
+    case DlnaStreamShape::FlacLive:
+        // Close-delimited live stream: no byte ranges, no time seek - OP=00 is
+        // the truthful advertisement, and a strict renderer will not even try
+        // to resume. (The file shapes below advertise OP=01 because they
+        // really do serve 206s.)
+        return L"http-get:*:audio/x-flac:DLNA.ORG_OP=00;" + flags;
     case DlnaStreamShape::FlacFile:
         // File-shaped FLAC: a declared length and byte ranges are offered, so
         // OP=01 is truthful. The "x-" spelling is what renderers advertise;

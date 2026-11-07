@@ -56,6 +56,8 @@ struct AudioCoreRuntimeCallbacks final {
     bool (*tryAcquireProducer)(void*) noexcept{};
     void (*releaseProducer)(void*) noexcept{};
     void (*onConverterBound)(void*, void*) noexcept{};
+    // Diagnostic-only: append a line to the main log. Disabled unless set.
+    void (*logDiagnostic)(void*, const wchar_t*) noexcept{};
 };
 
 struct AudioCorePcmFillStats final {
@@ -428,6 +430,12 @@ private:
     std::atomic<void*> streamingEofCandidateConverter_{};
     bool endOfStreamDrainPending_{};
     void* endOfStreamDrainConverter_{};
+    // Bounded EOS drain: a live/DLNA sink may never report Finished() when
+    // Apple tears down the graph instead of delivering a decoder S_FALSE.
+    // Without this deadline the drain never finalizes, graphBound_ stays true
+    // and a pending format-change rebind is never applied (second track mute).
+    std::uint64_t endOfStreamDrainStartTick_{};
+    std::uint64_t nextFinalizeDiagTick_{};
     std::atomic<std::uint64_t> directSelectionArmEpoch_{};
     std::atomic<std::uint64_t> directSelectionArmGeneration_{};
     std::atomic<std::uint64_t> transportSkipArmEpoch_{};

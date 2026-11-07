@@ -40,6 +40,14 @@ enum class DlnaStreamShape : std::uint8_t {
     // sample exists. No compression (bandwidth within 1% of WAV), but it plays
     // on renderers that refuse WAV while still demanding a known length.
     FlacFile = 1,
+    // Close-delimited live FLAC: a real FLAC stream (STREAMINFO declares
+    // total_samples = 0, frames emitted as PCM arrives) served with neither
+    // Content-Length nor Transfer-Encoding. The connection's clean close is the
+    // end-of-item signal, so the renderer's playlist can still auto-advance
+    // across a stable per-session URL. This is the shape foo_out_upnp and
+    // AirConnect prefer for realtime PCM; the file shapes remain available as
+    // per-device fallbacks.
+    FlacLive = 2,
 };
 
 // True when the wire body is a RIFF/WAVE container.
@@ -47,11 +55,29 @@ inline bool DlnaStreamShapeUsesWavContainer(DlnaStreamShape shape) noexcept {
     return shape == DlnaStreamShape::WavFile;
 }
 
+// True when the wire body is FLAC (file-shaped or live).
+inline bool DlnaStreamShapeUsesFlac(DlnaStreamShape shape) noexcept {
+    return shape == DlnaStreamShape::FlacFile || shape == DlnaStreamShape::FlacLive;
+}
+
+// True when the wire body declares a finite, range-addressable entity.
+inline bool DlnaStreamShapeIsFile(DlnaStreamShape shape) noexcept {
+    return shape == DlnaStreamShape::WavFile || shape == DlnaStreamShape::FlacFile;
+}
+
 inline const wchar_t* DlnaStreamShapeName(DlnaStreamShape shape) noexcept {
-    return shape == DlnaStreamShape::FlacFile ? L"flac-file" : L"wav";
+    switch (shape) {
+    case DlnaStreamShape::FlacFile: return L"flac-file";
+    case DlnaStreamShape::FlacLive: return L"live";
+    case DlnaStreamShape::WavFile:
+    default: return L"wav";
+    }
 }
 
 inline DlnaStreamShape DlnaStreamShapeFromText(const wchar_t* text) noexcept {
+    if (text && _wcsicmp(text, L"live") == 0) {
+        return DlnaStreamShape::FlacLive;
+    }
     if (text && (_wcsicmp(text, L"flac-file") == 0 || _wcsicmp(text, L"flac") == 0)) {
         return DlnaStreamShape::FlacFile;
     }
@@ -99,6 +125,11 @@ struct DlnaTarget final {
     std::wstring openHomeTime;
     std::wstring openHomeVolume;
     std::wstring openHomeInfo;
+    // Songcast path: the Receiver service the sink drives with SetSender/Play
+    // and the Product service used to select the Receiver source. Empty when
+    // the device does not implement them.
+    std::wstring openHomeReceiver;
+    std::wstring openHomeProduct;
     bool openHome{};
     bool avTransport{};
     bool nextUri{};

@@ -16,8 +16,10 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cwchar>
 #include <string>
 #include <thread>
@@ -60,6 +62,19 @@ public:
         produced_ += n;
         writtenFrames = n;
         endOfStream = produced_ >= total_;
+        // Produce at 1.0x like Apple's realtime decode. Without this the whole
+        // track appears instantly, the producer reaches the first track
+        // boundary before Start has queued anything, and the test exercises a
+        // path that cannot happen in production.
+        const auto now = std::chrono::steady_clock::now();
+        if (!paced_) {
+            start_ = now;
+            paced_ = true;
+        }
+        const auto due = start_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(static_cast<double>(produced_) /
+                                          static_cast<double>(rate_)));
+        if (due > now) std::this_thread::sleep_until(due);
         return S_OK;
     }
 
@@ -68,6 +83,8 @@ private:
     std::uint64_t total_{};
     std::uint32_t shift_{16};
     std::uint64_t produced_{};
+    bool paced_{};
+    std::chrono::steady_clock::time_point start_{};
 };
 
 const wchar_t* StateName(AudioSinkState state) {
@@ -78,6 +95,103 @@ const wchar_t* StateName(AudioSinkState state) {
     case AudioSinkState::Faulted: return L"Faulted";
     }
     return L"?";
+}
+
+// Simulates Apple Music's actual playlist behaviour across a format change:
+//   * PCM arrives at 1.0x from a per-track decoded source;
+//   * the runtime hands each track its own graph (rate/bit depth);
+//   * at track EOF the old graph is torn down (Stop) and the runtime rebinds
+//     by closing and re-opening the SAME sink object with a new format;
+//   * OpenHome receives a fresh DeleteAll + Insert + Play for the new item.
+// Unlike the single-track test, this exercises the live Close+Open path that
+// keeps the HTTP server and alias alive across a format change.
+int RunPlaylistSimulation(const std::wstring& location, int seconds,
+                          std::uint32_t bufferMs) {
+    struct Track {
+        std::uint32_t rate;
+        std::uint16_t bits;
+        const wchar_t* name;
+    };
+    const Track tracks[] = {
+        {44100u, 16u, L"44.1 kHz / 16 bit"},
+        {192000u, 24u, L"192 kHz / 24 bit"},
+    };
+    DlnaSink sink; // ONE object, reused exactly like the runtime reuses it
+    bool allOk = true;
+    for (std::size_t i = 0; i < std::size(tracks); ++i) {
+        const auto& track = tracks[i];
+        SineSource source(track.rate, static_cast<std::uint32_t>(seconds),
+                          track.bits);
+        AudioSinkOpenParams params{};
+        params.format.sampleRate = track.rate;
+        params.format.channels = 2;
+        params.format.validBits = track.bits;
+        params.format.containerBits = track.bits;
+        params.format.encoding = PcmEncoding::SignedInteger;
+        params.format.interleaved = true;
+        params.format.sourceValidBits = track.bits;
+        params.streamShape = DlnaStreamShape::FlacLive;
+        // SMTC would report the exact track duration; use it as the boundary.
+        params.streamSeconds = static_cast<std::uint32_t>(seconds);
+        params.streamBufferMs = bufferMs;
+        params.allowResampling = false;
+        params.dlna.location = location;
+
+        const HRESULT opened = sink.Open(params);
+        std::wprintf(L"[playlist] track %llu %ls: Open -> 0x%08lX "
+                     L"negotiated rate=%u bits=%u\n",
+                     static_cast<unsigned long long>(i + 1), track.name, opened,
+                     sink.Format().sampleRate, sink.Format().validBits);
+        std::fflush(stdout);
+        if (FAILED(opened)) return 1;
+
+        const HRESULT started = sink.Start(source);
+        std::wprintf(L"[playlist] track %llu: Start -> 0x%08lX state=%ls\n",
+                     static_cast<unsigned long long>(i + 1), started,
+                     StateName(sink.State()));
+        std::fflush(stdout);
+        if (FAILED(started)) return 1;
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(seconds + 20);
+        for (int tick = 2;; tick += 2) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            const auto stats = sink.Stats();
+            std::wprintf(L"[playlist] t=%ds state=%ls submitted=%llu "
+                         L"bytesServed=%llu buffered=%llu errors=%llu\n",
+                         tick, StateName(stats.state),
+                         static_cast<unsigned long long>(stats.submittedFrames),
+                         static_cast<unsigned long long>(stats.bytesServed),
+                         static_cast<unsigned long long>(stats.bufferedFrames),
+                         static_cast<unsigned long long>(stats.controlFailures));
+            std::fflush(stdout);
+            if (sink.EndOfStreamComplete() ||
+                std::chrono::steady_clock::now() > deadline) break;
+        }
+        const auto finalStats = sink.Stats();
+        const bool ok = finalStats.submittedFrames > 0 &&
+                        finalStats.bytesServed > 0 &&
+                        finalStats.state != AudioSinkState::Faulted;
+        std::wprintf(L"[playlist] track %llu %ls: submitted=%llu "
+                     L"bytesServed=%llu lastError=0x%08lX -> %ls\n",
+                     static_cast<unsigned long long>(i + 1), track.name,
+                     static_cast<unsigned long long>(finalStats.submittedFrames),
+                     static_cast<unsigned long long>(finalStats.bytesServed),
+                     finalStats.lastError, ok ? L"OK" : L"FAIL");
+        std::fflush(stdout);
+        allOk = allOk && ok;
+
+        // AM: streaming producer EOF -> runtime tears down the graph and
+        // rebinds for the next format. Stop + Close on the same sink object.
+        std::wprintf(L"[playlist] track %llu: EOF -> Stop + Close (runtime rebind)\n",
+                     static_cast<unsigned long long>(i + 1));
+        std::fflush(stdout);
+        sink.Stop();
+        sink.Close();
+    }
+    std::wprintf(L"[playlist] %ls\n", allOk ? L"PASS" : L"FAIL");
+    std::fflush(stdout);
+    return allOk ? 0 : 1;
 }
 
 } // namespace
@@ -93,6 +207,15 @@ int wmain(int argc, wchar_t** argv) {
     const std::wstring shapeText = argc > 3 ? argv[3] : L"wav";
     const std::uint32_t rate = argc > 4 ? static_cast<std::uint32_t>(_wtoi(argv[4])) : 44100u;
     const std::uint32_t bits = argc > 5 ? static_cast<std::uint32_t>(_wtoi(argv[5])) : 16u;
+    // Optional: declared track length and pull-buffer depth. A track length
+    // shorter than the produced audio exercises live auto-advance repeatedly.
+    const int trackSeconds = argc > 6
+        ? std::max(1, _wtoi(argv[6])) : seconds;
+    const std::uint32_t bufferMs = argc > 7
+        ? static_cast<std::uint32_t>(std::clamp(_wtoi(argv[7]), 300, 10000)) : 1500u;
+    if (shapeText == L"playlist") {
+        return RunPlaylistSimulation(location, seconds, bufferMs);
+    }
     SineSource source(rate, static_cast<std::uint32_t>(seconds), bits);
     DlnaSink sink;
 
@@ -107,14 +230,15 @@ int wmain(int argc, wchar_t** argv) {
     params.streamShape = DlnaStreamShapeFromText(shapeText.c_str());
     // Without Apple Music there is no SMTC timeline, so the declared length has
     // to come from the test itself or the file shape would advertise a guess.
-    params.streamSeconds = static_cast<std::uint32_t>(seconds);
-    params.streamBufferMs = 1500;
+    params.streamSeconds = static_cast<std::uint32_t>(trackSeconds);
+    params.streamBufferMs = bufferMs;
     params.allowResampling = false;
     params.dlna.location = location;
 
     const HRESULT opened = sink.Open(params);
     std::wprintf(L"[selftest] shape=%ls rate=%u bits=%u Open(%ls) -> 0x%08lX\n",
                  shapeText.c_str(), rate, bits, location.c_str(), opened);
+    std::fflush(stdout);
     if (FAILED(opened)) {
         std::wprintf(L"[selftest] FAIL: Open returned 0x%08lX\n", opened);
         return 1;
@@ -123,6 +247,7 @@ int wmain(int argc, wchar_t** argv) {
                  sink.Format().sampleRate, sink.Format().channels,
                  sink.Format().validBits, sink.Format().containerBits);
 
+    std::fflush(stdout);
     const HRESULT started = sink.Start(source);
     std::wprintf(L"[selftest] Start -> 0x%08lX state=%ls\n", started, StateName(sink.State()));
     if (FAILED(started)) {

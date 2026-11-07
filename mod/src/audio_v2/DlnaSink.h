@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -68,14 +69,16 @@ private:
     // this loses up to one block (4096 frames) of audio, and a decoder that
     // checks frame continuity may reject the tail outright.
     void FlushEncoderTail() noexcept;
-    void JoinProducer() noexcept;
+    // Returns false if the producer did not exit within gracefulMs.
+    bool JoinProducer(std::uint32_t gracefulMs = 0) noexcept;
     void RecordError(HRESULT error) noexcept;
     // Re-reads the SMTC track length into streamSeconds_ (declared length,
     // headroom included) and trackDurationMsExact_ (the exact boundary used
     // for auto-advance). When previousTitle is non-empty and the snapshot
     // still carries that title, waits briefly for the watcher to publish the
     // next track's metadata.
-    void RefreshTrackDurationFromSmtc(const std::wstring& previousTitle) noexcept;
+    void RefreshTrackDurationFromSmtc(const std::wstring& previousTitle,
+                                      bool fastTrackChange = false) noexcept;
     // Automatic track rollover for gapless auto-advance. Apple Music keeps
     // feeding PCM through the same converter at a track boundary, so no graph
     // rebuild ever re-opens this sink. Once the exact track length has been
@@ -149,6 +152,13 @@ private:
     // [dlna] pcm_byte_order=little escape hatch exists for renderers that
     // violate the spec.
     bool bigEndianPcm_{true};
+    // Live-mode alias token: the stable URL component the playlist sees. The
+    // per-track sessions rotate underneath it (see SetAliasSession).
+    std::wstring liveAlias_;
+    // Live track changes switch the playlist item via SeekId; the previous
+    // session keeps its connection briefly so the renderer can finish moving.
+    // Entries are aborted by the producer loop after the deadline.
+    std::vector<std::pair<std::shared_ptr<DlnaStreamSession>, std::uint64_t>> retiredSessions_;
     std::vector<std::pair<PcmFormat, bool>> formatCandidates_;
     std::size_t formatIndex_{};
 
@@ -158,11 +168,19 @@ private:
 
     IIntegerPcmSource* source_{};
     std::thread producer_;
+    std::mutex producerExitMutex_;
+    std::condition_variable producerExitCv_;
+    bool producerExited_{false};
     std::atomic<bool> producerStop_{false};
     std::atomic<bool> producerPaused_{false};
     std::atomic<bool> startedOnce_{false};
     std::atomic<bool> waitingForSource_{false};
     std::atomic<bool> endOfStreamSubmitted_{false};
+    // Tick at which the producer sealed the stream. EndOfStreamComplete must
+    // not depend forever on the renderer draining the ring: LightningPlayer
+    // answers a resume Range with 416 by giving up, and the runtime then waits
+    // for a completion that never comes (blocking the next format's rebind).
+    std::atomic<std::uint64_t> endOfStreamTick_{0};
     std::atomic<AudioSinkState> state_{AudioSinkState::Closed};
     std::atomic<HRESULT> lastError_{S_OK};
     std::atomic<std::uint64_t> submittedFrames_{0};

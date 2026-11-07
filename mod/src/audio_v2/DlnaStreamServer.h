@@ -8,6 +8,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -93,6 +94,25 @@ public:
     // producer. `reachable` is false when that offset has already been
     // reclaimed; the caller then answers 416 instead of serving wrong bytes.
     Reader NewReaderAt(std::uint64_t entityOffset, bool& reachable) noexcept;
+    // Live streams have no addressable byte 0 once the ring has advanced: a
+    // renderer that connects late (or reconnects after its own buffer pause)
+    // must start at the oldest byte still retained, exactly like joining a
+    // broadcast. Never reports "unreachable".
+    Reader NewLiveReader() noexcept;
+    // Resume at an absolute byte offset. Offsets at the current live edge
+    // (produced, with no buffered bytes yet) are valid: the reader waits for
+    // the next produced bytes. Only offsets behind the retained window are
+    // unsatisfiable.
+    Reader NewLiveReaderAt(std::uint64_t entityOffset, bool& reachable) noexcept;
+    std::uint64_t OldestByte() const noexcept;
+    // Largest recorded FLAC frame start <= offset (used to align a 206 resume
+    // to a decodable boundary).
+    std::uint64_t FrameStartAtOrBefore(std::uint64_t offset) const noexcept;
+    // Wake a producer blocked in Append without aborting the session (the
+    // graceful phase of Stop).
+    void RequestAppendCancel() noexcept;
+    // Clear a previous graceful cancel when the same session is resumed.
+    void ResetAppendCancel() noexcept;
     // Any byte-range request means the renderer has committed to the real
     // pull, so the ring may start discarding the head of the stream. Without
     // this a renderer that asks for "bytes=0-" would stall the producer
@@ -102,6 +122,12 @@ public:
     void Abort() noexcept;
 
     std::size_t BufferedBytes() const noexcept;
+    // Total bytes appended by the producer so far (the live stream's current
+    // extent; used for 416 Content-Range on unsatisfiable range requests).
+    std::uint64_t ProducedBytes() const noexcept {
+        std::lock_guard lock(mutex_);
+        return produced_;
+    }
     std::uint64_t BytesServed() const noexcept {
         return bytesServed_.load(std::memory_order_acquire);
     }
@@ -138,6 +164,9 @@ private:
     // mutex_ must be held. Bytes are reclaimed only after every active reader
     // has advanced past them; with no readers, live data need not be retained.
     void ReclaimLocked() noexcept;
+    // Called with mutex_ held.
+    bool HasActiveReaderLocked(std::uint64_t now) const noexcept;
+    void DropOldestLocked(std::size_t bytes) noexcept;
 
     // Per-reader tracking. `lastActiveTick` is refreshed on every successful
     // Read so ReclaimLocked can tell a live playback cursor from a stalled
@@ -147,11 +176,24 @@ private:
     struct ReaderState {
         std::uint64_t cursor{};
         std::uint64_t lastActiveTick{};
+        // When this reader attached. Reclaim is suppressed while any reader is
+        // younger than kReaderProbeGraceMs: renderers probe with a short GET
+        // (LightningPlayer reads 128 KB and hangs up), and letting that probe
+        // advance the retained head made the subsequent real GET start after
+        // the probe bytes - audibly eating the start of the track.
+        std::uint64_t createdTick{};
     };
     // Readers idle longer than this are excluded from the reclaim minimum.
     // Two seconds is well above any legitimate renderer read interval and
     // well below the time it takes a stalled probe to fill the ring.
     static constexpr std::uint64_t kReaderStallMs = 2000;
+    // No reclaim at all during a reader's first five seconds. A renderer probe
+    // reads ~128 KB *at stream rate* (about 3.3 s at 320 kbps, 1-1.5 s for
+    // typical lossless FLAC), so a shorter grace lets the probe's cursor move
+    // the retained head and the real GET then starts after the probe bytes -
+    // audibly eating the start of the track. The ring holds 8+ seconds, so the
+    // producer can run through the grace window without losing anything.
+    static constexpr std::uint64_t kReaderProbeGraceMs = 5000;
 
     std::wstring token_;
     PcmFormat format_{};
@@ -168,6 +210,7 @@ private:
     std::condition_variable dataReady_;
     std::condition_variable spaceReady_;
     std::atomic<bool> aborted_{false};
+    std::atomic<bool> appendCancelled_{false};
     std::atomic<bool> endOfStream_{false};
     std::atomic<bool> delivered_{false};
     std::atomic<std::uint64_t> bytesServed_{0};
@@ -182,6 +225,10 @@ private:
     bool rangeRequested_{false};
     std::map<std::uint64_t, ReaderState> readers_;
     std::uint64_t nextReaderId_{1};
+    // Absolute offsets at which each Append began. For live FLAC these are
+    // frame boundaries, so a 206 resume can be aligned to a decodable start.
+    // Kept bounded and pruned against the retained window.
+    std::deque<std::uint64_t> frameStarts_;
 };
 
 // Minimal HTTP/1.1 streaming server. It intentionally supports only GET/HEAD
@@ -203,6 +250,15 @@ public:
 
     void AddSession(const std::shared_ptr<DlnaStreamSession>& session);
     void RemoveSession(const std::wstring& token);
+    // Live-mode alias: `alias` resolves to the session the renderer should
+    // pull *right now*. The alias persists across per-track session rotation,
+    // so the URL handed to the playlist never expires mid-playback and the
+    // 410-storm class of failure cannot occur. Re-pointing is atomic from the
+    // reader's perspective: a GET either lands on the old session (which is
+    // already sealed EOS and drains cleanly) or on the new one.
+    void SetAliasSession(const std::wstring& alias,
+                         const std::shared_ptr<DlnaStreamSession>& session);
+    void RemoveAlias(const std::wstring& alias);
     std::shared_ptr<DlnaStreamSession> FindSession(const std::wstring& token) const;
 
     static std::vector<BYTE> WavHeader(const PcmFormat& format,

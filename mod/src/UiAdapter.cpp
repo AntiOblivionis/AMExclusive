@@ -2595,14 +2595,18 @@ Controls::Border CreateOutputTargetCard(
     manualRow.Children().Append(manualAdd);
     networkPanel.Children().Append(manualRow);
 
-    // Stream format. Persisted straight into the shared ini: the hook reads it
-    // when the next track opens, so a change needs no restart.
+    // Transport mode. Persisted straight into the shared ini: the hook reads
+    // it when the next track opens, so a change needs no restart.
+    //   wav         file-shaped WAV  (legacy, universal fallback)
+    //   flac-file   file-shaped FLAC (legacy, universal fallback)
+    //   live        close-delimited FLAC live stream on a stable URL
+    //   songcast    OpenHome Songcast OHU push (no HTTP at all)
     Controls::StackPanel shapeRow;
     shapeRow.Orientation(Controls::Orientation::Horizontal);
     shapeRow.Spacing(8.0);
     shapeRow.Margin(Xaml::Thickness{0, 4, 0, 0});
     Controls::TextBlock shapeLabel;
-    shapeLabel.Text(Localized(L"\u6d41\u683c\u5f0f", L"Stream format"));
+    shapeLabel.Text(Localized(L"\u6d41\u5f0f", L"Stream mode"));
     shapeLabel.VerticalAlignment(Xaml::VerticalAlignment::Center);
     shapeLabel.MinWidth(120.0);
     Controls::ComboBox shapeCombo;
@@ -2610,9 +2614,11 @@ Controls::Border CreateOutputTargetCard(
     shapeCombo.MinWidth(220.0);
     shapeCombo.VerticalAlignment(Xaml::VerticalAlignment::Center);
     {
-        const std::wstring names[2] = {
+        const std::wstring names[3] = {
             Localized(L"WAV\uff08\u6587\u4ef6\u5f62\u6001\uff09", L"WAV (file)"),
-            Localized(L"FLAC\uff08\u6587\u4ef6\u5f62\u6001\uff09", L"FLAC (file)")};
+            Localized(L"FLAC\uff08\u6587\u4ef6\u5f62\u6001\uff09", L"FLAC (file)"),
+            Localized(L"FLAC \u5b9e\u65f6\u6d41\uff08\u6807\u51c6\uff09",
+                      L"FLAC live (standard)")};
         for (const auto& name : names) {
             Controls::ComboBoxItem item;
             item.Content(box_value(name));
@@ -2624,14 +2630,21 @@ Controls::Border CreateOutputTargetCard(
         const auto path = StreamFormatIniPath();
         GetPrivateProfileStringW(L"dlna", L"stream_format", L"wav", value,
                                  static_cast<DWORD>(std::size(value)), path.c_str());
-        const bool flacFile = _wcsicmp(value, L"flac-file") == 0 ||
-                              _wcsicmp(value, L"flac") == 0;
-        shapeCombo.SelectedIndex(flacFile ? 1 : 0);
+        int index = 0;
+        if (_wcsicmp(value, L"live") == 0) {
+            index = 2;
+        } else if (_wcsicmp(value, L"flac-file") == 0 ||
+                   _wcsicmp(value, L"flac") == 0) {
+            index = 1;
+        }
+        shapeCombo.SelectedIndex(index);
     }
     shapeCombo.SelectionChanged([](auto&& sender, auto&&) {
         try {
             const int index = sender.as<Controls::ComboBox>().SelectedIndex();
-            const wchar_t* value = index == 1 ? L"flac-file" : L"wav";
+            const wchar_t* value = index == 1 ? L"flac-file"
+                                  : index == 2 ? L"live"
+                                               : L"wav";
             const auto path = StreamFormatIniPath();
             if (path.empty()) return;
             WritePrivateProfileStringW(L"dlna", L"stream_format", value, path.c_str());
@@ -2641,7 +2654,7 @@ Controls::Border CreateOutputTargetCard(
         }
     });
     Automation::AutomationProperties::SetName(
-        shapeCombo, Localized(L"\u6d41\u683c\u5f0f", L"Stream format"));
+        shapeCombo, Localized(L"\u6d41\u5f0f", L"Stream mode"));
     shapeRow.Children().Append(shapeLabel);
     shapeRow.Children().Append(shapeCombo);
     networkPanel.Children().Append(shapeRow);

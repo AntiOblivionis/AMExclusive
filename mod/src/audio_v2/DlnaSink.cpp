@@ -385,12 +385,48 @@ bool DlnaSink::BuildFormatCandidates(const std::wstring& sinkProtocolInfo) noexc
 }
 
 bool DlnaSink::SetupStream() noexcept {
+    // ProducerMain may have exited already, so its cleanup loop is gone.
+    // Release only retired sessions whose grace period has elapsed; a session
+    // retired at the immediately preceding Close must keep its connection
+    // alive until the renderer has picked up the new playlist item.
+    if (!retiredSessions_.empty()) {
+        const auto now = GetTickCount64();
+        for (auto it = retiredSessions_.begin(); it != retiredSessions_.end();) {
+            if (now >= it->second) {
+                server_.RemoveSession(it->first->Token());
+                it = retiredSessions_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (shape_ != DlnaStreamShape::FlacLive) {
+        // Mode switch away from live: close everything the live path kept
+        // alive across the previous Close+Open.
+        for (auto& entry : retiredSessions_) {
+            if (entry.first) server_.RemoveSession(entry.first->Token());
+        }
+        retiredSessions_.clear();
+        if (!liveAlias_.empty()) {
+            server_.RemoveAlias(liveAlias_);
+            liveAlias_.clear();
+        }
+    }
     // Drop any prior session but keep the HTTP server running across format
     // retries. Restarting the server on every retry forced the renderer to
     // re-resolve a new random port and left stale connections behind, which
     // is exactly the shape that made attempt N+1 fail even when attempt N had
     // the renderer connected.
-    CloseStream();
+    if (shape_ == DlnaStreamShape::FlacLive && session_) {
+        // Do not abort: the renderer is still reading while we switch items.
+        // The producer loop aborts it once the deadline passes.
+        retiredSessions_.emplace_back(session_, GetTickCount64() + 5000);
+        session_.reset();
+    } else {
+        CloseStream();
+    }
+    chunkFrames_ = std::min<std::uint32_t>(
+        std::max<std::uint32_t>(format_.sampleRate / 50u, 256u), 4096u);
     if (!server_.Running()) {
         const auto host = DlnaControlClient::HostFromLocation(target_.location);
         // [dlna] bind_interface pins the advertised/bound address. Only needed
@@ -407,17 +443,18 @@ bool DlnaSink::SetupStream() noexcept {
         std::uint16_t port = 0;
         if (!server_.Start(advertiseIp_, port, error)) return false;
     }
-    chunkFrames_ = std::min<std::uint32_t>(
-        std::max<std::uint32_t>(format_.sampleRate / 50u, 256u), 4096u);
-    if (shape_ == DlnaStreamShape::FlacFile) {
-        // Constant-size frames keep the declared length exact.
-        const std::uint64_t samples =
-            shape_ == DlnaStreamShape::FlacFile
-                ? static_cast<std::uint64_t>(format_.sampleRate) *
-                      static_cast<std::uint64_t>(std::max<std::uint32_t>(streamSeconds_, 5))
-                : 0;
+    if (DlnaStreamShapeUsesFlac(shape_)) {
+        // The file shape needs constant-size verbatim frames plus a published
+        // total; the live shape encodes real FLAC frames and declares
+        // total_samples = 0 ("unknown") in STREAMINFO, which every FLAC
+        // decoder accepts from a stream.
+        const bool verbatim = shape_ == DlnaStreamShape::FlacFile;
+        const std::uint64_t samples = verbatim
+            ? static_cast<std::uint64_t>(format_.sampleRate) *
+                  static_cast<std::uint64_t>(std::max<std::uint32_t>(streamSeconds_, 5))
+            : 0;
         flac_.Reset(format_.sampleRate, format_.channels, format_.containerBits,
-                    shape_ == DlnaStreamShape::FlacFile, samples);
+                    verbatim, samples);
     }
     // Renderers disagree about the WAV MIME spelling and several only accept
     // the one they advertise. Pick theirs when they name exactly one.
@@ -457,7 +494,11 @@ bool DlnaSink::SetupStream() noexcept {
     // the producer eventually emits. Overshooting is safe: the renderer simply
     // stops at the end of the real audio and waits for the next track's URL.
     // Undershooting would truncate the song, so the value is a ceiling.
-    if (shape_ == DlnaStreamShape::FlacFile) {
+    if (shape_ == DlnaStreamShape::FlacLive) {
+        // Close-delimited: no length exists and none is claimed. The response
+        // carries neither Content-Length nor Transfer-Encoding.
+        totalBytes_ = 0;
+    } else if (shape_ == DlnaStreamShape::FlacFile) {
         // Verbatim frames are fixed size, so the exact entity length is known
         // before a single sample exists. That is what lets a live capture be
         // announced as a normal file with Content-Length and byte ranges.
@@ -484,6 +525,15 @@ bool DlnaSink::SetupStream() noexcept {
                                                    contentFeatures_, totalBytes_);
     if (!wireMime.empty()) session_->SetMime(wireMime);
     server_.AddSession(session_);
+    if (shape_ == DlnaStreamShape::FlacLive) {
+        // The alias is minted once per sink open so the URL the playlist
+        // learned stays valid for the whole session; only the session behind
+        // it rotates per track. The old session is already sealed EOS when
+        // this re-points, so any in-flight GET drains cleanly and the next
+        // GET lands on the new one.
+        if (liveAlias_.empty()) liveAlias_ = L"live" + GuidToken();
+        server_.SetAliasSession(liveAlias_, session_);
+    }
     // Auto-advance boundary for this session: the EXACT frame count of the
     // track, not the declared entity length (which carries headroom and only
     // caps what the HTTP layer may send). Reaching this count without a
@@ -501,21 +551,29 @@ bool DlnaSink::SetupStream() noexcept {
     // keeps either of them from taking a page fault mid-transfer.
     DlnaLog(L"stream ring=" + std::to_wstring(capacity / 1024u) + L"KB locked=" +
             std::to_wstring(session_->LockMemory() ? 1 : 0));
-    streamUrl_ = server_.BaseUrl() + L"/ame/" + token +
-        (shape_ == DlnaStreamShape::FlacFile ? L".flac" : L".wav");
+    if (shape_ == DlnaStreamShape::FlacLive) {
+        streamUrl_ = server_.BaseUrl() + L"/ame/" + liveAlias_ + L".flac";
+    } else {
+        streamUrl_ = server_.BaseUrl() + L"/ame/" + token +
+            (shape_ == DlnaStreamShape::FlacFile ? L".flac" : L".wav");
+    }
     return true;
 }
 
 void DlnaSink::CloseStream() noexcept {
     // Session-only teardown. The HTTP server stays up so format retries can
     // reuse the same bound port; Close() is responsible for the full stop.
+    // The live alias deliberately survives: a mid-playback GET on the old
+    // alias must keep resolving (to the sealed old session, which reports EOS
+    // immediately) until the new session re-points it.
     if (session_) {
         server_.RemoveSession(session_->Token());
         session_.reset();
     }
 }
 
-void DlnaSink::RefreshTrackDurationFromSmtc(const std::wstring& previousTitle) noexcept {
+void DlnaSink::RefreshTrackDurationFromSmtc(const std::wstring& previousTitle,
+                                            bool fastTrackChange) noexcept {
     wchar_t value[16]{};
     GetPrivateProfileStringW(L"dlna", L"follow_track_duration", L"1", value,
                              static_cast<DWORD>(std::size(value)),
@@ -532,14 +590,17 @@ void DlnaSink::RefreshTrackDurationFromSmtc(const std::wstring& previousTitle) n
     // two to publish the new metadata; 900 ms made high-resolution
     // tracks (where the wait matters most) fall back to the 600 s
     // guess and declare a wildly wrong length.
-    auto info = monitor.Snapshot(2500);
+    // Live streams end with a clean EOF, so the device's own buffer is the
+    // only cover while the next playlist item is being queued. Keep the
+    // metadata wait short there to avoid a visible gap at every track change.
+    auto info = monitor.Snapshot(fastTrackChange ? 300u : 2500u);
     if (!previousTitle.empty()) {
         // Auto-advance: the watcher may still be showing the track that just
         // ended. Give it a few seconds to publish the next title so the new
         // session declares the new track's length, not the old one's. A
         // repeated title (same song on repeat) is indistinguishable from a
         // stale snapshot, so this wait is bounded and harmless either way.
-        const auto deadline = GetTickCount64() + 3000;
+        const auto deadline = GetTickCount64() + (fastTrackChange ? 500u : 3000u);
         while (info.valid && info.title == previousTitle &&
                GetTickCount64() < deadline) {
             if (producerStop_.load(std::memory_order_acquire)) return;
@@ -577,7 +638,12 @@ bool DlnaSink::AdvanceToNextTrack() noexcept {
     // this sink alive.
     if (session_) {
         FlushEncoderTail();
-        (void)session_->Append(nullptr, 0, true);
+        if (shape_ != DlnaStreamShape::FlacLive) {
+            // Live: no EOS. The renderer would treat the EOF as a broken
+            // connection and resume with a Range request instead of accepting
+            // the switch; the SeekId below closes the old connection instead.
+            (void)session_->Append(nullptr, 0, true);
+        }
     }
     // No waiting for the renderer here: the gentle queueing path hands the
     // next URL to the playlist while the current track is still playing, and
@@ -586,7 +652,7 @@ bool DlnaSink::AdvanceToNextTrack() noexcept {
     // the capture queue for nothing.
     if (producerStop_.load(std::memory_order_acquire)) return false;
     const auto previousTitle = lastTrackTitle_;
-    RefreshTrackDurationFromSmtc(previousTitle);
+    RefreshTrackDurationFromSmtc(previousTitle, shape_ == DlnaStreamShape::FlacLive);
     if (producerStop_.load(std::memory_order_acquire)) return false;
     if (!SetupStream()) {
         DlnaLog(L"auto-advance: stream setup failed");
@@ -606,13 +672,17 @@ bool DlnaSink::AppendNextTrackToDevice() noexcept {
     // seconds" failure.
     if (target_.openHome && !target_.openHomePlaylist.empty() &&
         lastOpenHomeId_ != 0) {
+        // Live mode queues the SAME URL with fresh metadata: the playlist
+        // advances to it when the current connection cleanly EOFs, and the
+        // alias resolves to the new track's session on the re-GET. File mode
+        // queues the new session's own URL.
+        const bool broadcast = shape_ == DlnaStreamShape::FlacLive;
         const auto duration = DlnaControlClient::TimeText(streamSeconds_) + L".000";
         const std::uint64_t didlSize =
-            (shape_ == DlnaStreamShape::WavFile || shape_ == DlnaStreamShape::FlacFile)
-                ? totalBytes_ : 0;
+            DlnaStreamShapeIsFile(shape_) ? totalBytes_ : 0;
         const auto didl = upnp::BuildDidlLite(
             L"ame-" + GuidToken(), L"Apple Music", streamUrl_, protocolInfo_,
-            duration, false, didlSize,
+            broadcast ? std::wstring() : duration, broadcast, didlSize,
             format_.sampleRate, format_.containerBits, format_.channels);
         std::wstring error;
         std::uint32_t newId = 0;
@@ -621,6 +691,23 @@ bool DlnaSink::AppendNextTrackToDevice() noexcept {
             DlnaLog(L"auto-advance queued afterId=" + std::to_wstring(lastOpenHomeId_) +
                     L" newId=" + std::to_wstring(newId) + L" url=" + streamUrl_);
             lastOpenHomeId_ = newId;
+            if (shape_ == DlnaStreamShape::FlacLive) {
+                // The renderer will not advance on its own: a live body has no
+                // length, so it would sit on the current item forever. Move the
+                // playlist to the new item ourselves; the renderer then drops
+                // the old connection (no EOF, no resume Range) and pulls the
+                // new session.
+                std::wstring seekError;
+                if (control_.OpenHomeSeekId(target_, newId, seekError)) {
+                    DlnaLog(L"live: playlist switched to id=" + std::to_wstring(newId));
+                    pendingPlayDeadlineTick_ = 0;
+                    return true;
+                }
+                controlFailures_.fetch_add(1, std::memory_order_relaxed);
+                DlnaLog(L"live: SeekId failed, forcing full send device=" +
+                        target_.friendlyName + L" reason=" + seekError);
+                return SendStreamToDevice();
+            }
             // Watchdog: if the renderer does not start pulling the queued
             // track within this window (no auto-continuation), escalate to an
             // explicit Play. Checked from the producer loop, never blocking.
@@ -719,11 +806,13 @@ HRESULT DlnaSink::Open(const AudioSinkOpenParams& params) noexcept {
             std::min(std::max(_wtoi(value), 3), 30));
         ringSeconds_ = std::max(seconds, bufferMs_ / 1000u + 3u);
     }
-    // Wire shape: wav (default, unchanged), flac, or live. Read here so a
-    // change takes effect on the next track without restarting Apple Music.
-    // params.streamShape wins when the caller sets it explicitly (the self
-    // test does); otherwise the persisted ini decides, which is the production
-    // path since the broker does not carry the shape over IPC.
+    // Wire shape: wav (default, unchanged), flac-file or live (close-delimited
+    // FLAC). Read here so a change takes effect on the next track without
+    // restarting Apple Music. params.streamShape wins when the caller sets it
+    // explicitly (the self test does); otherwise the persisted ini decides,
+    // which is the production path since the broker does not carry the shape
+    // over IPC. A leftover "songcast" value from the removed experimental
+    // mode is treated as wav instead of failing silently.
     shape_ = params.streamShape;
     if (shape_ == DlnaStreamShape::WavFile) {
         wchar_t value[16]{};
@@ -810,18 +899,15 @@ HRESULT DlnaSink::Open(const AudioSinkOpenParams& params) noexcept {
 
 bool DlnaSink::SendStreamToDevice() noexcept {
     std::wstring error;
-    // WAV is served file-shaped: a declared length, byte ranges, a musicTrack
-    // item that carries both duration and size. That is the shape every
-    // renderer already understands for a normal file, and the only one that
-    // AURALiC-class devices accept from a live source. Bare LPCM has no
-    // container and therefore no length, so it stays a radio broadcast.
+    // File shapes are served as a musicTrack with duration and size: the shape
+    // every renderer understands for a normal file, and the only one that
+    // AURALiC-class devices accept from a live source. The close-delimited
+    // live shape is an unbounded broadcast: audioBroadcast carries no duration
+    // and no size, and the connection close is the end-of-item signal.
+    const bool broadcast = shape_ == DlnaStreamShape::FlacLive;
     const auto duration = DlnaControlClient::TimeText(streamSeconds_) + L".000";
-    // Every shape is a file now: a musicTrack with duration (and size when the
-    // container length is known), never an unbounded broadcast item.
-    constexpr bool broadcast = false;
     const std::uint64_t didlSize =
-        (shape_ == DlnaStreamShape::WavFile || shape_ == DlnaStreamShape::FlacFile)
-            ? totalBytes_ : 0;
+        DlnaStreamShapeIsFile(shape_) ? totalBytes_ : 0;
     const auto didl = upnp::BuildDidlLite(
         L"ame-" + GuidToken(), L"Apple Music", streamUrl_, protocolInfo_,
         broadcast ? std::wstring() : duration, broadcast, didlSize,
@@ -928,15 +1014,21 @@ bool DlnaSink::SendStreamToDevice() noexcept {
 }
 
 HRESULT DlnaSink::Start(IIntegerPcmSource& source) noexcept {
-    if (!session_ || state_.load(std::memory_order_acquire) == AudioSinkState::Closed ||
+    if (!session_ ||
+        state_.load(std::memory_order_acquire) == AudioSinkState::Closed ||
         state_.load(std::memory_order_acquire) == AudioSinkState::Faulted) {
         return E_UNEXPECTED;
     }
     if (state_.load(std::memory_order_acquire) == AudioSinkState::Running) return S_OK;
     if (startedOnce_.load(std::memory_order_acquire)) {
+        if (session_) session_->ResetAppendCancel();
         producerPaused_.store(false, std::memory_order_release);
         if (!producer_.joinable()) {
             producerStop_.store(false, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(producerExitMutex_);
+                producerExited_ = false;
+            }
             producer_ = std::thread(&DlnaSink::ProducerMain, this);
         }
         std::wstring error;
@@ -962,6 +1054,10 @@ HRESULT DlnaSink::Start(IIntegerPcmSource& source) noexcept {
     for (std::size_t attempt = 0; attempt < formatCandidates_.size(); ++attempt) {
         producerStop_.store(false, std::memory_order_release);
         producerPaused_.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(producerExitMutex_);
+            producerExited_ = false;
+        }
         producer_ = std::thread(&DlnaSink::ProducerMain, this);
         // The coordinator already prebuffered the configured reservoir into
         // the P0 queue; move it into the HTTP ring before asking for Play.
@@ -1025,6 +1121,18 @@ void DlnaSink::ProducerMain() noexcept {
     std::vector<std::int32_t> samples(samplesPerChunk);
     std::vector<BYTE> packed;
     for (;;) {
+        // Abort retired live sessions whose grace period has passed.
+        if (!retiredSessions_.empty()) {
+            const auto now = GetTickCount64();
+            for (auto it = retiredSessions_.begin(); it != retiredSessions_.end();) {
+                if (now >= it->second) {
+                    server_.RemoveSession(it->first->Token());
+                    it = retiredSessions_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
         if (producerStop_.load(std::memory_order_acquire)) break;
         if (producerPaused_.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1070,8 +1178,14 @@ void DlnaSink::ProducerMain() noexcept {
         if (prepared == S_FALSE) {
             waitingForSource_.store(false, std::memory_order_release);
             FlushEncoderTail();
-            (void)session_->Append(nullptr, 0, true);
+            if (shape_ != DlnaStreamShape::FlacLive) {
+                (void)session_->Append(nullptr, 0, true);
+            }
+            // Live: no EOF at a track boundary. Closing would make the
+            // renderer resume with a Range instead of accepting the next
+            // playlist item; the runtime closes/reopens the sink itself.
             endOfStreamSubmitted_.store(true, std::memory_order_release);
+            endOfStreamTick_.store(GetTickCount64(), std::memory_order_release);
             break;
         }
         if (FAILED(prepared)) {
@@ -1132,8 +1246,11 @@ void DlnaSink::ProducerMain() noexcept {
         if (failed) break;
         if (eos) {
             FlushEncoderTail();
-            (void)session_->Append(nullptr, 0, true);
+            if (shape_ != DlnaStreamShape::FlacLive) {
+                (void)session_->Append(nullptr, 0, true);
+            }
             endOfStreamSubmitted_.store(true, std::memory_order_release);
+            endOfStreamTick_.store(GetTickCount64(), std::memory_order_release);
             break;
         }
     }
@@ -1141,14 +1258,21 @@ void DlnaSink::ProducerMain() noexcept {
     if (previousPriority != THREAD_PRIORITY_ERROR_RETURN) {
         (void)SetThreadPriority(GetCurrentThread(), previousPriority);
     }
+    {
+        std::lock_guard<std::mutex> lock(producerExitMutex_);
+        producerExited_ = true;
+    }
+    producerExitCv_.notify_all();
 }
 
 bool DlnaSink::PackChunk(const std::int32_t* samples, std::uint32_t frames,
                          bool endOfStream, std::vector<BYTE>& output) noexcept {
-    if (shape_ == DlnaStreamShape::FlacFile) {
+    if (DlnaStreamShapeUsesFlac(shape_)) {
         // FLAC frames are emitted whole, so the encoder buffers up to one block
         // and hands back whatever is ready. Nothing is produced for a partial
-        // block, which is why Drain may return an empty vector.
+        // block, which is why Drain may return an empty vector. The live shape
+        // shares this path: it is a real FLAC stream, just without a declared
+        // total.
         output.clear();
         if (samples && frames != 0) flac_.Push(samples, frames);
         if (endOfStream) {
@@ -1178,14 +1302,26 @@ bool DlnaSink::PackChunk(const std::int32_t* samples, std::uint32_t frames,
 }
 
 void DlnaSink::FlushEncoderTail() noexcept {
-    if (shape_ != DlnaStreamShape::FlacFile || !session_) return;
+    if (!DlnaStreamShapeUsesFlac(shape_) || !session_) return;
     std::vector<BYTE> tail;
     if (!PackChunk(nullptr, 0, true, tail) || tail.empty()) return;
     (void)session_->Append(tail.data(), tail.size(), false);
 }
 
-void DlnaSink::JoinProducer() noexcept {
-    if (producer_.joinable()) producer_.join();
+bool DlnaSink::JoinProducer(std::uint32_t gracefulMs) noexcept {
+    if (!producer_.joinable()) return true;
+    if (gracefulMs != 0) {
+        std::unique_lock<std::mutex> lock(producerExitMutex_);
+        if (!producerExitCv_.wait_for(lock,
+                std::chrono::milliseconds(gracefulMs),
+                [this] { return producerExited_; })) {
+            return false;
+        }
+        producer_.join();
+        return true;
+    }
+    producer_.join();
+    return true;
 }
 
 void DlnaSink::Pause() noexcept {
@@ -1206,10 +1342,21 @@ void DlnaSink::Pause() noexcept {
 void DlnaSink::Stop() noexcept {
     producerStop_.store(true, std::memory_order_release);
     producerPaused_.store(false, std::memory_order_release);
-    // Release a producer blocked on a full ring even when no HTTP client is
-    // draining it. The session is not reused after Stop.
-    if (session_) session_->Abort();
-    JoinProducer();
+    // Wake a producer blocked in Append WITHOUT aborting the session first:
+    // live connections must see the next playlist item rather than an RST.
+    // If the producer still does not exit within a second, abort the session
+    // (producer only honours aborted_ / appendCancelled_) and join again.
+    if (session_) {
+        if (shape_ != DlnaStreamShape::FlacLive) {
+            session_->Abort();
+        } else {
+            session_->RequestAppendCancel();
+        }
+    }
+    if (!JoinProducer(1000)) {
+        if (session_) session_->Abort();
+        JoinProducer();
+    }
     std::wstring error;
     if (!target_.avTransportControl.empty()) {
         (void)control_.Stop(target_, error);
@@ -1226,20 +1373,56 @@ void DlnaSink::Stop() noexcept {
 
 void DlnaSink::Close() noexcept {
     Stop();
-    CloseStream();
-    server_.Stop();
+    if (shape_ == DlnaStreamShape::FlacLive) {
+        // Keep the HTTP server and alias alive across the runtime's
+        // Close+Open at a format change. The new Open reuses both, so the
+        // renderer sees a new playlist item, not a reset and not a 410.
+        CloseStream(); // retires the current session without aborting it
+        // ProducerMain has exited by now, so its cleanup loop will not run
+        // again. Release only the retired sessions whose 5 s grace has
+        // elapsed; SetupStream prunes the rest on the next Open.
+        const auto now = GetTickCount64();
+        for (auto it = retiredSessions_.begin(); it != retiredSessions_.end();) {
+            if (now >= it->second) {
+                server_.RemoveSession(it->first->Token());
+                it = retiredSessions_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    } else {
+        for (auto& entry : retiredSessions_) {
+            if (entry.first) server_.RemoveSession(entry.first->Token());
+        }
+        retiredSessions_.clear();
+        CloseStream();
+        server_.Stop();
+        if (!liveAlias_.empty()) {
+            server_.RemoveAlias(liveAlias_);
+        }
+        liveAlias_.clear();
+    }
     startedOnce_.store(false, std::memory_order_release);
     endOfStreamSubmitted_.store(false, std::memory_order_release);
+    endOfStreamTick_.store(0, std::memory_order_release);
     lastOpenHomeId_ = 0;
     pendingPlayDeadlineTick_ = 0;
     trackDurationMsExact_ = 0;
     lastTrackTitle_.clear();
+    if (shape_ != DlnaStreamShape::FlacLive) liveAlias_.clear();
     source_ = nullptr;
     state_.store(AudioSinkState::Closed, std::memory_order_release);
 }
 
 bool DlnaSink::EndOfStreamComplete() const noexcept {
-    return session_ && session_->Finished();
+    if (!session_) return true;
+    if (session_->Finished()) return true;
+    // The renderer may have stopped reading (it answered a stale resume Range
+    // with a 416 and gave up), so a drained ring is not a precondition for
+    // "this stream is over". After two seconds the runtime must be allowed to
+    // close this sink and open the next format.
+    const auto tick = endOfStreamTick_.load(std::memory_order_acquire);
+    return tick != 0 && GetTickCount64() - tick > 2000;
 }
 
 AudioSinkStats DlnaSink::Stats() const noexcept {
@@ -1255,6 +1438,10 @@ AudioSinkStats DlnaSink::Stats() const noexcept {
         const auto bytesPerFrame = session_->BytesPerFrame();
         stats.bufferedFrames = bytesPerFrame
             ? session_->BufferedBytes() / bytesPerFrame : 0;
+    }
+    // Live switches retire the previous session; its bytes still count.
+    for (const auto& entry : retiredSessions_) {
+        if (entry.first) stats.bytesServed += entry.first->BytesServed();
     }
     return stats;
 }

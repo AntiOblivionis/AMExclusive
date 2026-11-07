@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <optional>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -129,14 +130,35 @@ bool DlnaStreamSession::Append(const BYTE* data, std::size_t bytes,
                                bool endOfStream) noexcept {
     try {
         std::unique_lock lock(mutex_);
+        if (shape_ == DlnaStreamShape::FlacLive && bytes != 0) {
+            // One Append == one FLAC frame for the live shape; remember its
+            // absolute start so a 206 resume can align to a decodable frame.
+            frameStarts_.push_back(produced_);
+            const std::uint64_t oldest = produced_ - size_;
+            while (!frameStarts_.empty() && frameStarts_.front() < oldest) {
+                frameStarts_.pop_front();
+            }
+            if (frameStarts_.size() > 4096) frameStarts_.pop_front();
+        }
         std::size_t remaining = bytes;
         std::size_t offset = 0;
-        while (remaining != 0 && !aborted_.load(std::memory_order_acquire)) {
+        while (remaining != 0 && !aborted_.load(std::memory_order_acquire) &&
+               !appendCancelled_.load(std::memory_order_acquire)) {
             // Check space before waiting, then re-check after waking. Readers
             // notify spaceReady_ after advancing the global retained window;
             // the timed wait is only a fallback for abort and missed wakeups.
             const std::size_t freeBytes = capacityBytes_ - size_;
             if (freeBytes == 0) {
+                if (shape_ == DlnaStreamShape::FlacLive &&
+                    !HasActiveReaderLocked(GetTickCount64())) {
+                    // Broadcast semantics: a renderer that stopped reading
+                    // is owed nothing. Drop the oldest bytes instead of
+                    // freezing the producer (which would back-pressure P0,
+                    // freeze capture and wedge Stop's JoinProducer).
+                    DropOldestLocked(std::min<std::size_t>(
+                        capacityBytes_ / 8u, size_));
+                    continue;
+                }
                 spaceReady_.wait_for(lock, std::chrono::milliseconds(20));
                 continue;
             }
@@ -158,7 +180,8 @@ bool DlnaStreamSession::Append(const BYTE* data, std::size_t bytes,
             endOfStream_.store(true, std::memory_order_release);
             dataReady_.notify_all();
         }
-        return !aborted_.load(std::memory_order_acquire);
+        return !aborted_.load(std::memory_order_acquire) &&
+               !appendCancelled_.load(std::memory_order_acquire);
     } catch (...) {
         return false;
     }
@@ -230,6 +253,15 @@ void DlnaStreamSession::ReclaimLocked() noexcept {
     }
     const std::uint64_t oldest = produced_ - size_;
     const std::uint64_t now = GetTickCount64();
+    // Probe grace: a freshly attached reader may be a renderer's short probe
+    // connection (LightningPlayer reads ~128 KB then resets). Reclaiming on
+    // its cursor would move the head past audio the following real GET still
+    // needs, so nothing is released until every reader has been attached for
+    // at least kReaderProbeGraceMs. The ring is sized in seconds and the
+    // producer runs at 1x, so this cannot overflow during the grace window.
+    for (const auto& entry : readers_) {
+        if (now - entry.second.createdTick < kReaderProbeGraceMs) return;
+    }
     // A reader that has not advanced for kReaderStallMs is a candidate for
     // being an abandoned probe. But real renderers also legitimately read
     // ahead and then pause for seconds while they play from their own buffer,
@@ -365,7 +397,7 @@ DlnaStreamSession::Reader DlnaStreamSession::NewReaderAt(std::uint64_t entityOff
     }
     const std::uint64_t readerId = nextReaderId_++;
     try {
-        readers_.emplace(readerId, ReaderState{cursor, GetTickCount64()});
+        readers_.emplace(readerId, ReaderState{cursor, GetTickCount64(), GetTickCount64()});
     } catch (...) {
         reachable = false;
         return Reader(*this, 0, cursor);
@@ -374,6 +406,83 @@ DlnaStreamSession::Reader DlnaStreamSession::NewReaderAt(std::uint64_t entityOff
     reachable = true;
     ReclaimLocked();
     return Reader(*this, readerId, cursor);
+}
+
+DlnaStreamSession::Reader DlnaStreamSession::NewLiveReader() noexcept {
+    std::lock_guard lock(mutex_);
+    // The live cursor is the oldest retained byte, not 0. A renderer may
+    // connect after prebuffering, pause its own pull for a while, or reconnect
+    // after a clean EOF; all of those are normal for a broadcast and must
+    // attach to whatever is currently buffered.
+    const std::uint64_t cursor = produced_ - size_;
+    const std::uint64_t readerId = nextReaderId_++;
+    try {
+        readers_.emplace(readerId, ReaderState{cursor, GetTickCount64(), GetTickCount64()});
+    } catch (...) {
+        return Reader(*this, 0, cursor);
+    }
+    readersCreated_.fetch_add(1, std::memory_order_release);
+    ReclaimLocked();
+    return Reader(*this, readerId, cursor);
+}
+
+bool DlnaStreamSession::HasActiveReaderLocked(std::uint64_t now) const noexcept {
+    for (const auto& entry : readers_) {
+        if (now - entry.second.lastActiveTick <= kReaderStallMs) return true;
+    }
+    return false;
+}
+
+void DlnaStreamSession::DropOldestLocked(std::size_t bytes) noexcept {
+    const std::size_t drop = std::min(bytes, size_);
+    if (drop == 0) return;
+    head_ = (head_ + drop) % capacityBytes_;
+    size_ -= drop;
+    spaceReady_.notify_all();
+}
+
+void DlnaStreamSession::RequestAppendCancel() noexcept {
+    appendCancelled_.store(true, std::memory_order_release);
+    spaceReady_.notify_all();
+    dataReady_.notify_all();
+}
+
+void DlnaStreamSession::ResetAppendCancel() noexcept {
+    appendCancelled_.store(false, std::memory_order_release);
+}
+
+std::uint64_t DlnaStreamSession::OldestByte() const noexcept {
+    std::lock_guard lock(mutex_);
+    return produced_ - size_;
+}
+
+std::uint64_t DlnaStreamSession::FrameStartAtOrBefore(
+    std::uint64_t offset) const noexcept {
+    std::lock_guard lock(mutex_);
+    for (auto it = frameStarts_.rbegin(); it != frameStarts_.rend(); ++it) {
+        if (*it <= offset) return *it;
+    }
+    return produced_ - size_;
+}
+
+DlnaStreamSession::Reader DlnaStreamSession::NewLiveReaderAt(
+    std::uint64_t entityOffset, bool& reachable) noexcept {
+    std::lock_guard lock(mutex_);
+    const std::uint64_t oldest = produced_ - size_;
+    // An offset at the live edge is valid: the reader will wait for the next
+    // bytes the producer appends.
+    reachable = entityOffset >= oldest && entityOffset <= produced_;
+    if (!reachable) return Reader(*this, 0, 0);
+    const std::uint64_t readerId = nextReaderId_++;
+    const auto now = GetTickCount64();
+    try {
+        readers_.emplace(readerId, ReaderState{entityOffset, now, now});
+    } catch (...) {
+        return Reader(*this, 0, entityOffset);
+    }
+    readersCreated_.fetch_add(1, std::memory_order_release);
+    ReclaimLocked();
+    return Reader(*this, readerId, entityOffset);
 }
 
 void DlnaStreamSession::MarkRangeRequested() noexcept {
@@ -398,6 +507,8 @@ struct DlnaStreamServer::State final {
     std::thread acceptThread;
     mutable std::mutex sessionsMutex;
     std::map<std::wstring, std::shared_ptr<DlnaStreamSession>> sessions;
+    // Live-mode aliases (see SetAliasSession). Guarded by sessionsMutex.
+    std::map<std::wstring, std::shared_ptr<DlnaStreamSession>> aliases;
 
     void ClientThread(SOCKET client) noexcept;
 };
@@ -437,7 +548,8 @@ std::wstring DlnaStreamServer::ContentType(const PcmFormat& format,
     (void)format;
     // Must agree with the protocolInfo in the DIDL. Renderers advertise and
     // accept the "x-" spelling of FLAC; the registered audio/flac is dropped.
-    return shape == DlnaStreamShape::FlacFile ? L"audio/x-flac" : L"audio/wav";
+    // The live FLAC stream carries the same framing, so it shares the MIME.
+    return shape == DlnaStreamShape::WavFile ? L"audio/wav" : L"audio/x-flac";
 }
 
 bool DlnaStreamServer::Start(const std::wstring& bindAddress, std::uint16_t& port,
@@ -528,6 +640,7 @@ void DlnaStreamServer::Stop() noexcept {
             if (entry.second) entry.second->Abort();
         }
         state->sessions.clear();
+        state->aliases.clear();
     }
     if (state->acceptThread.joinable()) state->acceptThread.join();
 }
@@ -562,12 +675,28 @@ void DlnaStreamServer::RemoveSession(const std::wstring& token) {
     if (removed) removed->Abort();
 }
 
+void DlnaStreamServer::SetAliasSession(const std::wstring& alias,
+                                        const std::shared_ptr<DlnaStreamSession>& session) {
+    if (!state_ || alias.empty() || !session) return;
+    std::lock_guard lock(state_->sessionsMutex);
+    state_->aliases[alias] = session;
+}
+
+void DlnaStreamServer::RemoveAlias(const std::wstring& alias) {
+    if (!state_) return;
+    std::lock_guard lock(state_->sessionsMutex);
+    state_->aliases.erase(alias);
+}
+
 std::shared_ptr<DlnaStreamSession> DlnaStreamServer::FindSession(
     const std::wstring& token) const {
     if (!state_) return {};
     std::lock_guard lock(state_->sessionsMutex);
     const auto found = state_->sessions.find(token);
-    return found == state_->sessions.end() ? nullptr : found->second;
+    if (found != state_->sessions.end()) return found->second;
+    // Live mode: the advertised token is an alias, not the session's own GUID.
+    const auto alias = state_->aliases.find(token);
+    return alias == state_->aliases.end() ? nullptr : alias->second;
 }
 
 void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
@@ -575,6 +704,15 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
     // pushes bytes to the renderer deserves the same treatment, otherwise a
     // busy neighbour can delay send() even though the ring has data ready.
     (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    // A renderer that stops reading must not hold the producer hostage: the
+    // live ring back-pressures the PCM queue, and a wedged send can stall the
+    // runtime's end-of-stream drain. Bound every send.
+    {
+        DWORD sendTimeoutMs = 15000;
+        (void)setsockopt(client, SOL_SOCKET, SO_SNDTIMEO,
+                         reinterpret_cast<const char*>(&sendTimeoutMs),
+                         sizeof(sendTimeoutMs));
+    }
     // Optional socket tuning, OFF by default: enabling it changed how a VEGA
     // G2.2 consumed the stream (it read ~2 s then reset). Kept behind a bitmask
     // so it can be re-tested: 1 = TCP_NODELAY, 2 = 512 KB send buffer,
@@ -678,7 +816,14 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
     {
         std::lock_guard lock(sessionsMutex);
         const auto found = sessions.find(token);
-        if (found != sessions.end()) session = found->second;
+        if (found != sessions.end()) {
+            session = found->second;
+        } else {
+            // Live mode: the advertised token is an alias that points at the
+            // session that should be pulled right now.
+            const auto alias = aliases.find(token);
+            if (alias != aliases.end()) session = alias->second;
+        }
     }
     if (!session) {
         // The renderer asked for a token this process no longer owns. Usually a
@@ -686,7 +831,19 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
         // renderer, so the exact token matters for diagnosis.
         LogDlnaLine(L"http 410 unknown token=" + token +
                     L" path=" + std::wstring(path.begin(), path.end()));
-        const char* response = "HTTP/1.1 410 Gone\r\nConnection: close\r\n\r\n";
+        // A renderer that lost its stream retries the stale URL in a tight
+        // loop: one measured session produced 661 requests for a single token,
+        // all the same "Range: bytes=...-" resume attempt. Answering instantly
+        // turns that into a connection storm, and on AURALiC hardware it has
+        // been enough to reboot the device (SSDP silence for 2-4 minutes right
+        // after such a burst). Answer slowly and advertise a retry delay so a
+        // well-behaved client backs off instead of hammering us.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        const char* response =
+            "HTTP/1.1 410 Gone\r\n"
+            "Retry-After: 10\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n\r\n";
         (void)SendAll(client, response, std::strlen(response));
         closesocket(client);
         return;
@@ -695,6 +852,190 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
     const std::wstring contentType = session->Mime().empty()
         ? DlnaStreamServer::ContentType(session->Format(), session->Shape())
         : session->Mime();
+
+    // ---------------------------------------------------------------------
+    // Live shape: FLAC served close-delimited. Neither Content-Length nor
+    // Transfer-Encoding is written; the response body ends when this side
+    // shuts the socket down after the producer seals the session (end of
+    // track). A clean FIN is the renderer's end-of-item signal, which is
+    // exactly what lets an OpenHome playlist auto-advance across a stable
+    // per-session URL. This is the framing UPnP AV prescribes for
+    // asynchronous pull (AVArchitecture:1 4.2) and the one foo_out_upnp /
+    // AirConnect prefer for realtime PCM. A Range request on a live body is a
+    // request to resume at the live edge, not a request for a finite entity.
+    // ---------------------------------------------------------------------
+    if (session->Shape() == DlnaStreamShape::FlacLive) {
+        // Manual decimal parse: no exceptions may escape this noexcept path.
+        std::uint64_t requested = 0;
+        bool hasRange = false;
+        const auto rangeAt = request.find("Range:");
+        if (rangeAt != std::string::npos) {
+            const auto bytesAt = request.find("bytes=", rangeAt);
+            if (bytesAt != std::string::npos) {
+                std::size_t i = bytesAt + 6;
+                bool any = false;
+                while (i < request.size() && request[i] >= '0' && request[i] <= '9') {
+                    requested = requested * 10 +
+                                static_cast<std::uint64_t>(request[i] - '0');
+                    ++i;
+                    any = true;
+                }
+                hasRange = any;
+            }
+        }
+        std::wstring statusW = L"200 OK";
+        std::wstring contentRangeW;
+        std::uint64_t serveFrom = 0;
+        if (hasRange) {
+            const auto produced = session->ProducedBytes();
+            const auto oldest = session->OldestByte();
+            // Align to a FLAC frame start unless the request is exactly at the
+            // live edge (where the next frame will begin).
+            const auto aligned = requested == produced
+                ? requested : session->FrameStartAtOrBefore(requested);
+            if (requested < oldest || aligned < oldest) {
+                // Never announce a total length: `bytes */<extent>` tells the
+                // renderer the resource is finished, which is precisely the
+                // bug that made it give up. `bytes */*` says only "unknown".
+                const std::string response = "HTTP/1.1 416 Range Not Satisfiable\r\n"
+                    "Content-Range: bytes */*\r\n"
+                    "Content-Length: 0\r\n"
+                    "Connection: close\r\n\r\n";
+                LogDlnaLine(L"http 416-live-range token=" + token +
+                            L" requested=" + std::to_wstring(requested) +
+                            L" oldest=" + std::to_wstring(oldest));
+                (void)SendAll(client, response.data(), response.size());
+                closesocket(client);
+                return;
+            }
+            serveFrom = aligned;
+            statusW = L"206 Partial Content";
+            contentRangeW = L"Content-Range: bytes " +
+                            std::to_wstring(serveFrom) + L"-/*\r\n";
+            LogDlnaLine(L"http 206-live-resume token=" + token +
+                        L" requested=" + std::to_wstring(requested) +
+                        L" from=" + std::to_wstring(serveFrom) +
+                        L" produced=" + std::to_wstring(produced));
+        }
+        std::wstring headerW = L"HTTP/1.1 " + statusW + L"\r\n";
+        headerW += L"Content-Type: " + contentType + L"\r\n";
+        headerW += CommonHeaders();
+        headerW += L"transferMode.dlna.org: Streaming\r\n";
+        headerW += L"contentFeatures.dlna.org: " + session->ContentFeatures() + L"\r\n";
+        headerW += contentRangeW;
+        headerW += L"Connection: close\r\n\r\n";
+        const std::string header = Narrow(headerW);
+        LogDlnaLine(L"http live token=" + token + L" status=" + statusW +
+                    L" type=" + contentType +
+                    L" session=" + session->Token().substr(0, 8));
+        if (!SendAll(client, header.data(), header.size())) {
+            closesocket(client);
+            return;
+        }
+        if (headRequest) {
+            closesocket(client);
+            return;
+        }
+        // Register exactly ONE reader for this connection. A plain GET joins
+        // at the oldest retained byte; a Range resume attaches at the aligned
+        // offset and waits for new bytes when it is at the live edge.
+        std::optional<DlnaStreamSession::Reader> reader;
+        if (hasRange) {
+            bool reachable = false;
+            auto resumed = session->NewLiveReaderAt(serveFrom, reachable);
+            if (!reachable) {
+                closesocket(client);
+                return;
+            }
+            reader.emplace(std::move(resumed));
+        } else {
+            reader.emplace(session->NewLiveReader());
+        }
+        std::uint64_t bytesSent = 0;
+        std::uint64_t chunksSent = 0;
+        const std::uint64_t streamStartTick = GetTickCount64();
+        // Same 1.0x pacing as the file shape: the renderer must not be able
+        // to download a live stream "ahead" faster than it plays.
+        const std::uint64_t pacedBytesPerSecond =
+            static_cast<std::uint64_t>(session->Format().sampleRate) *
+            session->Format().channels * (session->Format().containerBits / 8u);
+        std::uint64_t firstChunkAt = 0;
+        std::vector<BYTE> body(kSendChunkBytes);
+        bool endedByStream = false;
+        while (!stopping.load(std::memory_order_acquire)) {
+            std::size_t written = 0;
+            bool eos = false;
+            if (!reader->Read(body.data(), body.size(), written, eos, 500)) {
+                if (session->Aborted()) break;
+                if (eos) {
+                    endedByStream = true;
+                    break;
+                }
+                continue;
+            }
+            if (written == 0) {
+                // Reader::Read returns true with written == 0 when the ring is
+                // drained AND the producer already sealed the stream (the file
+                // shape parks on this on purpose). Live must close here - the
+                // clean EOF is the end-of-item signal.
+                if (eos) {
+                    endedByStream = true;
+                    break;
+                }
+                continue;
+            }
+            {
+                if (!SendAll(client, body.data(), written)) {
+                    const int wsa = WSAGetLastError();
+                    LogDlnaLine(L"http send failed token=" + token + L" afterBytes=" +
+                                std::to_wstring(bytesSent) + L" wsa=" +
+                                std::to_wstring(wsa));
+                    break;
+                }
+                if (firstChunkAt == 0) {
+                    firstChunkAt = GetTickCount64();
+                    // Stream-header diagnostics: a connection that starts on a
+                    // FLAC frame sync (0xFFF8) instead of "fLaC" attached to a
+                    // ring whose head had already advanced.
+                    // Manual hex: swprintf's size/count overload has bitten
+                    // us with a fast-fail on some CRT builds.
+                    static constexpr wchar_t kHex[] = L"0123456789ABCDEF";
+                    wchar_t hex[9]{};
+                    for (int nibble = 0; nibble < 4; ++nibble) {
+                        hex[nibble * 2] = kHex[(body[nibble] >> 4) & 0xF];
+                        hex[nibble * 2 + 1] = kHex[body[nibble] & 0xF];
+                    }
+                    LogDlnaLine(L"http live first-bytes=" + std::wstring(hex) +
+                                L" token=" + token + L" session=" +
+                                session->Token().substr(0, 8));
+                }
+                bytesSent += written;
+                ++chunksSent;
+                const auto elapsedMs = GetTickCount64() - streamStartTick;
+                const auto allowedBytes =
+                    elapsedMs * pacedBytesPerSecond / 1000u + pacedBytesPerSecond;
+                if (bytesSent > allowedBytes) {
+                    const auto behindMs =
+                        (bytesSent - allowedBytes) * 1000u / pacedBytesPerSecond;
+                    Sleep(static_cast<DWORD>(std::min<std::uint64_t>(behindMs, 500u)));
+                }
+            }
+        }
+        if (endedByStream && !session->Aborted()) {
+            // Half-close: the renderer sees a clean EOF, which the OpenHome
+            // playlist treats as "item finished" and advances to the queued
+            // next item (same URL, now aliased to the next session).
+            (void)shutdown(client, SD_SEND);
+        }
+        LogDlnaLine(L"http stream closed token=" + token + L" bytes=" +
+                    std::to_wstring(bytesSent) + L" firstChunkMs=" +
+                    std::to_wstring(firstChunkAt ? firstChunkAt - streamStartTick : 0) +
+                    L" reason=" + (session->Aborted() ? L"abort" :
+                                    endedByStream ? L"eos" : L"client"));
+        closesocket(client);
+        return;
+    }
+
     // ---------------------------------------------------------------------
     // File-shaped response: WAV with a declared total length and byte ranges.
     //
@@ -853,7 +1194,10 @@ void DlnaStreamServer::State::ClientThread(SOCKET client) noexcept {
                     // move is to stop feeding it and leave the socket alone:
                     // the next track arrives as a new URL and replaces this
                     // one. Closing here would surface as a network error.
+                    // Park politely: without this pause the loop spins at
+                    // 100% CPU until the runtime closes the sink.
                     endedByStream = true;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
                 continue;
             }

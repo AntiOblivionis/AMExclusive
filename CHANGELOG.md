@@ -6,6 +6,148 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.6-preview] - 2026-11-07
+
+### Added
+
+- **Selectable transport modes for network playback.** The panel's stream
+  selector now offers three modes, persisted as `[dlna] stream_format`:
+  - `wav` / `flac-file` — the existing file-shaped streams, unchanged. Both
+    remain the default and the universal fallback.
+  - `live` — a close-delimited FLAC live stream: real FLAC frames with
+    `STREAMINFO total_samples = 0`, **no** `Content-Length` and **no**
+    `Transfer-Encoding`, served over **one stable URL for the whole listening
+    session**. Each track boundary closes the connection cleanly, which an
+    OpenHome playlist treats as end-of-item and auto-advances (the alias is
+    re-pointed at the next track's ring, so the address never expires). Range
+    is not advertised (`DLNA.ORG_OP=00`), the DIDL item is
+    `object.item.audioItem.audioBroadcast`, and a late/reconnecting GET attaches
+    at the oldest retained byte instead of being refused. This removes the
+    stale-URL 410 storm class of failure at the root, and matches the framing
+    foo_out_upnp and AirConnect prefer for realtime PCM. Verified playing on a
+    VEGA G2.2 (`Playlist.TransportState = Playing`, stable pull).
+    Track boundaries are switched by the control point itself
+    (`Playlist.Insert` + `Playlist.SeekId`): a live body has no length, so the
+    renderer would otherwise never advance, and closing it produces a resume
+    Range rather than an end-of-item. Metadata, duration and sample rate are
+    therefore correct per track; the previous session is retired for 5 s and
+    then aborted, so the renderer can finish moving without seeing a reset.
+- `DlnaTarget` now carries `openHomeProduct` (and `openHomeReceiver`, unused
+  after the Songcast removal); the control client gained Product
+  (`SourceXml`/`SourceIndex`/`SetSourceIndex`) and Receiver actions.
+- `DlnaStreamServer` gained live-mode aliases (`SetAliasSession` /
+  `RemoveAlias`) and a close-delimited response path; `DlnaStreamSession`
+  gained `NewLiveReader` for late joiners.
+
+### Changed
+
+- `DlnaStreamShape` gained `FlacLive`; FLAC file and live shapes now share the
+  encoder path (the live shape simply omits the fixed total).
+- A leftover `stream_format=songcast` in an old ini is treated as `wav`.
+
+### Fixed
+
+- **Track boundaries no longer produce EOFs or resets at all.** The live
+  stream is never sealed at a track end: LightningPlayer treats an EOF as a
+  broken connection and resumes with `Range: bytes=<end>-`, which either wedges
+  the stream or makes it give up. `EndOfStreamComplete` is now a bookkeeping
+  event for the runtime (2 s grace, never waiting on the renderer to drain),
+  and a live `Close` keeps the HTTP server and alias alive across the runtime's
+  Close+Open, so a format change produces a new playlist item instead of a
+  reset. Retired sessions are still aborted after 5 s, and switching back to a
+  file shape cleans them up. Regression-tested end to end.
+- **Live + `Range` wedged the stream (and blocked the next format change).**
+  After a reconnect LightningPlayer sends `Range: bytes=<n>-`. A live body has
+  no finite representation, so answering 200 from the current head made the
+  device stop reading and hold the connection: the ring filled, the producer
+  back-pressured, and the runtime's end-of-stream drain never completed, so a
+  pending 192 kHz rebind was never applied (third track silent). Live now
+  answers `416` with `Content-Range: bytes */<current extent>`, which makes the
+  renderer re-GET from the start; every send also has a 15 s timeout so a
+  non-reading peer cannot pin the producer. Verified: 416 -> re-GET -> `fLaC`
+  from byte 0 -> full track.
+- **The start of a live track was being eaten.** LightningPlayer probes by
+  reading ~128 KB *at stream rate* (about 3.3 s at 320 kbps) and then reconnects;
+  that probe's cursor advanced the ring's retained head, so the real GET started
+  after the probe bytes. No reclaim now happens during a reader's first five
+  seconds, so the real GET always begins at byte 0. Verified end to end with a
+  simulated probe: every one of four consecutive tracks starts with `fLaC` and
+  delivers the full entity.
+- **Live track changes are queued promptly.** The SMTC metadata wait at a track
+  boundary is capped at 300 ms for live (500 ms for the title-change poll)
+  instead of 2.5-3 s: a live stream ends with a clean EOF, so the renderer's own
+  buffer is the only cover while the next playlist item is being inserted.
+
+### Removed
+
+- **Songcast (OHU push) experimental mode.** It was implemented and tested, but
+  the VEGA G2.2 firmware on hand advertises `Receiver:1` while `ProtocolInfo` is
+  empty, `SetSender` hangs (both `ohu://` and `ohm://`), no Join/Listen is ever
+  sent, and probing restarts the device's UPnP service (port change / HTTP 502).
+  With no working receiver to validate against, the mode, its `OhuSender`
+  implementation and the panel entry were removed rather than shipped broken.
+
+### Verified
+
+- Release build clean for hook / audiohost / UI / DLNA self test.
+- Protocol-level self test against a local OpenHome renderer: `live` returns
+  200 with `audio/x-flac`, no Content-Length, no chunked encoding,
+  `contentFeatures` `OP=00`, start byte `fLaC` after a probe, and a clean EOF
+  (`reason=eos`) after the track; `wav` and `flac-file` still pass unchanged.
+- Four consecutive live tracks (4 s each, 5 s pull buffer, 1.0x realtime source)
+  auto-advanced through Playlist.Insert with no fallback: four distinct session
+  GUIDs, every track starting at `fLaC`, full byte count, clean EOF.
+- **P0 fix - ring reclaim deadlock.** A renderer that stops reading used to
+  leave `ReclaimLocked()` with no active reader, so `Append()` waited forever
+  on a full ring: capture froze, `AdvanceToNextTrack()` was never reached and
+  `Stop()`'s `JoinProducer()` hung. `Append()` now drops the oldest bytes for
+  live sessions when no reader is active (broadcast semantics) and honours a
+  cancellable flag. `Stop()` requests cancellation, tries a 1 s graceful join,
+  and only then aborts and joins again. `ProducerMain` signals its exit through
+  a condition variable; `ResetAppendCancel()` clears the flag on resume.
+- **P1 fix - live-edge `Range`.** `416` with `bytes */<extent>` declared the
+  resource finished and made the renderer give up. A range whose offset is at
+  `produced` now attaches a reader that waits for new bytes; an offset inside
+  the retained window is aligned down to a recorded FLAC frame start and
+  answered `206` with `Content-Range: bytes <start>-/*` and no Content-Length.
+  An offset behind the window gets `416` with `bytes */*`. Each connection
+  registers exactly one reader and the range is parsed without exceptions.
+- **P2 fix -** file-shape EOS parking sleeps 50 ms instead of spinning;
+  `Close()` and `SetupStream()` prune expired retired sessions, so rings and
+  alias tokens no longer accumulate after the producer exits.
+- **Reproduction harness.** `tools/dlna_reconnect_renderer.py` mimics
+  LightningPlayer: 128 KB probe, real GET, deliberate close at N bytes, then
+  `Range: bytes=<received>-`. On the unfixed build a 45 s test hit the deadlock
+  (`timeout` 124); after the fixes the same test PASSes with `206` at the
+  aligned frame boundary and continues to EOF. Basic wav/live/multi-track
+  regressions also pass with no BEX64.
+- **AM playlist simulation.** `tools/run_am_playlist_sim.py` plus the
+  `playlist` mode of `DlnaSelfTest.cpp` reproduce Apple Music's real behaviour:
+  per-track decode format, 1.0x PCM, EOF -> Stop+Close -> re-Open of the SAME
+  sink, and an OpenHome DeleteAll on graph teardown. A 44.1/16 -> 192/24 run
+  PASSes: renderer STREAMINFO reads 44100/16 then 192000/24, both tracks get a
+  frame-aligned `206` resume, one stable URL/alias across the format change,
+  no 416, no deadlock, no BEX64.
+- **P0 fix - format-change rebind (confirmed on real hardware).** A
+  44.1/16 -> 192/24 playlist used to leave the second track silent: the
+  runtime's `FinalizeEndOfStreamDrainLocked()` waited forever on
+  `coordinator_.EndOfStreamComplete()` because a live session is never sealed
+  and Apple tears down the graph without delivering a decoder `S_FALSE`.
+  `graphBound_` stayed true, so `TryBindPendingGraphLocked()` never applied the
+  192 kHz successor. The drain now has a 3 s deadline; a real two-track replay
+  shows `finalize-run` -> `pending-apply` -> `bound a=192000`, a new
+  `open device rate=192000 bits=24` and continuous capture to track end.
+  Lightweight `v2 rebind` diagnostics are emitted at rebind decision points.
+- **Still open:** the 416 branch (`offset < oldest`) has not been exercised by
+  the harness; the "32 MiB renderer read-buffer ceiling" hypothesis is
+  unproven (two observed counts differ by 1.9 MB); real-device 44.1 -> 192
+  playback has not been retested.
+- Rate matrix, verified by parsing STREAMINFO from the delivered stream:
+  `44100/16`, `96000/24` and `192000/24` each deliver the requested rate and
+  depth, start at `fLaC`, and end cleanly. A sequential 44.1 -> 96 change
+  (separate sink opens, as the runtime does on a format change) works the same
+  way at both rates.
+
 ## [0.4.5] - 2026-11-06
 
 ### Fixed

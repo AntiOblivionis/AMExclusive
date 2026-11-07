@@ -76,6 +76,22 @@ public:
     bool OpenHomeInfo(const DlnaTarget& target, std::vector<upnp::SoapValue>& values,
                       std::wstring& error) noexcept;
 
+    // OpenHome Receiver / Product: the Songcast path. Receiver drives a
+    // Songcast receiver source (SetSender + Play/Stop); Product selects the
+    // source slot so the device actually listens to our OHU endpoint.
+    bool OpenHomeReceiverSetSender(const DlnaTarget& target, const std::wstring& uri,
+                                   const std::wstring& metadata, std::wstring& error) noexcept;
+    bool OpenHomeReceiverPlay(const DlnaTarget& target, std::wstring& error) noexcept;
+    bool OpenHomeReceiverStop(const DlnaTarget& target, std::wstring& error) noexcept;
+    bool OpenHomeReceiverTransportState(const DlnaTarget& target, std::wstring& state,
+                                         std::wstring& error) noexcept;
+    bool OpenHomeProductSourceXml(const DlnaTarget& target, std::wstring& xml,
+                                  std::wstring& error) noexcept;
+    bool OpenHomeProductSourceIndex(const DlnaTarget& target, std::uint32_t& index,
+                                     std::wstring& error) noexcept;
+    bool OpenHomeProductSetSourceIndex(const DlnaTarget& target, std::uint32_t index,
+                                       std::wstring& error) noexcept;
+
     static std::wstring HostFromLocation(const std::wstring& location);
     static std::wstring ProtocolInfoFor(DlnaStreamShape shape, const PcmFormat& format,
                                         bool converted);
