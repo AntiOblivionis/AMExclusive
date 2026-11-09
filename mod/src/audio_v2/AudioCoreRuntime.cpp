@@ -4,6 +4,7 @@
 #include "../AudioFormatPolicy.h"
 
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <cmath>
 
@@ -23,7 +24,12 @@ constexpr std::uint32_t kReferenceTimePerSecond = 10000000u;
 // (ten queue blocks); 64 slots were therefore exhausted before OpenEndpoint
 // could mark the generation prebuffered. Keep enough bounded storage for the
 // observed cold-start burst without making the decoder callback wait.
-constexpr std::size_t kProductionQueueCapacity = 256;
+// 256 blocks hold 524,288 frames: only 2.73 s at 192 kHz, less than
+// the default 3 s DLNA activation reservoir (576,000 frames). That made
+// TryActivateLocked() wait forever before any 192 kHz DLNA session existed.
+// 512 blocks cover 5.46 s at 192 kHz; the usable-capacity clamp below also
+// prevents oversized custom buffer_ms values from creating the same deadlock.
+constexpr std::size_t kProductionQueueCapacity = 512;
 
 constexpr std::uint64_t NativePumpLowWaterFrames(std::uint32_t sampleRate) noexcept {
     return (static_cast<std::uint64_t>(sampleRate) * 3u) / 10u;
@@ -435,11 +441,35 @@ void AudioCoreRuntime::OnTransportPlaybackState(std::uint64_t revision, bool pla
 
 void AudioCoreRuntime::OnTransportSelectionArm(std::uint64_t epoch) noexcept {
     if (!UiEnabled() || epoch == 0) return;
+    ControlScope lock(*this);
     directSelectionSkipEpoch_.store(0, std::memory_order_release);
     directSelectionArmGeneration_.store(
         boundMediaGeneration_.load(std::memory_order_acquire), std::memory_order_release);
     directSelectionArmEpoch_.store(epoch, std::memory_order_release);
     directSelectionArmDeadlineTick_.store(GetTickCount64() + 750, std::memory_order_release);
+
+    // Ported from 0.4.7 (the "pause, then pick another track" silence fix).
+    // Clicking another row while paused can emit ONLY selection_arm: there is
+    // no Play intent, no playback snapshot, and on a single click no "skip".
+    // The old userPauseIntent_ is generation-scoped but survives Apple's pause
+    // teardown, so TryActivateLocked() keeps returning before OpenEndpoint().
+    // The new track stays Bound with no network session, the renderer never
+    // gets a GET, and the generation eventually faults with E_UNEXPECTED
+    // ("exclusive output failed" in the broker dialog).
+    // A row selection is enough to retire that pause: opening the stream still
+    // requires a started native graph and a filled prebuffer, so an item that
+    // is merely highlighted cannot produce sound.
+    if (userPauseIntent_) {
+        userPauseIntent_ = false;
+        nativeStartedAfterUserPause_ = false;
+        resumePrebufferPending_ = false;
+        resumeProducerPending_ = false;
+        trackChangePending_ = true;
+        RebindDiag(callbacks_, L"selection-revoke-pause", epoch,
+                   reinterpret_cast<std::uintptr_t>(graphConverter_),
+                   static_cast<std::uint64_t>(coordinator_.Phase()), 1);
+        Wake();
+    }
 }
 
 void AudioCoreRuntime::OnTransportSkipArm(std::uint64_t epoch) noexcept {
@@ -1849,6 +1879,11 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
             pendingGraphBind_ = {graphUnit_, graphConverter_, snapshot.registration.observationId,
                                  snapshot.registrationId};
             ArmPendingCaptureLocked(snapshot);
+            // v8: the 35 s diagnostic delay is only for a true final track.
+            // A registered successor may arrive either before or after the old
+            // sink enters that delay. Cancel it in both cases so the bounded
+            // pending PCM reservoir is not exhausted while the old EOS waits.
+            coordinator_.CancelNaturalEndOfStreamDelayForSuccessor();
             RebindDiag(callbacks_, L"defer-pending-set", graphRate_,
                        reinterpret_cast<std::uintptr_t>(graphConverter_), reinterpret_cast<std::uintptr_t>(boundConverter_.load(std::memory_order_acquire)),
                        endOfStreamDrainPending_, streamingProducerDrainPending_,
@@ -1873,14 +1908,27 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
         return;
     }
 
-    // A track change must reopen the stream even when Apple reuses the same
-    // converter for the next song: the DLNA sink's previous session is already
-    // finished, so keeping the old graph would leave the renderer silent.
-    if (graphBound_ && boundConverter_.load(std::memory_order_acquire) == graphConverter_ &&
-        !trackChangePending_) {
-        RebindDiag(callbacks_, L"skip-same-bound", graphRate_,
-                   reinterpret_cast<std::uintptr_t>(graphConverter_), trackChangePending_);
-        return;
+    // A track change must reopen the stream when Apple reuses the same
+    // converter after the previous session has finished. A successor decoder
+    // can also be prepared while the current live session is still active;
+    // reopening then aborts audible PCM and immediately starts a new URL.
+    if (graphBound_ && boundConverter_.load(std::memory_order_acquire) == graphConverter_) {
+        if (!trackChangePending_) {
+            RebindDiag(callbacks_, L"skip-same-bound", graphRate_,
+                       reinterpret_cast<std::uintptr_t>(graphConverter_), trackChangePending_);
+            return;
+        }
+        if (outputKind_ == AudioSinkKind::Dlna &&
+            coordinator_.Phase() == AudioCoreGatePhase::Active &&
+            !coordinator_.EndOfStreamSubmitted()) {
+            // Keep the notification pending. A real Stop/seek/graph takeover
+            // retires through its existing path; natural EOS drains first and
+            // FinalizeEndOfStreamDrainLocked() rearms this same-converter bind.
+            RebindDiag(callbacks_, L"defer-active-track-change", graphRate_,
+                       reinterpret_cast<std::uintptr_t>(graphConverter_),
+                       reinterpret_cast<std::uintptr_t>(boundConverter_.load(std::memory_order_acquire)));
+            return;
+        }
     }
 
     if (pendingCaptureOwner_ && callbacks_.tryAcquireProducer && !pendingProducerLeaseHeld_) {
@@ -2024,6 +2072,14 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
         requiredPrebufferFrames_ = std::max<std::uint32_t>(
             requiredPrebufferFrames_,
             static_cast<std::uint32_t>(std::min<std::uint64_t>(networkFrames, 4000000u)));
+        // Never gate activation on more frames than the SPSC queue can hold.
+        // Leave 16 blocks of headroom for a Fill that arrives during handoff.
+        const auto usableBlocks = queueCapacity > 16u ? queueCapacity - 16u : 1u;
+        const auto usableFrames = std::min<std::uint64_t>(
+            usableBlocks * static_cast<std::uint64_t>(kMaxBlockFrames),
+            std::numeric_limits<std::uint32_t>::max());
+        requiredPrebufferFrames_ = std::min<std::uint32_t>(
+            requiredPrebufferFrames_, static_cast<std::uint32_t>(usableFrames));
     }
     const auto rate = static_cast<std::uint64_t>(format.sampleRate);
     if (outputKind_ == AudioSinkKind::Dlna) {
@@ -2246,8 +2302,12 @@ void AudioCoreRuntime::FinalizeEndOfStreamDrainLocked() noexcept {
     // audio graph without ever delivering S_FALSE, so the sink may never
     // report completion. Bound the wait so a pending format-change rebind can
     // still be applied (otherwise the whole second track stays silent).
+    // v7 diagnostic: DlnaSink holds natural live EOS for 35 s after the FLAC
+    // tail. Do not retire that session through the old 3 s fallback before the
+    // delayed EOS is submitted. Other outputs retain their original timeout.
+    const auto drainTimeoutMs = outputKind_ == AudioSinkKind::Dlna ? 45000u : 3000u;
     const bool timedOut = endOfStreamDrainStartTick_ != 0 &&
-                          now - endOfStreamDrainStartTick_ > 3000;
+                          now - endOfStreamDrainStartTick_ > drainTimeoutMs;
     if (!complete && !timedOut) {
         if (now >= nextFinalizeDiagTick_) {
             nextFinalizeDiagTick_ = now + 1000;

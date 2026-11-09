@@ -542,11 +542,20 @@ bool DlnaSink::SetupStream() noexcept {
     // and are appended to the next session, so the renderer hears an
     // unbroken stream no matter how accurate the SMTC length was.
     sessionFramesProduced_ = 0;
-    const auto boundaryMs = trackDurationMsExact_ != 0
-        ? static_cast<std::uint64_t>(trackDurationMsExact_)
-        : static_cast<std::uint64_t>(streamSeconds_) * 1000ull;
-    trackFramesExact_ = boundaryMs * format_.sampleRate / 1000ull;
-    if (trackFramesExact_ == 0) trackFramesExact_ = 1;
+    if (shape_ == DlnaStreamShape::FlacLive && trackDurationMsExact_ == 0) {
+        // With follow_track_duration=0 there is no real per-track boundary.
+        // stream_seconds is only a fallback declaration length, not a reason
+        // to reconnect a close-delimited live stream every 30 minutes. Keep
+        // the session continuous until a graph change or the real source EOF.
+        trackFramesExact_ = 0;
+        DlnaLog(L"live fixed-duration rollover disabled");
+    } else {
+        const auto boundaryMs = trackDurationMsExact_ != 0
+            ? static_cast<std::uint64_t>(trackDurationMsExact_)
+            : static_cast<std::uint64_t>(streamSeconds_) * 1000ull;
+        trackFramesExact_ = boundaryMs * format_.sampleRate / 1000ull;
+        if (trackFramesExact_ == 0) trackFramesExact_ = 1;
+    }
     // The HTTP reader thread and the producer both walk this ring; pinning it
     // keeps either of them from taking a page fault mid-transfer.
     DlnaLog(L"stream ring=" + std::to_wstring(capacity / 1024u) + L"KB locked=" +
@@ -750,6 +759,7 @@ bool DlnaSink::WaitForFirstGet(std::uint32_t timeoutMs) noexcept {
 
 HRESULT DlnaSink::Open(const AudioSinkOpenParams& params) noexcept {
     Close();
+    naturalEosDelayCancel_.store(false, std::memory_order_release);
     if (!IsValidFormat(params.format)) return E_INVALIDARG;
     // [dlna] pcm_byte_order=little is a compatibility escape hatch for
     // renderers that ignore RFC 3551/3190. Anything else keeps big-endian.
@@ -1177,15 +1187,10 @@ void DlnaSink::ProducerMain() noexcept {
         }
         if (prepared == S_FALSE) {
             waitingForSource_.store(false, std::memory_order_release);
-            FlushEncoderTail();
-            if (shape_ != DlnaStreamShape::FlacLive) {
-                (void)session_->Append(nullptr, 0, true);
-            }
-            // Live: no EOF at a track boundary. Closing would make the
-            // renderer resume with a Range instead of accepting the next
-            // playlist item; the runtime closes/reopens the sink itself.
-            endOfStreamSubmitted_.store(true, std::memory_order_release);
-            endOfStreamTick_.store(GetTickCount64(), std::memory_order_release);
+            // This is a real source EOF, not AdvanceToNextTrack's metadata-
+            // driven live switch. The v6 helper retains the clean FlacLive EOS
+            // and adds only a diagnostic delay after the FLAC tail.
+            SubmitNaturalEndOfStreamDelayed();
             break;
         }
         if (FAILED(prepared)) {
@@ -1245,12 +1250,8 @@ void DlnaSink::ProducerMain() noexcept {
         }
         if (failed) break;
         if (eos) {
-            FlushEncoderTail();
-            if (shape_ != DlnaStreamShape::FlacLive) {
-                (void)session_->Append(nullptr, 0, true);
-            }
-            endOfStreamSubmitted_.store(true, std::memory_order_release);
-            endOfStreamTick_.store(GetTickCount64(), std::memory_order_release);
+            // Fill-reported EOS is the same terminal path as S_FALSE above.
+            SubmitNaturalEndOfStreamDelayed();
             break;
         }
     }
@@ -1308,6 +1309,76 @@ void DlnaSink::FlushEncoderTail() noexcept {
     (void)session_->Append(tail.data(), tail.size(), false);
 }
 
+void DlnaSink::SubmitNaturalEndOfStreamDelayed() noexcept {
+    if (!session_) return;
+    FlushEncoderTail();
+    const bool live = shape_ == DlnaStreamShape::FlacLive;
+    // File shapes (wav / flac-file) are sealed BEFORE the wait. Declaring the
+    // terminal block is what tells the renderer the entity ends here; it can
+    // then play out the buffer it already holds while we keep the session - and
+    // its TCP connection - alive. live must not seal early: a close-delimited
+    // stream that ends is exactly what makes the renderer stop, so it is sealed
+    // only after the wait.
+    //
+    // Before this change the wait existed only on the live path, so wav and
+    // flac-file submitted EOS and let the runtime retire immediately: the
+    // renderer lost whatever its own buffer still held.
+    if (!live) {
+        (void)session_->Append(nullptr, 0, true);
+        endOfStreamSubmitted_.store(true, std::memory_order_release);
+        endOfStreamTick_.store(GetTickCount64(), std::memory_order_release);
+    }
+    // All encoded audio, including the final partial FLAC block, has already
+    // been appended before this wait. Keeping the HTTP session open lets the
+    // renderer consume more of its internal tail buffer before it sees EOS. No
+    // PCM is inserted, removed, delayed or resampled.
+    // v8: as soon as a successor is pending, shorten only the wait and still
+    // submit a natural EOS so the rebind can run. A manual stop still cancels
+    // the wait outright - but only a real stop does: see Stop(), which now waits
+    // for this hold instead of cancelling it on every runtime retirement.
+    constexpr std::uint64_t kDiagnosticDelayMs = 35000;
+    const auto beginTick = GetTickCount64();
+    naturalEosHoldDeadlineTick_.store(beginTick + kDiagnosticDelayMs,
+                                      std::memory_order_release);
+    naturalEosHold_.store(true, std::memory_order_release);
+    bool successorPending = naturalEosDelayCancel_.load(std::memory_order_acquire);
+    if (successorPending) {
+        DlnaLog(std::wstring(L"natural EOS hold skipped for pending successor live=") +
+                (live ? L"1" : L"0"));
+    } else {
+        DlnaLog(std::wstring(L"natural EOS hold begin ms=35000 live=") +
+                (live ? L"1" : L"0"));
+    }
+    const auto deadline = beginTick + kDiagnosticDelayMs;
+    while (!successorPending && GetTickCount64() < deadline) {
+        if (producerStop_.load(std::memory_order_acquire)) {
+            DlnaLog(L"natural EOS hold cancelled by manual stop");
+            naturalEosHold_.store(false, std::memory_order_release);
+            return;
+        }
+        Sleep(25);
+        successorPending = naturalEosDelayCancel_.load(std::memory_order_acquire);
+    }
+    naturalEosHold_.store(false, std::memory_order_release);
+    if (producerStop_.load(std::memory_order_acquire)) {
+        DlnaLog(L"natural EOS hold cancelled by manual stop");
+        return;
+    }
+    if (live) {
+        (void)session_->Append(nullptr, 0, true);
+        endOfStreamSubmitted_.store(true, std::memory_order_release);
+        endOfStreamTick_.store(GetTickCount64(), std::memory_order_release);
+    }
+    const auto submittedTick = GetTickCount64();
+    if (successorPending) {
+        DlnaLog(L"natural EOS released early for successor after ms=" +
+                std::to_wstring(submittedTick - beginTick));
+    } else {
+        DlnaLog(L"natural EOS hold finished after ms=" +
+                std::to_wstring(submittedTick - beginTick));
+    }
+}
+
 bool DlnaSink::JoinProducer(std::uint32_t gracefulMs) noexcept {
     if (!producer_.joinable()) return true;
     if (gracefulMs != 0) {
@@ -1340,25 +1411,69 @@ void DlnaSink::Pause() noexcept {
 }
 
 void DlnaSink::Stop() noexcept {
-    producerStop_.store(true, std::memory_order_release);
     producerPaused_.store(false, std::memory_order_release);
+    // A natural end may still be inside its hold. Cancelling that hold on a
+    // runtime retirement is what cut the tail of every track: the retirement
+    // fires as soon as Apple tears the graph down, which is exactly when the
+    // renderer still has its own buffer left to play. Let the hold finish; a
+    // pending successor releases it within one 25 ms tick, so this only waits
+    // for as long as the wait itself would have run.
+    // A retirement that lands while a natural end is in progress must behave
+    // exactly like a natural end: no transport Stop and no Abort. Otherwise the
+    // wait below delays this Stop by up to 8 s, the next track opens and plays
+    // in the meantime, and this late Stop then lands on the NEW session and
+    // silences the device (observed: transport STOPPED while the body was still
+    // streaming at full rate).
+    const bool naturalEndInProgress =
+        naturalEosHold_.load(std::memory_order_acquire) != false;
+    if (naturalEosHold_.load(std::memory_order_acquire)) {
+        const auto holdDeadline =
+            naturalEosHoldDeadlineTick_.load(std::memory_order_acquire);
+        // Never inherit the whole 35 s here: this runs on the runtime worker, and
+        // blocking it for half a minute would also block the successor
+        // registration that is supposed to release the hold. The renderer trails
+        // playback by a few seconds, so a bounded wait is what the tail needs -
+        // and a track change stays responsive.
+        constexpr std::uint64_t kStopHoldWaitMs = 8000;
+        const auto waitUntil = std::min<std::uint64_t>(
+            holdDeadline, GetTickCount64() + kStopHoldWaitMs);
+        while (naturalEosHold_.load(std::memory_order_acquire) &&
+               GetTickCount64() < waitUntil) {
+            Sleep(25);
+        }
+    }
+    producerStop_.store(true, std::memory_order_release);
+    const bool naturalEos = endOfStreamSubmitted_.load(std::memory_order_acquire) ||
+                            naturalEndInProgress;
     // Wake a producer blocked in Append WITHOUT aborting the session first:
     // live connections must see the next playlist item rather than an RST.
     // If the producer still does not exit within a second, abort the session
     // (producer only honours aborted_ / appendCancelled_) and join again.
     if (session_) {
         if (shape_ != DlnaStreamShape::FlacLive) {
-            session_->Abort();
+            // Never reset a connection that has already delivered its whole
+            // entity: the renderer may still be collecting the tail, and an
+            // Abort turns those reads into an empty 206 it gives up on - the
+            // audible "cut just before the end".
+            if (!naturalEos) session_->Abort();
         } else {
             session_->RequestAppendCancel();
         }
     }
     if (!JoinProducer(1000)) {
-        if (session_) session_->Abort();
+        if (session_ && !naturalEos) session_->Abort();
         JoinProducer();
     }
     std::wstring error;
-    if (!target_.avTransportControl.empty()) {
+    if (naturalEos) {
+        // The producer has already flushed the FLAC tail and sealed the live
+        // session. Runtime retirement calls Stop/Close after native stop; an
+        // additional OpenHome Stop here can discard audio still buffered by
+        // the renderer. Let the renderer consume that tail and finish on EOS.
+        // Manual stop/pause, track switches and format changes never set this
+        // flag, so their transport-control behaviour remains unchanged.
+        DlnaLog(L"natural EOS: transport stop suppressed");
+    } else if (!target_.avTransportControl.empty()) {
         (void)control_.Stop(target_, error);
     } else if (!target_.openHomeTransport.empty()) {
         (void)control_.OpenHomeStop(target_, error);

@@ -552,7 +552,7 @@ bool Install(HMODULE media, HMODULE foundation, LogFunction log) {
     typeId = reinterpret_cast<decltype(typeId)>(GetProcAddress(foundation, "CFGetTypeID"));
     arrayTypeId = reinterpret_cast<decltype(arrayTypeId)>(GetProcAddress(foundation, "CFArrayGetTypeID"));
     dataTypeId = reinterpret_cast<decltype(dataTypeId)>(GetProcAddress(foundation, "CFDataGetTypeID"));
-    arrayCallbacks = GetProcAddress(foundation, "kCFTypeArrayCallBacks");
+    arrayCallbacks = reinterpret_cast<const void*>(GetProcAddress(foundation, "kCFTypeArrayCallBacks"));
     auto target = reinterpret_cast<void*>(GetProcAddress(media, "FigSimpleAlternateFilterCreate"));
     if (!maxSampleRate || !arrayCreate || !arrayValue || !arrayCount || !dataCreate ||
         !dataSetLength || !dataBytes || !dataLength ||

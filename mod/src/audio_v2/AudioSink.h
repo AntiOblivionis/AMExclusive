@@ -252,6 +252,9 @@ public:
     virtual bool EndOfStreamSubmitted() const noexcept = 0;
     virtual bool EndOfStreamComplete() const noexcept = 0;
     virtual void SetResumeBlocked(bool blocked) noexcept = 0;
+    // Only the DLNA live diagnostic tail delay uses this. Other outputs have
+    // no such wait, so their default remains a no-op.
+    virtual void CancelNaturalEndOfStreamDelayForSuccessor() noexcept {}
 };
 
 } // namespace ammod::audio_v2

@@ -53,6 +53,9 @@ public:
     }
     bool EndOfStreamComplete() const noexcept override;
     void SetResumeBlocked(bool blocked) noexcept override { (void)blocked; }
+    void CancelNaturalEndOfStreamDelayForSuccessor() noexcept override {
+        naturalEosDelayCancel_.store(true, std::memory_order_release);
+    }
 
 private:
     bool BuildFormatCandidates(const std::wstring& sinkProtocolInfo) noexcept;
@@ -69,6 +72,10 @@ private:
     // this loses up to one block (4096 frames) of audio, and a decoder that
     // checks frame continuity may reject the tail outright.
     void FlushEncoderTail() noexcept;
+    // v6/v7 diagnostic: keep a naturally ending live session open after the
+    // FLAC tail, then submit EOS. Manual Stop cancels EOS submission; v8 lets a
+    // waiting successor shorten only the delay, with natural EOS still sealed.
+    void SubmitNaturalEndOfStreamDelayed() noexcept;
     // Returns false if the producer did not exit within gracefulMs.
     bool JoinProducer(std::uint32_t gracefulMs = 0) noexcept;
     void RecordError(HRESULT error) noexcept;
@@ -172,6 +179,15 @@ private:
     std::condition_variable producerExitCv_;
     bool producerExited_{false};
     std::atomic<bool> producerStop_{false};
+    // Set by the runtime as soon as a real successor is pending. This releases
+    // only the natural-end wait; unlike producerStop_, it must still submit EOS.
+    std::atomic<bool> naturalEosDelayCancel_{false};
+    // True while the producer is inside the natural-end wait. Stop() polls this
+    // so a runtime retirement cannot cancel the wait at the exact moment the
+    // renderer still has audio buffered - that cancellation is what used to cut
+    // the tail of every track, on every stream shape.
+    std::atomic<bool> naturalEosHold_{false};
+    std::atomic<std::uint64_t> naturalEosHoldDeadlineTick_{0};
     std::atomic<bool> producerPaused_{false};
     std::atomic<bool> startedOnce_{false};
     std::atomic<bool> waitingForSource_{false};

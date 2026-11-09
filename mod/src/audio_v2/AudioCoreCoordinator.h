@@ -154,6 +154,9 @@ public:
     bool EndOfStreamComplete() const noexcept {
         return sink_ && sink_->EndOfStreamComplete();
     }
+    void CancelNaturalEndOfStreamDelayForSuccessor() noexcept {
+        if (sink_) sink_->CancelNaturalEndOfStreamDelayForSuccessor();
+    }
 
 private:
     bool PushResult(bool pushed, std::uint32_t frames) noexcept;

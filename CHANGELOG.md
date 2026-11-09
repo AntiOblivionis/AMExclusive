@@ -6,6 +6,34 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.8] - 2026-11-09
+
+### Fixed
+
+- **DLNA tail cut at a natural end.** On a natural end the runtime no longer sends
+  a transport Stop, and an already-complete session is no longer aborted: both used
+  to happen the moment Apple tore the graph down, which is exactly when the renderer
+  still had a few seconds buffered. The natural-end hold now runs for every stream
+  shape (wav, flac-file and live - it used to be live-only), and a pending successor
+  releases it within one 25 ms tick. `DlnaSink::Stop` waits for an in-flight hold
+  (capped at 8 s) instead of cancelling it, and a retirement that lands inside that
+  window is treated as a natural end so a late Stop can never hit the next session.
+- **Silence after "pause, then pick another track".** Clicking another row while
+  paused emits only `selection_arm` - no Play intent, no playback snapshot and, on a
+  single click, no skip. `OnTransportSelectionArm` now revokes `userPauseIntent_`,
+  clears the resume pendings and sets `trackChangePending_`, so activation runs
+  again. Before this, `TryActivateLocked` returned early forever, no network session
+  was opened, and the generation faulted with `E_UNEXPECTED` (shown as
+  "exclusive output failed"). Ported from 0.4.7.
+
+### Notes
+
+- Baseline for this release is the 0.4.6 tree. Roon/RAAT from the 0.4.7 line is
+  **not** part of 0.4.8.
+- `live` (chunked, no declared length) is still not accepted by
+  LightningPlayer-class renderers; the hold exists for that path but those devices
+  disconnect first, so `wav` / `flac-file` remain the supported shapes.
+
 ## [Unreleased]
 
 ### Changed
