@@ -28,6 +28,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Upstream acknowledgement.** The README now thanks the original author
+  [AntiOblivionis](https://github.com/AntiOblivionis) and the upstream project in both the
+  致谢 and Acknowledgements sections, and the repository description says the same.
 - **Donation codes.** `assets/donate-wechat.png` (WeChat reward code) and
   `assets/donate-alipay.jpg` (Alipay QR) are published in a new 打赏支持 / Donations
   section; clicking a code opens the full-size image in GitHub's image

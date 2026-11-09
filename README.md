@@ -160,6 +160,13 @@ mod\build\dist\AMExclusive-Setup.exe
 
 ### 致谢
 
+本项目的起点和主要代码基础来自上游
+[AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclusive)。**衷心感谢原作者
+[AntiOblivionis](https://github.com/AntiOblivionis)** 的开创性工作，以及把项目以 MIT
+许可证开放出来的决定 —— 没有它就没有 Orion。Orion 是在它的 WASAPI 独占输出之上，增加了
+DLNA / OpenHome 网播输出、格式协商、控制点与流媒体服务等一系列能力。上游全部提交历史都完整
+保留在本仓库中，贡献名单见 [CONTRIBUTORS.md](CONTRIBUTORS.md)。
+
 感谢 [LINUX DO 社区](https://linux.do/) 在项目开发与测试过程中提供的交流、支持与反馈。
 
 本项目使用了以下开源项目：
@@ -336,6 +343,15 @@ separate, later task:
 | `AMExclusive` | Windows installed-apps list | Name registered by the installer |
 
 ### Acknowledgements
+
+This project starts from, and is largely built on, the upstream
+[AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclusive).
+**Sincere thanks to its author, [AntiOblivionis](https://github.com/AntiOblivionis)**, for the
+original work and for releasing it under the MIT license — without it there would be no Orion.
+Orion adds the DLNA / OpenHome network playback path, format negotiation, the control point and
+the stream server on top of upstream's WASAPI-exclusive output. The complete upstream commit
+history is preserved in this repository; the contributor list is in
+[CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 Thanks to the [LINUX DO community](https://linux.do/) for the discussion, support, and feedback provided during the development and testing of this project.
 
