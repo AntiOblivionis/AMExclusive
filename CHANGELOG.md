@@ -28,8 +28,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Notes
 
-- Baseline for this release is the 0.4.6 tree. Roon/RAAT from the 0.4.7 line is
-  **not** part of 0.4.8.
+- Baseline for this release is the 0.4.6 tree.
 - `live` (chunked, no declared length) is still not accepted by
   LightningPlayer-class renderers; the hold exists for that path but those devices
   disconnect first, so `wav` / `flac-file` remain the supported shapes.
