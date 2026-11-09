@@ -8,7 +8,7 @@ body:
       value: |
         Thanks for taking the time to report this.
 
-        Please check [Known limitations](https://github.com/dxdxdxlm123/AMExclusive-Openhome#known-limitations)
+        Please check [Known limitations](https://github.com/dxdxdxlm123/AppleMusic-OpenHome#known-limitations)
         first: renderer-side seeking, the 3-second progress-bar tail, and the
         first-track SMTC fallback are known behaviour.
 

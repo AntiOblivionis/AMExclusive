@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">Orion logo</title>
+  <desc id="desc">Orion wordmark in a geometric monoline alphabet next to the constellation of Orion, on a blue-to-magenta gradient, transparent background.</desc>
+  <defs>
+    <linearGradient id="orionGrad" gradientUnits="userSpaceOnUse" x1="60" y1="300" x2="1056" y2="60">
+      <stop offset="0%" stop-color="#2f81f7"/>
+      <stop offset="50%" stop-color="#8957e5"/>
+      <stop offset="100%" stop-color="#db61a2"/>
+    </linearGradient>
+  </defs>
+
+  <!-- ============ constellation: Orion ============ -->
+  <g stroke="url(#orionGrad)" stroke-width="3" stroke-linecap="round" opacity="0.5" fill="none">
+    <path d="M105,100 L150,175"/>
+    <path d="M255,112 L210,201"/>
+    <path d="M150,175 L180,188 L210,201"/>
+    <path d="M150,175 L108,262"/>
+    <path d="M210,201 L245,272"/>
+    <path d="M180,188 L180,225"/>
+  </g>
+  <g stroke="url(#orionGrad)" stroke-width="2" stroke-linecap="round" opacity="0.35">
+    <path d="M108,238 L108,286"/>
+    <path d="M84,262 L132,262"/>
+  </g>
+  <circle cx="105" cy="100" r="17" fill="#f0883e"/>
+  <circle cx="255" cy="112" r="11" fill="url(#orionGrad)"/>
+  <circle cx="150" cy="175" r="9" fill="url(#orionGrad)"/>
+  <circle cx="180" cy="188" r="9" fill="url(#orionGrad)"/>
+  <circle cx="210" cy="201" r="9" fill="url(#orionGrad)"/>
+  <circle cx="245" cy="272" r="11" fill="url(#orionGrad)"/>
+  <circle cx="108" cy="262" r="14" fill="#79c0ff"/>
+  <circle cx="180" cy="225" r="5" fill="url(#orionGrad)" opacity="0.8"/>
+
+  <!-- ============ wordmark: O R I O N ============ -->
+  <g fill="url(#orionGrad)">
+    <!-- O -->
+    <path fill-rule="evenodd" d="M428,100 C471.1,100 506,135.8 506,180 C506,224.2 471.1,260 428,260 C384.9,260 350,224.2 350,180 C350,135.8 384.9,100 428,100 Z M428,122 C458.9,122 484,148 484,180 C484,212 458.9,238 428,238 C397.1,238 372,212 372,180 C372,148 397.1,122 428,122 Z"/>
+    <!-- R -->
+    <path d="M536,100 L558,100 L558,260 L536,260 Z"/>
+    <path fill-rule="evenodd" d="M598,100 C632.1,100 660,117.9 660,140 C660,162.1 632.1,180 598,180 C563.9,180 536,162.1 536,140 C536,117.9 563.9,100 598,100 Z M598,122 C620.1,122 638,130.1 638,140 C638,149.9 620.1,158 598,158 C575.9,158 558,149.9 558,140 C558,130.1 575.9,122 598,122 Z"/>
+    <path d="M588,172 L610,172 L662,260 L640,260 Z"/>
+    <!-- I -->
+    <path d="M692,100 L714,100 L714,260 L692,260 Z"/>
+    <!-- O -->
+    <path fill-rule="evenodd" d="M822,100 C865.1,100 900,135.8 900,180 C900,224.2 865.1,260 822,260 C778.9,260 744,224.2 744,180 C744,135.8 778.9,100 822,100 Z M822,122 C853.1,122 878,148 878,180 C878,212 853.1,238 822,238 C790.9,238 766,212 766,180 C766,148 790.9,122 822,122 Z"/>
+    <!-- N -->
+    <path d="M930,100 L952,100 L952,260 L930,260 Z"/>
+    <path d="M1034,100 L1056,100 L1056,260 L1034,260 Z"/>
+    <path d="M930,100 L952,100 L1056,260 L1034,260 Z"/>
+  </g>
+</svg>

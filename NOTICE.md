@@ -14,14 +14,24 @@ below. [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) is likewise retained
 unchanged. The MIT copyright notice and permission notice also accompany every
 binary installer produced from this tree.
 
-The `assets/` directory (including `assets/ame-logo.svg`) comes from the upstream
-repository and remains credited to its authors. This fork does not claim ownership
-of the upstream name or logo and does not present itself as the upstream project.
+The upstream wordmark `assets/ame-logo.svg` is retained in this repository only for
+attribution and history. **This project does not use it.** Its replacement,
+`assets/orion-logo.svg`, is an original design for this project - an Orion
+constellation figure plus geometric letterforms drawn for the word "ORION" - and it
+does not reuse the upstream letter outlines, glyph metrics or asset file.
+
+This derivative project does not claim ownership of the upstream name or logo and
+does not present itself as the upstream project.
 
 ## Derivative work
 
-`AppleMusic-OpenHome` is maintained independently by
-[dxdxdxlm123](https://github.com/dxdxdxlm123). Changes relative to upstream:
+`Orion` — repository `AppleMusic-OpenHome` — is maintained independently by
+[dxdxdxlm123](https://github.com/dxdxdxlm123). It is named **Orion** and deliberately
+does not carry the upstream name **AMExclusive / AME** into its own branding,
+documentation or repository metadata. The legacy spelling is still intentionally
+kept in file and artifact names such as `am-exclusive.ini`, `AMExclusive-Setup.exe`
+and `%PUBLIC%\AMExclusive` so that existing installs keep working; migrating those
+identifiers is a separate, later task. Changes relative to upstream:
 
 ### New subsystems
 

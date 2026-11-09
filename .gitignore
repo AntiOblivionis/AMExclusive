@@ -98,6 +98,10 @@ dist/
 **/*.tif
 **/*.tiff
 **/*.heic
+# The donation QR codes referenced by README.md are the one exception to the
+# media-file block above; without them the 打赏支持 / Donations section is empty.
+!assets/donate-wechat.png
+!assets/donate-alipay.jpg
 
 # Captures, dumps, reverse-engineering scratch output, and local acceptance data
 /evidence/**/*.etl

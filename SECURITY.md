@@ -2,9 +2,9 @@
 
 ## Scope
 
-AppleMusic-OpenHome is a local Windows DLL injected into the Apple Music process.
-It hosts a small HTTP server on the LAN for DLNA rendering, installs a scheduled
-task, and writes to `%PUBLIC%\AMExclusive`.
+Orion (repository `AppleMusic-OpenHome`) is a local Windows DLL injected into the
+Apple Music process. It hosts a small HTTP server on the LAN for DLNA rendering,
+installs a scheduled task, and writes to `%PUBLIC%\AMExclusive`.
 
 In scope:
 

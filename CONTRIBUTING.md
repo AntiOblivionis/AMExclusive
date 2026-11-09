@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for your interest in improving AppleMusic-OpenHome. This is a small,
+Thanks for your interest in improving Orion. This is a small,
 hardware-sensitive project: **good bug reports are worth more than speculative
 patches.**
 

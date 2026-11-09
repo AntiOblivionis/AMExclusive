@@ -6,6 +6,41 @@ upstream [AntiOblivionis/AMExclusive](https://github.com/AntiOblivionis/AMExclus
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **Renamed the project to Orion.** Documentation, contributor/compliance files and
+  the repository description now use **Orion** (repository name `AppleMusic-OpenHome`)
+  instead of the upstream name **AMExclusive / AME**. Legacy file and artifact
+  identifiers (`am-exclusive.ini`, `AMExclusive-Setup.exe`, `%PUBLIC%\AMExclusive`,
+  log names) are intentionally unchanged so existing installs keep working; see the
+  "About the name" section of the README.
+- **New wordmark.** `assets/orion-logo.svg` is an original Orion-constellation figure
+  with geometric letterforms. The upstream `assets/ame-logo.svg` is no longer used by
+  any document and is kept only for attribution.
+- **Single bilingual README.** `README.md` now carries both languages on one page,
+  Chinese first, with `中文` / `English` / `打赏支持` jump links. `README.zh-CN.md`
+  became a redirect stub.
+- README gained **Download**, **The panel: local and network output**,
+  **Known limitations**, **About the name** / 关于命名 sections, and the build
+  instructions now link to this repository's Actions instead of upstream's.
+
+### Added
+
+- **Donation codes.** `assets/donate-wechat.png` (WeChat reward code) and
+  `assets/donate-alipay.jpg` (Alipay QR) are published in a new 打赏支持 / Donations
+  section; clicking a code opens the full-size image in GitHub's image
+  viewer (or a new tab, depending on the client).
+
+### Fixed
+
+- Issue templates linked to `dxdxdxlm123/AMExclusive-Openhome`, a repository name that
+  does not exist; they now point at `dxdxdxlm123/AppleMusic-OpenHome`.
+- The bug-report template's `#known-limitations` anchor had no matching section in
+  either README; the bilingual README now provides it, and `CONTRIBUTING.md` links
+  resolve as well.
+
 ## [0.4.6-preview] - 2026-11-07
 
 ### Added
