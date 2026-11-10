@@ -133,7 +133,7 @@ bool HttpRequest(const std::wstring& url, const std::wstring& method,
         if (!WinHttpQueryDataAvailable(request, &available)) break;
         if (!available) break;
         const std::size_t offset = bytes.size();
-        if (bytes.size() + available > 128u * 1024u) {
+        if (bytes.size() + available > 1024u * 1024u) {
             error = L"response too large";
             return false;
         }
@@ -405,26 +405,40 @@ bool DlnaControlClient::GetPosition(const DlnaTarget& target,
 
 bool DlnaControlClient::SetVolume(const DlnaTarget& target, std::uint32_t volume,
                                   std::wstring& error) noexcept {
-    std::vector<upnp::SoapValue> values;
-    return Call(target.renderingControl, kRenderingControl, L"SetVolume",
-                L"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>" +
-                    std::to_wstring(volume) + L"</DesiredVolume>", values, error);
+    if (!target.renderingControl.empty()) {
+        std::vector<upnp::SoapValue> values;
+        return Call(target.renderingControl, kRenderingControl, L"SetVolume",
+                    L"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>" +
+                        std::to_wstring(volume) + L"</DesiredVolume>", values, error);
+    }
+    if (!target.openHomeVolume.empty()) {
+        return OpenHomeSetVolume(target, volume, error);
+    }
+    error = L"no volume service available";
+    return false;
 }
 
 bool DlnaControlClient::GetVolume(const DlnaTarget& target, std::uint32_t& volume,
                                   std::wstring& error) noexcept {
-    std::vector<upnp::SoapValue> values;
-    if (!Call(target.renderingControl, kRenderingControl, L"GetVolume",
-              L"<InstanceID>0</InstanceID><Channel>Master</Channel>", values, error)) {
-        return false;
+    if (!target.renderingControl.empty()) {
+        std::vector<upnp::SoapValue> values;
+        if (!Call(target.renderingControl, kRenderingControl, L"GetVolume",
+                  L"<InstanceID>0</InstanceID><Channel>Master</Channel>", values, error)) {
+            return false;
+        }
+        std::wstring text;
+        if (!FindValue(values, L"CurrentVolume", text)) {
+            error = L"GetVolume response lacks CurrentVolume";
+            return false;
+        }
+        volume = static_cast<std::uint32_t>(_wtoi(text.c_str()));
+        return true;
     }
-    std::wstring text;
-    if (!FindValue(values, L"CurrentVolume", text)) {
-        error = L"GetVolume response lacks CurrentVolume";
-        return false;
+    if (!target.openHomeVolume.empty()) {
+        return OpenHomeGetVolume(target, volume, error);
     }
-    volume = static_cast<std::uint32_t>(_wtoi(text.c_str()));
-    return true;
+    error = L"no volume service available";
+    return false;
 }
 
 bool DlnaControlClient::OpenHomeWrite(const DlnaTarget& target, std::uint32_t id,
@@ -456,6 +470,13 @@ bool DlnaControlClient::OpenHomeDeleteAll(const DlnaTarget& target,
                                           std::wstring& error) noexcept {
     std::vector<upnp::SoapValue> values;
     return Call(target.openHomePlaylist, kOhPlaylist, L"DeleteAll", {}, values, error);
+}
+
+bool DlnaControlClient::OpenHomeDelete(const DlnaTarget& target, std::uint32_t id,
+                                       std::wstring& error) noexcept {
+    std::vector<upnp::SoapValue> values;
+    const std::wstring body = L"<Id>" + std::to_wstring(id) + L"</Id>";
+    return Call(target.openHomePlaylist, kOhPlaylist, L"Delete", body, values, error);
 }
 
 bool DlnaControlClient::OpenHomeInsert(const DlnaTarget& target, std::uint32_t afterId,
@@ -639,8 +660,8 @@ bool DlnaControlClient::OpenHomeProductSetSourceIndex(const DlnaTarget& target,
 }
 
 std::wstring DlnaControlClient::ProtocolInfoFor(DlnaStreamShape shape,
-                                                const PcmFormat& format,
-                                                bool converted) {
+                                                const PcmFormat& /*format*/,
+                                                bool /*converted*/) {
     // CI=1 means "fetch this through the connection manager's transcoder".
     // We transcode server-side and hand the renderer a WAV it can decode
     // natively, so the flag must stay 0 - a VEGA G2.2 stopped consuming a
@@ -677,6 +698,46 @@ std::wstring DlnaControlClient::ProtocolInfoFor(DlnaStreamShape shape,
 }
 
 bool DlnaControlClient::ProtocolAllows(const std::wstring& sinkProtocolInfo,
+                                       DlnaStreamShape shape, std::uint32_t sampleRate,
+                                       std::uint16_t bits, std::uint16_t channels) {
+    if (DlnaStreamShapeUsesFlac(shape)) {
+        std::wstringstream entries(sinkProtocolInfo);
+        std::wstring entry;
+        while (std::getline(entries, entry, L',')) {
+            entry = Trim(entry);
+            if (entry.empty()) continue;
+            std::wstringstream fields(entry);
+            std::wstring field;
+            std::vector<std::wstring> parts;
+            while (std::getline(fields, field, L':')) parts.push_back(Trim(field));
+            if (parts.size() < 3) continue;
+
+            const auto& typed = parts[2];
+            const auto semicolon = typed.find(L';');
+            const std::wstring mediaType = Lower(semicolon == std::wstring::npos
+                ? typed : typed.substr(0, semicolon));
+            const std::wstring parameters = semicolon == std::wstring::npos
+                ? std::wstring{} : typed.substr(semicolon);
+
+            if (mediaType == L"*") continue;
+            if (mediaType == L"audio/flac" || mediaType == L"audio/x-flac") {
+                const auto ratePos = parameters.find(L"rate=");
+                if (ratePos != std::wstring::npos && sampleRate != 0) {
+                    std::wstringstream rateValue(parameters.substr(ratePos + 5));
+                    std::uint32_t declared = 0;
+                    rateValue >> declared;
+                    if (declared != 0 && declared != sampleRate) continue;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+    return ProtocolAllows(sinkProtocolInfo, DlnaStreamShapeUsesWavContainer(shape),
+                          sampleRate, bits, channels);
+}
+
+bool DlnaControlClient::ProtocolAllows(const std::wstring& sinkProtocolInfo,
                                        bool wav, std::uint32_t sampleRate,
                                        std::uint16_t bits, std::uint16_t channels) {
     std::wstringstream entries(sinkProtocolInfo);
@@ -689,20 +750,12 @@ bool DlnaControlClient::ProtocolAllows(const std::wstring& sinkProtocolInfo,
         std::vector<std::wstring> parts;
         while (std::getline(fields, field, L':')) parts.push_back(Trim(field));
         if (parts.size() < 3) continue;
-        // parts[2] is the media type with its parameters, e.g.
-        // "audio/L16;rate=48000;channels=2". Split at the first ';' so the
-        // comparison is against "audio/l16" and not the whole parameter list.
         const auto& typed = parts[2];
         const auto semicolon = typed.find(L';');
         const std::wstring mediaType = Lower(semicolon == std::wstring::npos
             ? typed : typed.substr(0, semicolon));
         const std::wstring parameters = semicolon == std::wstring::npos
             ? std::wstring{} : typed.substr(semicolon);
-        // An unrestricted "*" entry only proves that the sink accepts an
-        // unspecified content type; it is not a statement that the exact
-        // rate/depth combination below is supported. Only exact matches count
-        // as evidence, otherwise a device would be told to pull a format it
-        // cannot decode.
         if (mediaType == L"*") continue;
         if (wav && (mediaType == L"audio/wav" || mediaType == L"audio/x-wav")) {
             return true;

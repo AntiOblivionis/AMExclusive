@@ -20,6 +20,9 @@ enum class AudioSinkKind : std::uint8_t {
     // "HiFi player" mode: a separate am-exclusive-audiohost.exe owns the
     // endpoint and drains a shared-memory ring. The hook only moves PCM.
     Remote = 3,
+    // Roon RAAT endpoint. RaatSink drives the session in-process; the
+    // renderer's DAC owns the clock and the sender only feeds PCM.
+    Raat = 4,
 };
 
 enum class AudioSinkState : std::uint8_t {
@@ -137,6 +140,17 @@ struct DlnaTarget final {
     bool volume{};
 };
 
+// Roon RAAT endpoint selected from the [roon] ini section. deviceId is the
+// stable SOOD identity; address/controlPort are a cache re-resolved through
+// SOOD on every session because the renderer moves its control port.
+struct RaatTarget final {
+    std::wstring deviceId;
+    std::wstring friendlyName;
+    std::wstring address;
+    std::wstring raatVersion;
+    std::uint16_t controlPort{};
+};
+
 // Sink-facing open parameters. WasapiExclusiveSink maps these onto its
 // existing WasapiSinkConfig without changing any of its behavior.
 struct AudioSinkOpenParams final {
@@ -162,6 +176,7 @@ struct AudioSinkOpenParams final {
     std::uint32_t streamSeconds{};
     DlnaStreamShape streamShape{DlnaStreamShape::WavFile};
     DlnaTarget dlna{};
+    RaatTarget raat{};
 };
 
 // The single active output. Exactly one of these paths is live at any time:
@@ -171,6 +186,7 @@ struct AudioSinkOpenParams final {
 struct OutputProfile final {
     AudioSinkKind kind{AudioSinkKind::Wasapi};
     DlnaTarget dlna{};
+    RaatTarget raat{};
     // Empty means "follow whatever endpoint Apple Music opened".
     std::wstring wasapiDeviceId;
     // ASIO driver CLSID in "{....}" form; only meaningful for kind == Asio.
@@ -183,6 +199,9 @@ struct OutputProfile final {
                dlna.udn == other.dlna.udn &&
                dlna.friendlyName == other.dlna.friendlyName &&
                dlna.location == other.dlna.location &&
+               raat.deviceId == other.raat.deviceId &&
+               raat.address == other.raat.address &&
+               raat.controlPort == other.raat.controlPort &&
                wasapiDeviceId == other.wasapiDeviceId &&
                asioDriverClsid == other.asioDriverClsid &&
                asioDriverName == other.asioDriverName &&

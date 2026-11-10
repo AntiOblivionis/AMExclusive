@@ -149,6 +149,7 @@ private:
     // OpenHome playlist id of the most recently inserted track; auto-advance
     // queues the next track right after it. 0 = unknown (legacy Write path).
     std::uint32_t lastOpenHomeId_{0};
+    std::vector<std::uint32_t> openHomeHistoryIds_;
     // Watchdog for the gentle queueing path: when nonzero, the producer
     // checks after this tick whether the renderer started pulling the queued
     // session and forces a Play if it did not.

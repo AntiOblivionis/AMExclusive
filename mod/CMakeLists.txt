@@ -16,6 +16,19 @@ target_include_directories(am_exclusive_drain_probe PRIVATE src)
 target_compile_definitions(am_exclusive_drain_probe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(am_exclusive_drain_probe PRIVATE ole32 uuid avrt)
 
+# Explicit build/run only: RAAT wire-format self test (offline, no device).
+add_executable(am_exclusive_raat_selftest EXCLUDE_FROM_ALL
+  tests/RaatSelfTest.cpp
+  src/audio_v2/DlnaLog.cpp
+  src/audio_v2/RaatDiscovery.cpp
+  src/audio_v2/RaatProtocol.cpp
+  src/audio_v2/RaatScripts.cpp
+  src/audio_v2/RaatScripts.rc
+  src/audio_v2/RaatSink.cpp)
+target_include_directories(am_exclusive_raat_selftest PRIVATE src)
+target_compile_definitions(am_exclusive_raat_selftest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(am_exclusive_raat_selftest PRIVATE ws2_32 ole32 iphlpapi)
+
 # Explicit build/run only: drives DlnaSink + a synthetic PCM source against a
 # local OpenHome renderer (tools/oh_test_renderer.py) to validate the whole
 # control-point + stream-server chain without Apple Music / broker / UI.
@@ -89,6 +102,11 @@ add_library(am_exclusive_hook SHARED
   src/audio_v2/FlacEncoder.cpp
   src/audio_v2/DlnaStreamServer.cpp
   src/audio_v2/NativeRenderGateProxy.cpp
+  src/audio_v2/RaatDiscovery.cpp
+  src/audio_v2/RaatProtocol.cpp
+  src/audio_v2/RaatScripts.cpp
+  src/audio_v2/RaatScripts.rc
+  src/audio_v2/RaatSink.cpp
   src/audio_v2/RemoteSink.cpp
   src/audio_v2/ResampledPcmSource.cpp
   src/audio_v2/WasapiExclusiveSink.cpp
@@ -136,6 +154,8 @@ target_link_libraries(am_exclusive_media_control PRIVATE ole32 runtimeobject win
 add_executable(am_exclusive_broker
   src/Broker.cpp
   src/DlnaDiscovery.cpp
+  src/audio_v2/RaatDiscovery.cpp
+  src/audio_v2/RaatProtocol.cpp
   src/IpcTransport.cpp
   src/UpnpXml.cpp)
 target_include_directories(am_exclusive_broker PRIVATE src)

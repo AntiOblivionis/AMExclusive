@@ -1,0 +1,12 @@
+// Roon/RAAT Lua payloads. These are shipped as RCDATA because MSVC cannot
+// compile a single 47 KB string literal reliably.
+
+3001 RCDATA "raat_scripts/official/base.lua"
+3002 RCDATA "raat_scripts/official/dkjson.lua"
+3003 RCDATA "raat_scripts/official/protocol.lua"
+3004 RCDATA "raat_scripts/official/roon_tcp.lua"
+
+3005 RCDATA "raat_scripts/cleanroom/rbase.lua"
+3006 RCDATA "raat_scripts/cleanroom/rjson.lua"
+3007 RCDATA "raat_scripts/cleanroom/rprotocol.lua"
+3008 RCDATA "raat_scripts/cleanroom/rroon.lua"

@@ -334,6 +334,10 @@ bool AsioExclusiveSink::ResolveSampleMode(std::uint16_t sourceBits) noexcept {
         sampleMode_ = SampleMode::Int16Packed;
         sampleBytes_ = 2;
         return true;
+    case asio::ASIOSTFloat32LSB:
+        sampleMode_ = SampleMode::Float32;
+        sampleBytes_ = 4;
+        return true;
     default:
         return false;
     }
@@ -381,6 +385,8 @@ void AsioExclusiveSink::Stop() noexcept {
 
     HRESULT lifecycleResult = S_OK;
     running_.store(false, std::memory_order_release);
+    g_activeSink.store(nullptr, std::memory_order_release);
+    source_ = nullptr;
     if (driver_) {
         const auto stopped = driver_->stop();
         NotifyLifecycle(AudioSinkLifecycleEvent::AsioStopped, HResultFromAsio(stopped));
@@ -389,8 +395,6 @@ void AsioExclusiveSink::Stop() noexcept {
             lifecycleResult = HResultFromAsio(stopped);
         }
     }
-    g_activeSink.store(nullptr, std::memory_order_release);
-    source_ = nullptr;
     waitingForSource_.store(false, std::memory_order_release);
     resumeBlocked_.store(false, std::memory_order_release);
     if (current != AudioSinkState::Faulted) {
@@ -471,6 +475,9 @@ long AsioExclusiveSink::AsioMessageThunk(long selector, long value, void* /*mess
     case asio::kAsioSelectorSupported:
         return (value == asio::kAsioEngineVersion || value == asio::kAsioSupportsTimeInfo ||
                 value == asio::kAsioSupportsTimeCode ||
+                value == asio::kAsioResetRequest ||
+                value == asio::kAsioBufferSizeChange ||
+                value == asio::kAsioResyncRequest ||
                 value == asio::kAsioSelectorSupported) ? 1L : 0L;
     case asio::kAsioEngineVersion:
         return 2L;
@@ -478,6 +485,14 @@ long AsioExclusiveSink::AsioMessageThunk(long selector, long value, void* /*mess
         return 1L;
     case asio::kAsioSupportsTimeCode:
         return 0L;
+    case asio::kAsioResetRequest:
+    case asio::kAsioBufferSizeChange:
+    case asio::kAsioResyncRequest:
+        if (auto* sink = g_activeSink.load(std::memory_order_acquire)) {
+            Detail(L"driver requested reset/resize selector=" + std::to_wstring(selector));
+            sink->RecordError(ammod::audio::kAsioDeviceReset);
+        }
+        return 1L;
     default:
         return 0L;
     }
@@ -612,6 +627,15 @@ void AsioExclusiveSink::FillBuffer(long bufferIndex) noexcept {
                 output[static_cast<std::size_t>(frame) * 2u] = static_cast<std::uint8_t>(value);
                 output[static_cast<std::size_t>(frame) * 2u + 1u] =
                     static_cast<std::uint8_t>(value >> 8u);
+            }
+            break;
+        }
+        case SampleMode::Float32: {
+            auto* output = static_cast<float*>(destination);
+            for (std::uint32_t frame = 0; frame < bufferFrames_; ++frame) {
+                const auto val = interleaved_[static_cast<std::size_t>(frame) *
+                                              kSupportedChannels + channel];
+                output[frame] = static_cast<float>(val) / 2147483648.0f;
             }
             break;
         }

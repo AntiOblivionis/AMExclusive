@@ -115,8 +115,16 @@ winrt::weak_ref<Controls::Button> g_localTabButton;
 winrt::weak_ref<Controls::Button> g_networkTabButton;
 winrt::weak_ref<Controls::StackPanel> g_localPanel;
 winrt::weak_ref<Controls::StackPanel> g_networkPanel;
+winrt::weak_ref<Controls::Button> g_roonTabButton;
+winrt::weak_ref<Controls::StackPanel> g_roonPanel;
+winrt::weak_ref<Controls::ComboBox> g_roonCombo;
+winrt::weak_ref<Controls::TextBox> g_roonDeviceList;
+winrt::weak_ref<Controls::TextBox> g_roonBufferInput;
+winrt::weak_ref<Controls::ComboBox> g_roonBitsCombo;
+winrt::weak_ref<Controls::TextBox> g_roonLeadInput;
+winrt::weak_ref<Controls::TextBox> g_roonSoodPortInput;
 winrt::weak_ref<Controls::TextBlock> g_outputTargetStatus;
-std::atomic<int> g_activeOutputTab{0}; // 0 = local, 1 = network
+std::atomic<int> g_activeOutputTab{0}; // 0 = local, 1 = network, 2 = Roon
 std::mutex g_localDevicesMutex;
 std::vector<ammod::local_devices::Device> g_localDevices;
 
@@ -127,6 +135,10 @@ struct OutputDeviceEntry final {
     bool online{};
     bool openHome{};
     bool avTransport{};
+    bool roon{};
+    std::wstring roonAddress;
+    std::wstring roonVersion;
+    std::uint16_t roonPort{};
 };
 
 std::mutex g_outputDevicesMutex;
@@ -164,6 +176,8 @@ Microsoft::UI::Dispatching::DispatcherQueueTimer g_statusRefreshTimer{nullptr};
 WindowObserverRef g_settingsWindow;
 
 void ApplyOutputTargetStatus();
+void RebuildRoonCombo(const Controls::ComboBox& combo);
+void RebuildRoonDeviceList(const Controls::TextBox& list);
 void AttachTransportObservers(const Xaml::Window& window, const std::wstring& windowProperty);
 bool AttachOrRefreshToggle(const Xaml::DependencyObject& page);
 void ScheduleTransportObserverAttach();
@@ -1858,8 +1872,8 @@ std::wstring StreamFormatIniPath() {
 // output and the tab the user was last on.
 
 struct OutputSettings final {
-    int kind{0}; // 0 = WASAPI, 1 = DLNA/OpenHome, 2 = ASIO
-    int tab{-1}; // -1 = derive from kind
+    int kind{0}; // 0 = WASAPI, 1 = DLNA/OpenHome, 2 = ASIO, 3 = Roon RAAT
+    int tab{-1}; // -1 = derive from kind; 0 = local, 1 = network, 2 = Roon
     int playerMode{0}; // 0 = AM player (in-process), 1 = HiFi player (audiohost)
     std::wstring wasapiId;
     std::wstring wasapiName;
@@ -1868,6 +1882,15 @@ struct OutputSettings final {
     std::wstring dlnaUdn;
     std::wstring dlnaName;
     std::wstring dlnaLocation;
+    std::wstring roonId;
+    std::wstring roonName;
+    std::wstring roonAddress;
+    std::wstring roonVersion;
+    int roonPort{};
+    int roonBufferMs{600};
+    int roonStartLeadMs{300};
+    int roonWireBits{};
+    int roonSoodPort{};
 };
 
 std::wstring ReadIniText(const wchar_t* section, const wchar_t* key,
@@ -1897,9 +1920,15 @@ OutputSettings ReadOutputSettings() {
     OutputSettings settings;
     const auto output = ReadIniText(L"mod", L"output", L"wasapi");
     settings.kind = _wcsicmp(output.c_str(), L"dlna") == 0 ? 1
-        : _wcsicmp(output.c_str(), L"asio") == 0 ? 2 : 0;
+        : _wcsicmp(output.c_str(), L"asio") == 0 ? 2
+        : (_wcsicmp(output.c_str(), L"r_device") == 0 ||
+           _wcsicmp(output.c_str(), L"raat") == 0 ||
+           _wcsicmp(output.c_str(), L"roon") == 0) ? 3 : 0;
     const auto tab = ReadIniText(L"mod", L"output_tab", L"");
     settings.tab = _wcsicmp(tab.c_str(), L"network") == 0 ? 1
+        : (_wcsicmp(tab.c_str(), L"r_device") == 0 ||
+           _wcsicmp(tab.c_str(), L"raat") == 0 ||
+           _wcsicmp(tab.c_str(), L"roon") == 0) ? 2
         : _wcsicmp(tab.c_str(), L"local") == 0 ? 0 : -1;
     settings.playerMode = _wcsicmp(ReadIniText(L"mod", L"player_mode", L"am").c_str(),
                                    L"hifi") == 0 ? 1 : 0;
@@ -1910,13 +1939,36 @@ OutputSettings ReadOutputSettings() {
     settings.dlnaUdn = ReadIniText(L"dlna", L"device_udn");
     settings.dlnaName = ReadIniText(L"dlna", L"device_name");
     settings.dlnaLocation = ReadIniText(L"dlna", L"location");
+
+    auto readRoon = [](const wchar_t* key, const wchar_t* fallback = L"") {
+        auto val = ReadIniText(L"r_device", key);
+        if (val.empty()) val = ReadIniText(L"roon", key);
+        return val.empty() ? std::wstring(fallback) : val;
+    };
+    auto readRoonInt = [](const wchar_t* key, int fallback) {
+        int val = ReadIniInt(L"r_device", key, -99999);
+        if (val == -99999) val = ReadIniInt(L"roon", key, fallback);
+        return val;
+    };
+
+    settings.roonId = readRoon(L"device_id");
+    settings.roonName = readRoon(L"device_name");
+    settings.roonAddress = readRoon(L"address");
+    settings.roonVersion = readRoon(L"raat_version");
+    settings.roonPort = readRoonInt(L"port", 0);
+    settings.roonBufferMs = readRoonInt(L"buffer_ms", 600);
+    settings.roonStartLeadMs = readRoonInt(L"start_lead_ms", 300);
+    settings.roonWireBits = readRoonInt(L"wire_bits", 0);
+    settings.roonSoodPort = readRoonInt(L"sood_port", 0);
     return settings;
 }
 
 void PersistOutputSettings(const OutputSettings& settings) {
-    WriteIniText(L"mod", L"output", settings.kind == 2 ? L"asio"
+    WriteIniText(L"mod", L"output", settings.kind == 3 ? L"r_device"
+        : settings.kind == 2 ? L"asio"
         : settings.kind == 1 ? L"dlna" : L"wasapi");
-    WriteIniText(L"mod", L"output_tab", settings.tab == 1 ? L"network" : L"local");
+    WriteIniText(L"mod", L"output_tab", settings.tab == 2 ? L"r_device"
+        : settings.tab == 1 ? L"network" : L"local");
     WriteIniText(L"mod", L"player_mode", settings.playerMode == 1 ? L"hifi" : L"am");
     WriteIniText(L"mod", L"wasapi_device", settings.wasapiId);
     WriteIniText(L"mod", L"wasapi_name", settings.wasapiName);
@@ -1925,6 +1977,18 @@ void PersistOutputSettings(const OutputSettings& settings) {
     WriteIniText(L"dlna", L"device_udn", settings.dlnaUdn);
     WriteIniText(L"dlna", L"device_name", settings.dlnaName);
     WriteIniText(L"dlna", L"location", settings.dlnaLocation);
+    // Write both r_device and roon for full backward and forward compatibility
+    for (const auto* sec : {L"r_device", L"roon"}) {
+        WriteIniText(sec, L"device_id", settings.roonId);
+        WriteIniText(sec, L"device_name", settings.roonName);
+        WriteIniText(sec, L"address", settings.roonAddress);
+        WriteIniText(sec, L"raat_version", settings.roonVersion);
+        WriteIniText(sec, L"port", std::to_wstring(settings.roonPort));
+        WriteIniText(sec, L"buffer_ms", std::to_wstring(settings.roonBufferMs));
+        WriteIniText(sec, L"start_lead_ms", std::to_wstring(settings.roonStartLeadMs));
+        WriteIniText(sec, L"wire_bits", std::to_wstring(settings.roonWireBits));
+        WriteIniText(sec, L"sood_port", std::to_wstring(settings.roonSoodPort));
+    }
     const auto path = StreamFormatIniPath();
     if (!path.empty()) {
         (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
@@ -2067,6 +2131,9 @@ void SelectOutputTab(int tab) {
     if (auto panel = g_networkPanel.get()) {
         panel.Visibility(tab == 1 ? Xaml::Visibility::Visible : Xaml::Visibility::Collapsed);
     }
+    if (auto panel = g_roonPanel.get()) {
+        panel.Visibility(tab == 2 ? Xaml::Visibility::Visible : Xaml::Visibility::Collapsed);
+    }
     if (auto button = g_localTabButton.get()) {
         button.Content(box_value(Localized(
             tab == 0 ? L"● 本地播放" : L"本地播放",
@@ -2076,6 +2143,11 @@ void SelectOutputTab(int tab) {
         button.Content(box_value(Localized(
             tab == 1 ? L"● 网播播放" : L"网播播放",
             tab == 1 ? L"● Network playback" : L"Network playback")));
+    }
+    if (auto button = g_roonTabButton.get()) {
+        button.Content(box_value(Localized(
+            tab == 2 ? L"● 兼容 R 设备" : L"兼容 R 设备",
+            tab == 2 ? L"● R-Device" : L"R-Device")));
     }
     Log(L"ui output tab selected=" + std::to_wstring(tab));
 }
@@ -2118,7 +2190,7 @@ void ApplyOutputSelection() {
         settings.dlnaUdn.clear();
         settings.dlnaName.clear();
         settings.dlnaLocation.clear();
-    } else {
+    } else if (tab == 1) {
         std::wstring udn;
         if (auto combo = g_outputCombo.get()) {
             if (auto item = combo.SelectedItem().try_as<Controls::ComboBoxItem>()) {
@@ -2143,18 +2215,65 @@ void ApplyOutputSelection() {
         settings.dlnaUdn = udn;
         settings.dlnaName = it->name;
         settings.dlnaLocation = it->location;
+    } else {
+        std::wstring udn;
+        if (auto combo = g_roonCombo.get()) {
+            if (auto item = combo.SelectedItem().try_as<Controls::ComboBoxItem>()) {
+                udn = winrt::unbox_value_or<winrt::hstring>(item.Tag(), L"").c_str();
+            }
+        }
+        if (udn.empty()) {
+            SetOutputStatusText(Localized(
+                L"请先扫描并选择一个兼容 R 设备",
+                L"Scan for and select an R-device first"));
+            return;
+        }
+        const auto devices = CopyOutputDevices();
+        auto it = std::find_if(devices.begin(), devices.end(),
+            [&udn](const OutputDeviceEntry& entry) { return entry.udn == udn; });
+        if (it == devices.end() || !it->online) {
+            SetOutputStatusText(Localized(
+                L"所选兼容 R 设备当前离线", L"The selected R-device is offline"));
+            return;
+        }
+        settings.kind = 3;
+        settings.roonId = udn;
+        settings.roonName = it->name;
+        settings.roonAddress = it->roonAddress;
+        settings.roonVersion = it->roonVersion;
+        settings.roonPort = it->roonPort;
+        if (auto box = g_roonBufferInput.get()) {
+            settings.roonBufferMs = std::clamp(_wtoi(std::wstring(box.Text().c_str()).c_str()), 100, 5000);
+        }
+        if (auto box = g_roonLeadInput.get()) {
+            settings.roonStartLeadMs = std::clamp(_wtoi(std::wstring(box.Text().c_str()).c_str()), 300, 4000);
+        }
+        if (auto box = g_roonSoodPortInput.get()) {
+            settings.roonSoodPort = std::clamp(_wtoi(std::wstring(box.Text().c_str()).c_str()), 0, 65535);
+        }
+        if (auto combo = g_roonBitsCombo.get()) {
+            static constexpr int kBits[4] = {0, 16, 24, 32};
+            const int index = combo.SelectedIndex();
+            settings.roonWireBits = index >= 0 && index < 4 ? kBits[index] : 0;
+        }
+        settings.dlnaUdn.clear();
+        settings.dlnaName.clear();
+        settings.dlnaLocation.clear();
     }
 
     PersistOutputSettings(settings);
     {
         std::lock_guard lock(g_pendingOutputMutex);
-        g_pendingOutputUdn = settings.dlnaUdn;
-        g_pendingOutputName = settings.kind == 1 ? settings.dlnaName : displayName;
-        g_pendingOutputLocation = settings.dlnaLocation;
+        g_pendingOutputUdn = settings.kind == 3 ? settings.roonId : settings.dlnaUdn;
+        g_pendingOutputName = settings.kind == 1 ? settings.dlnaName
+            : settings.kind == 3 ? settings.roonName : displayName;
+        g_pendingOutputLocation = settings.kind == 3
+            ? settings.roonAddress + L"|" + settings.roonVersion : settings.dlnaLocation;
         g_pendingOutputLocalId = settings.kind == 0 ? settings.wasapiId
-            : settings.kind == 2 ? settings.asioClsid : std::wstring();
+            : settings.kind == 2 ? settings.asioClsid
+            : settings.kind == 3 ? std::to_wstring(settings.roonPort) : std::wstring();
     }
-    g_pendingOutputBufferMs.store(1500);
+    g_pendingOutputBufferMs.store(settings.kind == 3 ? settings.roonBufferMs : 1500);
     g_pendingOutputKind.store(settings.kind);
     // Restart the current track so the new sink is bound now, not only on the
     // next track. No Apple Music restart is required.
@@ -2195,7 +2314,11 @@ void RebuildOutputCombo(const Controls::ComboBox& combo) {
     g_outputComboUserInteraction.store(false);
     combo.Items().Clear();
     int selectedIndex = 0;
-    if (devices.empty()) {
+    bool anyNetwork = false;
+    for (const auto& device : devices) {
+        if (!device.roon) { anyNetwork = true; break; }
+    }
+    if (!anyNetwork) {
         Controls::ComboBoxItem placeholder;
         placeholder.Content(box_value(Localized(
             L"尚未发现网播设备，点「刷新设备」", L"No renderer found, press Refresh")));
@@ -2203,6 +2326,7 @@ void RebuildOutputCombo(const Controls::ComboBox& combo) {
         combo.Items().Append(placeholder);
     }
     for (const auto& device : devices) {
+        if (device.roon) continue;
         Controls::ComboBoxItem item;
         std::wstring text = device.name;
         text += device.openHome ? L" · OpenHome" : L" · DLNA";
@@ -2226,8 +2350,22 @@ void UpdateOutputDevice(const Message& message, bool found) {
     entry.udn = message.endpointId;
     entry.name = message.endpointName;
     entry.location = message.detail;
-    entry.openHome = message.reserved[1] != 0;
-    entry.avTransport = message.reserved[2] != 0;
+    entry.roon = message.reserved[3] != 0;
+    if (entry.roon) {
+        const std::wstring detail = message.detail;
+        const auto separator = detail.find(L'|');
+        if (separator != std::wstring::npos) {
+            entry.roonAddress = detail.substr(0, separator);
+            entry.roonVersion = detail.substr(separator + 1);
+        } else {
+            entry.roonAddress = detail;
+        }
+        entry.roonPort = static_cast<std::uint16_t>(_wtoi(message.format));
+        entry.location = entry.roonAddress;
+    } else {
+        entry.openHome = message.reserved[1] != 0;
+        entry.avTransport = message.reserved[2] != 0;
+    }
     entry.online = found;
     if (entry.udn.empty()) return;
     {
@@ -2238,19 +2376,27 @@ void UpdateOutputDevice(const Message& message, bool found) {
             if (!entry.name.empty()) foundEntry->name = entry.name;
             if (!entry.location.empty()) foundEntry->location = entry.location;
             foundEntry->online = found;
+            foundEntry->roon = entry.roon;
             foundEntry->openHome = entry.openHome;
             foundEntry->avTransport = entry.avTransport;
+            if (!entry.roonAddress.empty()) foundEntry->roonAddress = entry.roonAddress;
+            if (!entry.roonVersion.empty()) foundEntry->roonVersion = entry.roonVersion;
+            if (entry.roonPort) foundEntry->roonPort = entry.roonPort;
         } else if (found) {
             g_outputDevices.push_back(entry);
         }
     }
     Log(L"device " + std::wstring(found ? L"found " : L"lost ") + entry.name +
-        L" udn=" + entry.udn);
+        L" udn=" + entry.udn + L" roon=" + std::to_wstring(entry.roon ? 1 : 0));
     if (g_dispatcher) {
         const auto weakCombo = g_outputCombo;
-        g_dispatcher.TryEnqueue([weakCombo] {
+        const auto weakRoon = g_roonCombo;
+        const auto weakRoonList = g_roonDeviceList;
+        g_dispatcher.TryEnqueue([weakCombo, weakRoon, weakRoonList] {
             try {
                 if (auto combo = weakCombo.get()) RebuildOutputCombo(combo);
+                if (auto combo = weakRoon.get()) RebuildRoonCombo(combo);
+                if (auto list = weakRoonList.get()) RebuildRoonDeviceList(list);
             } catch (const winrt::hresult_error& error) {
                 Log(L"output device combo refresh failed hr=0x" +
                     std::to_wstring(static_cast<std::uint32_t>(error.code())));
@@ -2260,6 +2406,63 @@ void UpdateOutputDevice(const Message& message, bool found) {
         });
     }
     ScheduleStatusRefresh();
+}
+
+void RebuildRoonCombo(const Controls::ComboBox& combo) {
+    if (!combo || !combo.DispatcherQueue().HasThreadAccess()) return;
+    const auto settings = ReadOutputSettings();
+    const auto devices = CopyOutputDevices();
+    g_suppressOutputSelection.store(true);
+    combo.Items().Clear();
+    int selectedIndex = 0;
+    bool any = false;
+    for (const auto& device : devices) {
+        if (!device.roon) continue;
+        any = true;
+        Controls::ComboBoxItem item;
+        std::wstring text = device.name;
+        if (!device.roonAddress.empty()) text += L" (" + device.roonAddress + L")";
+        if (!device.online) text += Localized(L"（离线）", L" (offline)");
+        item.Content(box_value(text));
+        item.Tag(box_value(winrt::hstring(device.udn)));
+        item.IsEnabled(device.online);
+        combo.Items().Append(item);
+        if (!settings.roonId.empty() && device.udn == settings.roonId) {
+            selectedIndex = static_cast<int>(combo.Items().Size()) - 1;
+        }
+    }
+    if (!any) {
+        Controls::ComboBoxItem placeholder;
+        placeholder.Content(box_value(Localized(
+            L"尚未发现兼容 R 设备，点「重新扫描」",
+            L"No R-device found, press Rescan now")));
+        placeholder.Tag(box_value(winrt::hstring(L"")));
+        combo.Items().Append(placeholder);
+    }
+    combo.SelectedIndex(selectedIndex);
+    g_suppressOutputSelection.store(false);
+}
+
+void RebuildRoonDeviceList(const Controls::TextBox& list) {
+    if (!list || !list.DispatcherQueue().HasThreadAccess()) return;
+    const auto devices = CopyOutputDevices();
+    std::wstring text;
+    bool any = false;
+    for (const auto& device : devices) {
+        if (!device.roon) continue;
+        any = true;
+        text += device.name;
+        if (!device.roonAddress.empty()) text += L" (" + device.roonAddress + L")";
+        if (device.roonPort) text += L" :" + std::to_wstring(device.roonPort);
+        if (!device.roonVersion.empty()) text += L"  v" + device.roonVersion;
+        if (!device.online) text += Localized(L"  [离线]", L"  [offline]");
+        text += L"\r\n";
+    }
+    if (!any) {
+        text = Localized(L"尚未发现兼容 R 设备，点「重新扫描」",
+                         L"No R-device found, press Rescan now");
+    }
+    list.Text(text);
 }
 
 Controls::Border CreateOutputTargetCard(
@@ -2299,10 +2502,18 @@ Controls::Border CreateOutputTargetCard(
     networkTabButton.Click([](auto&&, auto&&) {
         try { SelectOutputTab(1); } catch (...) {}
     });
+    Controls::Button roonTabButton;
+    roonTabButton.Name(L"AMExclusiveRoonTab");
+    roonTabButton.MinWidth(140.0);
+    roonTabButton.Click([](auto&&, auto&&) {
+        try { SelectOutputTab(2); } catch (...) {}
+    });
     tabStrip.Children().Append(localTabButton);
     tabStrip.Children().Append(networkTabButton);
+    tabStrip.Children().Append(roonTabButton);
     g_localTabButton = winrt::make_weak(localTabButton);
     g_networkTabButton = winrt::make_weak(networkTabButton);
+    g_roonTabButton = winrt::make_weak(roonTabButton);
 
     // ---- local tab -------------------------------------------------------
     Controls::StackPanel localPanel;
@@ -2750,6 +2961,155 @@ Controls::Border CreateOutputTargetCard(
     Automation::AutomationProperties::SetName(
         localDeviceCombo, Localized(L"本地输出设备", L"Local output device"));
 
+    // ---- R-Device tab ---------------------------------------------------
+    Controls::StackPanel roonPanel;
+    roonPanel.Name(L"AMExclusiveRoonOutputPanel");
+    roonPanel.Margin(Xaml::Thickness{0, 4, 0, 0});
+
+    Controls::StackPanel roonDeviceRow;
+    roonDeviceRow.Orientation(Controls::Orientation::Horizontal);
+    roonDeviceRow.Spacing(8.0);
+    Controls::TextBlock roonDeviceLabel;
+    roonDeviceLabel.Text(Localized(L"兼容 R 设备", L"R-device"));
+    roonDeviceLabel.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    roonDeviceLabel.MinWidth(120.0);
+    Controls::ComboBox roonCombo;
+    roonCombo.Name(L"AMExclusiveRoonDeviceCombo");
+    roonCombo.MinWidth(300.0);
+    roonCombo.SelectionChanged([](auto&&, auto&&) {
+        if (g_suppressOutputSelection.load()) return;
+        SetOutputStatusText(Localized(
+            L"已选择兼容 R 设备 · 点击「保存并应用」生效",
+            L"R-device selected - press Save & apply"));
+    });
+    Controls::Button roonRescan;
+    roonRescan.Content(box_value(Localized(L"重新扫描", L"Rescan now")));
+    roonRescan.MinWidth(104.0);
+    roonRescan.Click([](auto&&, auto&&) {
+        g_pendingRefreshDevices.store(true);
+        SetOutputStatusText(Localized(
+            L"正在扫描兼容 R 设备…", L"Scanning for R-devices…"));
+    });
+    roonDeviceRow.Children().Append(roonDeviceLabel);
+    roonDeviceRow.Children().Append(roonCombo);
+    roonDeviceRow.Children().Append(roonRescan);
+    roonPanel.Children().Append(roonDeviceRow);
+
+    const auto roonSettings = ReadOutputSettings();
+    const auto makeNumericRow = [&roonPanel, &nativeText](
+        const std::wstring& label, const std::wstring& value,
+        Controls::TextBox& box) {
+        Controls::StackPanel row;
+        row.Orientation(Controls::Orientation::Horizontal);
+        row.Spacing(8.0);
+        row.Margin(Xaml::Thickness{0, 4, 0, 0});
+        Controls::TextBlock text;
+        text.Text(label);
+        text.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        text.MinWidth(200.0);
+        if (nativeText.size() > 1) text.Style(nativeText[1].Style());
+        box.Text(value);
+        box.Width(110.0);
+        box.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        row.Children().Append(text);
+        row.Children().Append(box);
+        roonPanel.Children().Append(row);
+    };
+
+    Controls::TextBox roonBufferInput;
+    Controls::TextBox roonLeadInput;
+    Controls::TextBox roonSoodPortInput;
+    makeNumericRow(Localized(L"Buffer look-ahead (ms):", L"Buffer look-ahead (ms):"),
+                   std::to_wstring(roonSettings.roonBufferMs), roonBufferInput);
+    g_roonBufferInput = winrt::make_weak(roonBufferInput);
+
+    Controls::TextBlock roonBufferHint;
+    roonBufferHint.Text(Localized(
+        L"起播预填充 + 播放期间保持在设备侧领先播放位置的音频量。100–5000 ms；起播掉音时调大。",
+        L"How much audio stays pre-buffered on the device ahead of the play position: pre-roll flushed before START plus the stream lead the pump maintains. 100-5000 ms; raise it if track starts drop out."));
+    roonBufferHint.TextWrapping(Xaml::TextWrapping::Wrap);
+    roonBufferHint.Margin(Xaml::Thickness{0, 2, 0, 0});
+    if (nativeText.size() > 1) roonBufferHint.Style(nativeText[1].Style());
+    roonPanel.Children().Append(roonBufferHint);
+
+    Controls::StackPanel roonBitsRow;
+    roonBitsRow.Orientation(Controls::Orientation::Horizontal);
+    roonBitsRow.Spacing(8.0);
+    roonBitsRow.Margin(Xaml::Thickness{0, 4, 0, 0});
+    Controls::TextBlock roonBitsLabel;
+    roonBitsLabel.Text(Localized(L"Wire bits (off = auto from source):",
+                                 L"Wire bits (off = auto from source):"));
+    roonBitsLabel.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    roonBitsLabel.MinWidth(200.0);
+    Controls::ComboBox roonBitsCombo;
+    roonBitsCombo.Name(L"AMExclusiveRoonBitsCombo");
+    roonBitsCombo.MinWidth(150.0);
+    {
+        const std::wstring names[4] = {
+            Localized(L"Off (auto)", L"Off (auto)"),
+            L"16", L"24", L"32"};
+        for (const auto& name : names) {
+            Controls::ComboBoxItem item;
+            item.Content(box_value(name));
+            roonBitsCombo.Items().Append(item);
+        }
+    }
+    {
+        static constexpr int kBits[4] = {0, 16, 24, 32};
+        int best = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (kBits[i] == roonSettings.roonWireBits) { best = i; break; }
+        }
+        roonBitsCombo.SelectedIndex(best);
+    }
+    roonBitsRow.Children().Append(roonBitsLabel);
+    roonBitsRow.Children().Append(roonBitsCombo);
+    roonPanel.Children().Append(roonBitsRow);
+
+    makeNumericRow(Localized(L"Start lead (ms, 300-4000):", L"Start lead (ms, 300-4000):"),
+                   std::to_wstring(roonSettings.roonStartLeadMs), roonLeadInput);
+    g_roonLeadInput = winrt::make_weak(roonLeadInput);
+    makeNumericRow(Localized(L"SOOD port (0 = default 9003):", L"SOOD port (0 = default 9003):"),
+                   std::to_wstring(roonSettings.roonSoodPort), roonSoodPortInput);
+    g_roonSoodPortInput = winrt::make_weak(roonSoodPortInput);
+
+    Controls::TextBlock roonListLabel;
+    roonListLabel.Text(Localized(L"Discovered devices:", L"Discovered devices:"));
+    roonListLabel.Margin(Xaml::Thickness{0, 6, 0, 2});
+    if (nativeText.size() > 1) roonListLabel.Style(nativeText[1].Style());
+    roonPanel.Children().Append(roonListLabel);
+    Controls::TextBox roonDeviceList;
+    roonDeviceList.Name(L"AMExclusiveRoonDeviceList");
+    roonDeviceList.IsReadOnly(true);
+    roonDeviceList.AcceptsReturn(true);
+    roonDeviceList.TextWrapping(Xaml::TextWrapping::Wrap);
+    roonDeviceList.Height(110.0);
+    roonDeviceList.MinWidth(420.0);
+    roonPanel.Children().Append(roonDeviceList);
+
+    Controls::StackPanel roonButtons;
+    roonButtons.Orientation(Controls::Orientation::Horizontal);
+    roonButtons.Spacing(8.0);
+    roonButtons.Margin(Xaml::Thickness{0, 6, 0, 0});
+    Controls::Button roonSave;
+    roonSave.Content(box_value(Localized(L"保存并应用", L"Save & apply")));
+    roonSave.MinWidth(112.0);
+    roonSave.Click([](auto&&, auto&&) {
+        try { ApplyOutputSelection(); } catch (...) {}
+    });
+    Controls::Button roonRestart;
+    roonRestart.Content(box_value(Localized(L"重开当前曲目", L"Restart current track")));
+    roonRestart.MinWidth(132.0);
+    roonRestart.Click([](auto&&, auto&&) {
+        try { RequestRestartCurrent(); } catch (...) {}
+    });
+    roonButtons.Children().Append(roonSave);
+    roonButtons.Children().Append(roonRestart);
+    roonPanel.Children().Append(roonButtons);
+
+    Automation::AutomationProperties::SetName(
+        roonCombo, Localized(L"兼容 R 设备输出", L"R-device output"));
+
     // ---- assemble --------------------------------------------------------
     Controls::StackPanel labels;
     labels.VerticalAlignment(Xaml::VerticalAlignment::Center);
@@ -2759,6 +3119,7 @@ Controls::Border CreateOutputTargetCard(
     labels.Children().Append(tabStrip);
     labels.Children().Append(localPanel);
     labels.Children().Append(networkPanel);
+    labels.Children().Append(roonPanel);
 
     Controls::ColumnDefinition labelColumn;
     labelColumn.Width(Xaml::GridLength{1.0, Xaml::GridUnitType::Star});
@@ -2786,16 +3147,24 @@ Controls::Border CreateOutputTargetCard(
     g_localDeviceCombo = winrt::make_weak(localDeviceCombo);
     g_localPanel = winrt::make_weak(localPanel);
     g_networkPanel = winrt::make_weak(networkPanel);
+    g_roonPanel = winrt::make_weak(roonPanel);
     g_outputTargetStatus = winrt::make_weak(status);
+    g_roonCombo = winrt::make_weak(roonCombo);
+    g_roonBitsCombo = winrt::make_weak(roonBitsCombo);
+    g_roonDeviceList = winrt::make_weak(roonDeviceList);
 
     const auto settings = ReadOutputSettings();
     backendCombo.SelectedIndex(settings.kind == 2 ? 1 : 0);
     RefreshLocalDevices();
     RebuildLocalDeviceCombo();
     RebuildOutputCombo(combo);
+    RebuildRoonCombo(roonCombo);
+    RebuildRoonDeviceList(roonDeviceList);
     // Reopening Apple Music shows the tab that matches the saved output, not
     // whichever tab the user happened to browse last.
-    SelectOutputTab(settings.kind == 1 ? 1 : 0);
+    SelectOutputTab(settings.kind == 3 ? 2
+        : settings.tab >= 0 ? settings.tab
+        : settings.kind == 1 ? 1 : 0);
     return card;
 }
 
@@ -3376,8 +3745,9 @@ DWORD WINAPI PipeThread(void*) {
             if (pendingOutputKind >= 0) {
                 auto message = NewMessage(MessageType::SetOutputTarget, Role::Ui);
                 message.uiPid = GetCurrentProcessId();
-                // 0 = WASAPI, 1 = DLNA/OpenHome, 2 = ASIO. `format` carries the
-                // selected WASAPI endpoint id or ASIO driver CLSID.
+                // 0 = WASAPI, 1 = DLNA/OpenHome, 2 = ASIO, 3 = Roon RAAT.
+                // For kind 3 `format` carries the control port and `detail`
+                // packs "address|raat_version".
                 message.enabledIntent = static_cast<std::uint8_t>(pendingOutputKind);
                 message.hardwareBufferMs = static_cast<std::uint32_t>(
                     g_pendingOutputBufferMs.load());

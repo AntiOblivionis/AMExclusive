@@ -1,5 +1,6 @@
 #include "BoundedLog.h"
 #include "DlnaDiscovery.h"
+#include "audio_v2/RaatDiscovery.h"
 #include "IpcProtocol.h"
 #include "IpcTransport.h"
 
@@ -93,6 +94,13 @@ std::wstring g_dlnaUdn;
 std::wstring g_dlnaName;
 std::wstring g_dlnaLocation;
 std::uint32_t g_dlnaBufferMs{1500};
+std::wstring g_roonDeviceId;
+std::wstring g_roonName;
+std::wstring g_roonAddress;
+std::wstring g_roonVersion;
+std::uint16_t g_roonPort{};
+std::uint32_t g_roonBufferMs{1000};
+std::uint16_t g_roonSoodPort{9003};
 // Remembered local selections. The UI keeps both so switching tabs does not
 // lose the other backend's choice; the broker relays whichever one is active.
 std::wstring g_wasapiDeviceId;
@@ -109,9 +117,11 @@ std::wstring g_discoveredUdn;
 std::wstring g_discoveredLocation;
 std::wstring g_manualUrls;
 std::unique_ptr<ammod::dlna::DlnaDiscovery> g_discovery;
+std::unique_ptr<ammod::raat::RaatDiscovery> g_raatDiscovery;
 std::mutex g_deviceQueueMutex;
 std::condition_variable g_deviceQueueCv;
 std::deque<ammod::dlna::DiscoveredDevice> g_deviceQueue;
+std::deque<ammod::raat::RaatDevice> g_raatDeviceQueue;
 std::thread g_deviceBroadcastThread;
 std::atomic<bool> g_deviceBroadcastStop{false};
 std::thread g_iniWatchThread;
@@ -139,6 +149,9 @@ std::uint8_t ReadOutputKind() {
                              static_cast<DWORD>(std::size(value)), BrokerIniPath().c_str());
     if (_wcsicmp(value, L"dlna") == 0) return 1u;
     if (_wcsicmp(value, L"asio") == 0) return 2u;
+    if (_wcsicmp(value, L"r_device") == 0 ||
+        _wcsicmp(value, L"raat") == 0 ||
+        _wcsicmp(value, L"roon") == 0) return 3u;
     return 0u;
 }
 
@@ -171,6 +184,47 @@ std::uint32_t ReadDlnaBufferMs() {
     // 10000 matches the panel dropdown and DlnaSink's own clamp.
     return static_cast<std::uint32_t>(
         std::min(std::max(static_cast<int>(value), 300), 10000));
+}
+
+std::wstring ReadRoonValue(const wchar_t* key) {
+    wchar_t value[512]{};
+    GetPrivateProfileStringW(L"r_device", key, L"", value,
+                             static_cast<DWORD>(std::size(value)), BrokerIniPath().c_str());
+    if (value[0] == L'\0') {
+        GetPrivateProfileStringW(L"roon", key, L"", value,
+                                 static_cast<DWORD>(std::size(value)), BrokerIniPath().c_str());
+    }
+    return value;
+}
+
+std::uint16_t ReadRoonSoodPort() {
+    const int value = _wtoi(ReadRoonValue(L"sood_port").c_str());
+    return value > 0 && value <= 65535 ? static_cast<std::uint16_t>(value) : 9003;
+}
+
+std::uint32_t ReadRoonBufferMs() {
+    const auto value = GetPrivateProfileIntW(L"roon", L"buffer_ms", 1000,
+                                             BrokerIniPath().c_str());
+    return static_cast<std::uint32_t>(
+        std::min(std::max(static_cast<int>(value), 100), 5000));
+}
+
+void WriteRoonTarget(const std::wstring& deviceId, const std::wstring& name,
+                     const std::wstring& address, std::uint16_t port,
+                     const std::wstring& version, std::uint32_t bufferMs) {
+    const auto path = BrokerIniPath();
+    (void)WritePrivateProfileStringW(L"mod", L"output", L"r_device", path.c_str());
+    (void)WritePrivateProfileStringW(L"mod", L"output_tab", L"r_device", path.c_str());
+    for (const auto* sec : {L"r_device", L"roon"}) {
+        (void)WritePrivateProfileStringW(sec, L"device_id", deviceId.c_str(), path.c_str());
+        (void)WritePrivateProfileStringW(sec, L"device_name", name.c_str(), path.c_str());
+        (void)WritePrivateProfileStringW(sec, L"address", address.c_str(), path.c_str());
+        (void)WritePrivateProfileStringW(sec, L"port", std::to_wstring(port).c_str(), path.c_str());
+        (void)WritePrivateProfileStringW(sec, L"raat_version", version.c_str(), path.c_str());
+        (void)WritePrivateProfileStringW(sec, L"buffer_ms",
+                                         std::to_wstring(bufferMs).c_str(), path.c_str());
+    }
+    (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
 }
 
 void WriteOutputTarget(std::uint8_t kind, const std::wstring& udn,
@@ -250,6 +304,63 @@ void EnqueueDevice(const ammod::dlna::DiscoveredDevice& device) {
     g_deviceQueueCv.notify_one();
 }
 
+void BroadcastRaatDevice(const ammod::raat::RaatDevice& device) {
+    Message message{};
+    message.type = device.online ? MessageType::DeviceFound : MessageType::DeviceLost;
+    message.role = Role::Broker;
+    message.senderPid = GetCurrentProcessId();
+    GetSystemTimeAsFileTime(&message.timestampUtc);
+    CopyText(message.endpointId, device.deviceId);
+    CopyText(message.endpointName, device.friendlyName);
+    CopyText(message.detail, device.address + L"|" + device.raatVersion);
+    CopyText(message.format, std::to_wstring(device.controlPort));
+    message.hardwareBufferMs = g_roonBufferMs;
+    message.reserved[0] = device.online ? 1u : 0u;
+    // reserved[3] marks a Roon/RAAT device; the panel keeps the two lists apart.
+    message.reserved[3] = 1u;
+    std::vector<HANDLE> targets;
+    {
+        std::lock_guard lock(g_mutex);
+        for (const auto& client : g_clients) {
+            if (client.role != Role::Ui || client.minor < 3) continue;
+            HANDLE duplicate{};
+            if (DuplicateHandle(GetCurrentProcess(), client.pipe, GetCurrentProcess(),
+                                &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                targets.push_back(duplicate);
+            }
+        }
+    }
+    Log(L"broadcast roon device " + device.friendlyName + L" id=" + device.deviceId);
+    for (HANDLE pipe : targets) {
+        (void)WriteMessage(pipe, message);
+        CloseHandle(pipe);
+    }
+}
+
+void EnqueueRaatDevice(const ammod::raat::RaatDevice& device) {
+    {
+        std::lock_guard lock(g_deviceQueueMutex);
+        if (g_raatDeviceQueue.size() < 64) g_raatDeviceQueue.push_back(device);
+    }
+    g_deviceQueueCv.notify_one();
+}
+
+void SendRaatSnapshot(HANDLE pipe) {
+    if (!g_raatDiscovery) return;
+    for (const auto& device : g_raatDiscovery->Snapshot()) {
+        auto message = NewMessage(device.online ? MessageType::DeviceFound
+                                                : MessageType::DeviceLost, Role::Broker);
+        CopyText(message.endpointId, device.deviceId);
+        CopyText(message.endpointName, device.friendlyName);
+        CopyText(message.detail, device.address + L"|" + device.raatVersion);
+        CopyText(message.format, std::to_wstring(device.controlPort));
+        message.hardwareBufferMs = g_roonBufferMs;
+        message.reserved[0] = device.online ? 1u : 0u;
+        message.reserved[3] = 1u;
+        (void)WriteMessage(pipe, message);
+    }
+}
+
 void DeviceBroadcastThread() {
     for (;;) {
         ammod::dlna::DiscoveredDevice device;
@@ -257,10 +368,17 @@ void DeviceBroadcastThread() {
             std::unique_lock lock(g_deviceQueueMutex);
             g_deviceQueueCv.wait(lock, [] {
                 return g_deviceBroadcastStop.load(std::memory_order_acquire) ||
-                    !g_deviceQueue.empty();
+                    !g_deviceQueue.empty() || !g_raatDeviceQueue.empty();
             });
             if (g_deviceBroadcastStop.load(std::memory_order_acquire) &&
-                g_deviceQueue.empty()) break;
+                g_deviceQueue.empty() && g_raatDeviceQueue.empty()) break;
+            if (!g_raatDeviceQueue.empty()) {
+                auto roonDevice = std::move(g_raatDeviceQueue.front());
+                g_raatDeviceQueue.pop_front();
+                lock.unlock();
+                BroadcastRaatDevice(roonDevice);
+                continue;
+            }
             device = std::move(g_deviceQueue.front());
             g_deviceQueue.pop_front();
         }
@@ -272,7 +390,16 @@ void DeviceBroadcastThread() {
 Message OutputTargetMessage() {
     auto message = NewMessage(MessageType::SetOutputTarget, Role::Broker);
     message.enabledIntent = g_outputKind;
-    message.hardwareBufferMs = g_dlnaBufferMs;
+    message.hardwareBufferMs = g_outputKind == 3u ? g_roonBufferMs : g_dlnaBufferMs;
+    if (g_outputKind == 3u) {
+        // Roon packing: id/name in the usual slots, detail="ip|version",
+        // format=control port.
+        CopyText(message.endpointId, g_roonDeviceId);
+        CopyText(message.endpointName, g_roonName);
+        CopyText(message.detail, g_roonAddress + L"|" + g_roonVersion);
+        CopyText(message.format, std::to_wstring(g_roonPort));
+        return message;
+    }
     CopyText(message.endpointId, g_dlnaUdn);
     CopyText(message.detail, g_dlnaLocation);
     if (g_outputKind == 1u) {
@@ -330,11 +457,23 @@ void IniWatchThread() {
         const auto wasapiName = ReadModValue(L"wasapi_name");
         const auto asioClsid = ReadModValue(L"asio_driver");
         const auto asioName = ReadModValue(L"asio_name");
+        const auto roonId = ReadRoonValue(L"device_id");
+        const auto roonName = ReadRoonValue(L"device_name");
+        const auto roonAddress = ReadRoonValue(L"address");
+        const auto roonVersion = ReadRoonValue(L"raat_version");
+        const std::wstring roonPortText = ReadRoonValue(L"port");
+        const std::uint16_t roonPort = static_cast<std::uint16_t>(_wtoi(roonPortText.c_str()));
+        const auto roonBufferMs = ReadRoonBufferMs();
+        const std::uint16_t roonSoodPort = ReadRoonSoodPort();
         const bool changed = kind != g_outputKind || udn != g_dlnaUdn ||
             name != g_dlnaName || location != g_dlnaLocation ||
             bufferMs != g_dlnaBufferMs || wasapiId != g_wasapiDeviceId ||
             wasapiName != g_wasapiName || asioClsid != g_asioDriverClsid ||
-            asioName != g_asioName;
+            asioName != g_asioName || roonId != g_roonDeviceId ||
+            roonName != g_roonName || roonAddress != g_roonAddress ||
+            roonVersion != g_roonVersion || roonPort != g_roonPort ||
+            roonBufferMs != g_roonBufferMs ||
+            roonSoodPort != g_roonSoodPort;
         if (!changed) continue;
         g_outputKind = kind;
         g_dlnaUdn = udn;
@@ -345,13 +484,29 @@ void IniWatchThread() {
         g_wasapiName = wasapiName;
         g_asioDriverClsid = asioClsid;
         g_asioName = asioName;
+        g_roonDeviceId = roonId;
+        g_roonName = roonName;
+        g_roonAddress = roonAddress;
+        g_roonVersion = roonVersion;
+        g_roonPort = roonPort;
+        g_roonBufferMs = roonBufferMs;
+        if (roonSoodPort != g_roonSoodPort) {
+            g_roonSoodPort = roonSoodPort;
+            ammod::raat::SetSoodPort(roonSoodPort);
+            if (g_raatDiscovery) g_raatDiscovery->Refresh();
+            Log(L"roon sood port changed -> " + std::to_wstring(roonSoodPort));
+        }
         g_status.reserved[0] = g_outputKind;
-        if (g_outputKind != 0) {
+        if (g_outputKind == 3u) {
+            CopyText(g_status.endpointId, g_roonDeviceId);
+            CopyText(g_status.endpointName, g_roonName);
+        } else if (g_outputKind != 0) {
             CopyText(g_status.endpointId, g_dlnaUdn);
             CopyText(g_status.endpointName, g_dlnaName);
         }
         Log(L"ini target reloaded output=" + std::to_wstring(g_outputKind) +
-            L" device=" + g_dlnaName + L" location=" + g_dlnaLocation);
+            L" device=" + (g_outputKind == 3u ? g_roonName : g_dlnaName) +
+            L" location=" + g_dlnaLocation);
         Broadcast(OutputTargetMessage(), nullptr);
     }
 }
@@ -1256,8 +1411,8 @@ void HandleMessage(const Message& incoming, HANDLE source) {
         } else if (incoming.type == MessageType::SetOutputTarget &&
                    (incoming.role == Role::Ui || incoming.role == Role::Controller)) {
             if (incoming.minor < 3) return;
-            // 0 = WASAPI endpoint, 1 = DLNA/OpenHome renderer, 2 = ASIO driver.
-            const std::uint8_t kind = incoming.enabledIntent > 2u
+            // 0 = WASAPI, 1 = DLNA/OpenHome, 2 = ASIO, 3 = Roon RAAT.
+            const std::uint8_t kind = incoming.enabledIntent > 3u
                 ? 0u : incoming.enabledIntent;
             if (kind == 1u && incoming.endpointId[0] == L'\0') return;
             if (kind == 2u && incoming.format[0] == L'\0') return;
@@ -1271,16 +1426,36 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             g_dlnaBufferMs = ReadDlnaBufferMs();
             const std::wstring localId = incoming.format;
             const std::wstring localName = incoming.endpointName;
-            if (kind == 2u) {
+            if (kind == 3u) {
+                g_roonDeviceId = incoming.endpointId;
+                g_roonName = incoming.endpointName;
+                g_roonPort = static_cast<std::uint16_t>(_wtoi(incoming.format));
+                std::wstring detail = incoming.detail;
+                const auto separator = detail.find(L'|');
+                if (separator != std::wstring::npos) {
+                    g_roonAddress = detail.substr(0, separator);
+                    g_roonVersion = detail.substr(separator + 1);
+                } else {
+                    g_roonAddress = detail;
+                    g_roonVersion.clear();
+                }
+                g_roonBufferMs = incoming.hardwareBufferMs
+                    ? incoming.hardwareBufferMs : ReadRoonBufferMs();
+            } else if (kind == 2u) {
                 g_asioDriverClsid = localId;
                 g_asioName = localName;
             } else if (kind == 0u) {
                 g_wasapiDeviceId = localId;
                 g_wasapiName = localName;
             }
-            (void)WriteOutputTarget(g_outputKind, g_dlnaUdn, g_dlnaName,
-                                    g_dlnaLocation, g_dlnaBufferMs,
-                                    localId, localName);
+            if (kind == 3u) {
+                WriteRoonTarget(g_roonDeviceId, g_roonName, g_roonAddress,
+                                g_roonPort, g_roonVersion, g_roonBufferMs);
+            } else {
+                (void)WriteOutputTarget(g_outputKind, g_dlnaUdn, g_dlnaName,
+                                        g_dlnaLocation, g_dlnaBufferMs,
+                                        localId, localName);
+            }
             if (!g_status.enabledIntent) {
                 // Saving any output in the panel is a request to route audio
                 // through AME, just like enabling exclusive mode.
@@ -1293,6 +1468,9 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             if (g_outputKind == 1u) {
                 CopyText(g_status.endpointName, g_dlnaName);
                 CopyText(g_status.endpointId, g_dlnaUdn);
+            } else if (g_outputKind == 3u) {
+                CopyText(g_status.endpointName, g_roonName);
+                CopyText(g_status.endpointId, g_roonDeviceId);
             } else {
                 CopyText(g_status.endpointName, CurrentLocalDeviceName());
                 CopyText(g_status.endpointId, CurrentLocalDeviceId());
@@ -1472,6 +1650,7 @@ void ClientThread(HANDLE pipe) {
             return;
         }
     }
+    if (hello.role == Role::Ui && hello.minor >= 3) SendRaatSnapshot(pipe);
     if (hello.role == Role::Ui && hello.minor >= 3 && g_discovery) {
         const auto devices = g_discovery->Snapshot();
         for (const auto& device : devices) {
@@ -1515,6 +1694,8 @@ void ClientThread(HANDLE pipe) {
                 }
                 g_discovery->Refresh();
             }
+            SendRaatSnapshot(pipe);
+            if (g_raatDiscovery) g_raatDiscovery->Refresh();
         } else HandleMessage(incoming, pipe);
     }
     RemoveClient(pipe);
@@ -1648,9 +1829,20 @@ int wmain() {
     g_wasapiName = ReadModValue(L"wasapi_name");
     g_asioDriverClsid = ReadModValue(L"asio_driver");
     g_asioName = ReadModValue(L"asio_name");
+    g_roonDeviceId = ReadRoonValue(L"device_id");
+    g_roonName = ReadRoonValue(L"device_name");
+    g_roonAddress = ReadRoonValue(L"address");
+    g_roonVersion = ReadRoonValue(L"raat_version");
+    g_roonPort = static_cast<std::uint16_t>(_wtoi(ReadRoonValue(L"port").c_str()));
+    g_roonBufferMs = ReadRoonBufferMs();
+    g_roonSoodPort = ReadRoonSoodPort();
+    ammod::raat::SetSoodPort(g_roonSoodPort);
     g_manualUrls = ReadDlnaValue(L"manual_urls");
     g_status.reserved[0] = g_outputKind;
-    if (g_outputKind != 0) {
+    if (g_outputKind == 3u) {
+        CopyText(g_status.endpointId, g_roonDeviceId);
+        CopyText(g_status.endpointName, g_roonName);
+    } else if (g_outputKind != 0) {
         CopyText(g_status.endpointId, g_dlnaUdn);
         CopyText(g_status.endpointName, g_dlnaName);
     }
@@ -1675,6 +1867,15 @@ int wmain() {
     std::wcout << L"Broker ready: " << pipeName << L'\n';
     g_deviceBroadcastThread = std::thread(DeviceBroadcastThread);
     g_iniWatchThread = std::thread(IniWatchThread);
+    g_raatDiscovery = std::make_unique<ammod::raat::RaatDiscovery>();
+    std::wstring raatDiscoveryError;
+    if (!g_raatDiscovery->Start([](const ammod::raat::RaatDevice& device) {
+            EnqueueRaatDevice(device);
+        }, [](const std::wstring& text) {
+            Log(text);
+        }, raatDiscoveryError)) {
+        Log(L"RAAT discovery unavailable: " + raatDiscoveryError);
+    }
     g_discovery = std::make_unique<ammod::dlna::DlnaDiscovery>();
     std::wstring discoveryError;
     if (!g_discovery->Start([](const ammod::dlna::DiscoveredDevice& device) {
@@ -1729,6 +1930,7 @@ int wmain() {
     }
     Log(L"companion shutdown complete");
     if (g_discovery) g_discovery->Stop();
+    if (g_raatDiscovery) g_raatDiscovery->Stop();
     g_deviceBroadcastStop.store(true, std::memory_order_release);
     g_deviceQueueCv.notify_all();
     if (g_deviceBroadcastThread.joinable()) g_deviceBroadcastThread.join();

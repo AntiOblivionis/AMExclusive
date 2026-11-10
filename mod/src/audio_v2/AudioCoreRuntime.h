@@ -336,6 +336,7 @@ private:
     LocalPlaybackTuning localTuning_{};
     AudioSinkKind outputKind_{AudioSinkKind::Wasapi};
     DlnaTarget dlnaTarget_{};
+    RaatTarget raatTarget_{};
     std::uint32_t streamBufferMs_{1500};
     std::wstring wasapiDeviceId_;
     std::wstring asioDriverClsid_;

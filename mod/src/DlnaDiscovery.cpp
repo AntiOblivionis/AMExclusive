@@ -293,11 +293,20 @@ void DlnaDiscovery::ScanOnce() noexcept {
         DWORD ttl = 2;
         (void)setsockopt(socket, IPPROTO_IP, IP_MULTICAST_TTL,
                          reinterpret_cast<const char*>(&ttl), sizeof(ttl));
+        BOOL broadcastEnable = TRUE;
+        (void)setsockopt(socket, SOL_SOCKET, SO_BROADCAST,
+                         reinterpret_cast<const char*>(&broadcastEnable), sizeof(broadcastEnable));
 
         sockaddr_in target{};
         target.sin_family = AF_INET;
         target.sin_port = htons(kSsdpPort);
         inet_pton(AF_INET, "239.255.255.250", &target.sin_addr);
+
+        sockaddr_in broadcastTarget{};
+        broadcastTarget.sin_family = AF_INET;
+        broadcastTarget.sin_port = htons(kSsdpPort);
+        inet_pton(AF_INET, "255.255.255.255", &broadcastTarget.sin_addr);
+
         for (const auto* type : searchTypes) {
             const std::wstring search =
                 L"M-SEARCH * HTTP/1.1\r\n"
@@ -309,6 +318,8 @@ void DlnaDiscovery::ScanOnce() noexcept {
             for (unsigned attempt = 0; attempt < 2; ++attempt) {
                 sendto(socket, searchBytes.c_str(), static_cast<int>(searchBytes.size()), 0,
                        reinterpret_cast<const sockaddr*>(&target), sizeof(target));
+                sendto(socket, searchBytes.c_str(), static_cast<int>(searchBytes.size()), 0,
+                       reinterpret_cast<const sockaddr*>(&broadcastTarget), sizeof(broadcastTarget));
             }
             LogLine(L"ssdp search iface=" + localAddress + L" st=" + type);
         }

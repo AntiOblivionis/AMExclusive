@@ -62,6 +62,7 @@ private:
         Int32Aligned,
         Int24Packed,
         Int16Packed,
+        Float32,
     };
 
     // ASIO callbacks are plain function pointers with no user context, so the

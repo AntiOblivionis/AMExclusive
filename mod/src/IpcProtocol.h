@@ -98,6 +98,11 @@ enum class ErrorCategory : std::uint16_t {
     DlnaStreamFailed,
     DlnaControlFailed,
     DlnaSeekUnsupported,
+    RaatDeviceUnavailable,
+    RaatFormatUnsupported,
+    RaatStreamFailed,
+    RaatControlFailed,
+    RaatScriptRejected,
 };
 
 #pragma pack(push, 1)
@@ -157,6 +162,11 @@ inline ErrorCategory CategorizeAudioError(HRESULT hr) noexcept {
     case ammod::audio::kDlnaStreamFailed: return ErrorCategory::DlnaStreamFailed;
     case ammod::audio::kDlnaControlFailed: return ErrorCategory::DlnaControlFailed;
     case ammod::audio::kDlnaSeekUnsupported: return ErrorCategory::DlnaSeekUnsupported;
+    case ammod::audio::kRaatDeviceUnavailable: return ErrorCategory::RaatDeviceUnavailable;
+    case ammod::audio::kRaatFormatUnsupported: return ErrorCategory::RaatFormatUnsupported;
+    case ammod::audio::kRaatStreamFailed: return ErrorCategory::RaatStreamFailed;
+    case ammod::audio::kRaatControlFailed: return ErrorCategory::RaatControlFailed;
+    case ammod::audio::kRaatScriptRejected: return ErrorCategory::RaatScriptRejected;
     case HRESULT_FROM_WIN32(ERROR_TIMEOUT): return ErrorCategory::Timeout;
     case AUDCLNT_E_UNSUPPORTED_FORMAT: return ErrorCategory::FormatUnsupported;
     case AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED: return ErrorCategory::ExclusiveNotAllowed;

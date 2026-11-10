@@ -350,22 +350,13 @@ bool DlnaSink::BuildFormatCandidates(const std::wstring& sinkProtocolInfo) noexc
     // unknown sink therefore admits both paths, and the LPCM-first ordering
     // below decides which is tried first.
     const bool sinkUnknown = sinkProtocolInfo.empty();
-    // Rank every candidate twice: bare LPCM (audio/L16, audio/L24) first, WAV
-    // as the fallback. WAV needs a RIFF container whose length is unknown for
-    // a live stream, which is exactly the shape many renderers mishandle, so it
-    // is only offered when the device declares no raw PCM support.
-    for (const bool preferWav : {false, true}) {
+    const bool isFlacShape = DlnaStreamShapeUsesFlac(shape_);
+    if (isFlacShape) {
         for (const auto& candidate : candidates) {
-            const bool wavAllowed = sinkUnknown ||
-                DlnaControlClient::ProtocolAllows(sinkProtocolInfo, true, candidate.rate,
+            const bool flacAllowed = sinkUnknown ||
+                DlnaControlClient::ProtocolAllows(sinkProtocolInfo, shape_, candidate.rate,
                                                   candidate.bits, 2);
-            // candidate.bits is already constrained to [1,24] by add() above,
-            // so no extra depth guard is needed here.
-            const bool pcmAllowed = sinkUnknown ||
-                DlnaControlClient::ProtocolAllows(sinkProtocolInfo, false, candidate.rate,
-                                                  candidate.bits, 2);
-            const bool allowed = preferWav ? wavAllowed : pcmAllowed;
-            if (!allowed) continue;
+            if (!flacAllowed) continue;
             PcmFormat format = params_.format;
             format.sampleRate = candidate.rate;
             format.validBits = candidate.bits;
@@ -373,7 +364,32 @@ bool DlnaSink::BuildFormatCandidates(const std::wstring& sinkProtocolInfo) noexc
             format.encoding = PcmEncoding::SignedInteger;
             format.interleaved = true;
             if (!IsValidEndpointFormat(format, true)) continue;
-            formatCandidates_.emplace_back(format, preferWav);
+            formatCandidates_.emplace_back(format, false);
+        }
+    } else {
+        // Rank every candidate twice: bare LPCM (audio/L16, audio/L24) first, WAV
+        // as the fallback. WAV needs a RIFF container whose length is unknown for
+        // a live stream, which is exactly the shape many renderers mishandle, so it
+        // is only offered when the device declares no raw PCM support.
+        for (const bool preferWav : {false, true}) {
+            for (const auto& candidate : candidates) {
+                const bool wavAllowed = sinkUnknown ||
+                    DlnaControlClient::ProtocolAllows(sinkProtocolInfo, true, candidate.rate,
+                                                      candidate.bits, 2);
+                const bool pcmAllowed = sinkUnknown ||
+                    DlnaControlClient::ProtocolAllows(sinkProtocolInfo, false, candidate.rate,
+                                                      candidate.bits, 2);
+                const bool allowed = preferWav ? wavAllowed : pcmAllowed;
+                if (!allowed) continue;
+                PcmFormat format = params_.format;
+                format.sampleRate = candidate.rate;
+                format.validBits = candidate.bits;
+                format.containerBits = candidate.bits;
+                format.encoding = PcmEncoding::SignedInteger;
+                format.interleaved = true;
+                if (!IsValidEndpointFormat(format, true)) continue;
+                formatCandidates_.emplace_back(format, preferWav);
+            }
         }
     }
     if (formatCandidates_.empty()) return false;
@@ -699,7 +715,20 @@ bool DlnaSink::AppendNextTrackToDevice() noexcept {
                                     newId, error)) {
             DlnaLog(L"auto-advance queued afterId=" + std::to_wstring(lastOpenHomeId_) +
                     L" newId=" + std::to_wstring(newId) + L" url=" + streamUrl_);
+            openHomeHistoryIds_.push_back(lastOpenHomeId_);
             lastOpenHomeId_ = newId;
+
+            // Clean up older items so the device playlist does not accumulate unbounded entries.
+            while (openHomeHistoryIds_.size() > 2) {
+                const auto oldId = openHomeHistoryIds_.front();
+                openHomeHistoryIds_.erase(openHomeHistoryIds_.begin());
+                std::wstring delErr;
+                if (!control_.OpenHomeDelete(target_, oldId, delErr)) {
+                    DlnaLog(L"openhome old item cleanup failed id=" + std::to_wstring(oldId) +
+                            L" reason=" + delErr);
+                }
+            }
+
             if (shape_ == DlnaStreamShape::FlacLive) {
                 // The renderer will not advance on its own: a live body has no
                 // length, so it would sit on the current item forever. Move the
@@ -727,8 +756,26 @@ bool DlnaSink::AppendNextTrackToDevice() noexcept {
         DlnaLog(L"auto-advance queue failed, forcing full send device=" +
                 target_.friendlyName + L" reason=" + error);
     }
-    // Plain AVTransport renderers (or a failed queue) keep the old immediate
-    // behavior; SetNextAVTransportURI would be the gentle variant there.
+    // Plain AVTransport renderers: if SetNextAVTransportURI is supported,
+    // queue the new URL ahead of time so the renderer seamlessly rolls over
+    // without interrupting the current track's playback tail.
+    if (target_.avTransport && target_.nextUri && !target_.avTransportControl.empty()) {
+        const bool broadcast = shape_ == DlnaStreamShape::FlacLive;
+        const auto duration = DlnaControlClient::TimeText(streamSeconds_) + L".000";
+        const std::uint64_t didlSize =
+            DlnaStreamShapeIsFile(shape_) ? totalBytes_ : 0;
+        const auto didl = upnp::BuildDidlLite(
+            L"ame-" + GuidToken(), L"Apple Music", streamUrl_, protocolInfo_,
+            broadcast ? std::wstring() : duration, broadcast, didlSize,
+            format_.sampleRate, format_.containerBits, format_.channels);
+        std::wstring nextError;
+        if (control_.SetNextAvTransportUri(target_, streamUrl_, didl, nextError)) {
+            DlnaLog(L"auto-advance: queued SetNextAVTransportURI url=" + streamUrl_);
+            pendingPlayDeadlineTick_ = GetTickCount64() + 25000;
+            return true;
+        }
+        DlnaLog(L"SetNextAVTransportURI failed, falling back to immediate send: " + nextError);
+    }
     return SendStreamToDevice();
 }
 
@@ -1350,11 +1397,22 @@ void DlnaSink::SubmitNaturalEndOfStreamDelayed() noexcept {
                 (live ? L"1" : L"0"));
     }
     const auto deadline = beginTick + kDiagnosticDelayMs;
+    std::uint64_t emptySinceTick = 0;
     while (!successorPending && GetTickCount64() < deadline) {
         if (producerStop_.load(std::memory_order_acquire)) {
             DlnaLog(L"natural EOS hold cancelled by manual stop");
             naturalEosHold_.store(false, std::memory_order_release);
             return;
+        }
+        if (session_ && session_->BufferedBytes() == 0 && session_->EndOfStream()) {
+            if (emptySinceTick == 0) {
+                emptySinceTick = GetTickCount64();
+            } else if (GetTickCount64() - emptySinceTick >= 3000) {
+                DlnaLog(L"natural EOS hold finished early: buffer fully drained by renderer");
+                break;
+            }
+        } else {
+            emptySinceTick = 0;
         }
         Sleep(25);
         successorPending = naturalEosDelayCancel_.load(std::memory_order_acquire);

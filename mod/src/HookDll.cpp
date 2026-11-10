@@ -3704,23 +3704,42 @@ DWORD WINAPI PipeClientLoop(void*) {
                     L" allowResampling=" + std::to_wstring(incoming.allowResampling));
             } else if (incoming.type == MessageType::SetOutputTarget) {
                 using ammod::audio_v2::AudioSinkKind;
-                // 0 = WASAPI endpoint, 1 = DLNA/OpenHome renderer, 2 = ASIO driver.
-                const std::uint8_t kindCode = incoming.enabledIntent > 2u
+                // 0 = WASAPI endpoint, 1 = DLNA/OpenHome renderer,
+                // 2 = ASIO driver, 3 = Roon RAAT endpoint.
+                const std::uint8_t kindCode = incoming.enabledIntent > 3u
                     ? 0u : incoming.enabledIntent;
                 // "HiFi player" mode routes every local kind - WASAPI, ASIO and
                 // DLNA - through the separate audiohost process. The hook only
                 // moves PCM; the device fields below still carry enough for
                 // RemoteSink (and its in-process fallback) to pick the engine.
+                // Roon always stays in-process: RaatSession owns its own sockets.
                 const bool hifiMode =
                     _wcsicmp(ReadSetting(L"player_mode", L"am").c_str(), L"hifi") == 0;
                 ammod::audio_v2::OutputProfile profile{};
-                profile.kind = hifiMode ? AudioSinkKind::Remote
-                    : (kindCode == 2u ? AudioSinkKind::Asio
-                     : kindCode == 1u ? AudioSinkKind::Dlna
-                                      : AudioSinkKind::Wasapi);
+                profile.kind = kindCode == 3u ? AudioSinkKind::Raat
+                    : (hifiMode ? AudioSinkKind::Remote
+                     : (kindCode == 2u ? AudioSinkKind::Asio
+                      : kindCode == 1u ? AudioSinkKind::Dlna
+                                       : AudioSinkKind::Wasapi));
                 profile.dlna.udn = incoming.endpointId;
                 profile.dlna.friendlyName = incoming.endpointName;
                 profile.dlna.location = incoming.detail;
+                if (kindCode == 3u) {
+                    // Roon IPC packing: endpointId=device id, endpointName=name,
+                    // format=control port, detail="ip|raat_version".
+                    profile.raat.deviceId = incoming.endpointId;
+                    profile.raat.friendlyName = incoming.endpointName;
+                    profile.raat.controlPort = static_cast<std::uint16_t>(
+                        _wtoi(incoming.format));
+                    std::wstring detail = incoming.detail;
+                    const auto separator = detail.find(L'|');
+                    if (separator != std::wstring::npos) {
+                        profile.raat.address = detail.substr(0, separator);
+                        profile.raat.raatVersion = detail.substr(separator + 1);
+                    } else {
+                        profile.raat.address = detail;
+                    }
+                }
                 profile.streamBufferMs = incoming.hardwareBufferMs
                     ? incoming.hardwareBufferMs : 1500u;
                 // `format` carries the WASAPI endpoint id or ASIO driver CLSID;

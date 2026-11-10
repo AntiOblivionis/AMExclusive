@@ -3,6 +3,7 @@
 #include "DlnaLog.h"
 #include "DlnaSink.h"
 #include "RemoteSink.h"
+#include "RaatSink.h"
 
 #include <new>
 
@@ -51,6 +52,8 @@ HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) n
         }
         if (config.sinkKind == AudioSinkKind::Dlna) {
             sink_ = std::make_unique<DlnaSink>();
+        } else if (config.sinkKind == AudioSinkKind::Raat) {
+            sink_ = std::make_unique<RaatSink>();
         } else if (config.sinkKind == AudioSinkKind::Asio) {
             sink_ = std::make_unique<AsioExclusiveSink>();
         } else if (config.sinkKind == AudioSinkKind::Remote) {

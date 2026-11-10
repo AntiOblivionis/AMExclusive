@@ -46,6 +46,7 @@ public:
     // OpenHome Playlist / Time / Volume / Info. These are the primary path for
     // OpenHome renderers; AVTransport remains the transport-control fallback.
     bool OpenHomeDeleteAll(const DlnaTarget& target, std::wstring& error) noexcept;
+    bool OpenHomeDelete(const DlnaTarget& target, std::uint32_t id, std::wstring& error) noexcept;
     // Legacy OpenHome (v0 draft) exposes Playlist.Write(Id, Uris, Titles) instead
     // of Insert. hifi-relay drives such devices with Write + Playlist.Play.
     bool OpenHomeWrite(const DlnaTarget& target, std::uint32_t id,
@@ -96,6 +97,9 @@ public:
     static std::wstring ProtocolInfoFor(DlnaStreamShape shape, const PcmFormat& format,
                                         bool converted);
     static bool ProtocolAllows(const std::wstring& sinkProtocolInfo, bool wav,
+                               std::uint32_t sampleRate, std::uint16_t bits,
+                               std::uint16_t channels);
+    static bool ProtocolAllows(const std::wstring& sinkProtocolInfo, DlnaStreamShape shape,
                                std::uint32_t sampleRate, std::uint16_t bits,
                                std::uint16_t channels);
     static std::wstring TimeText(std::uint32_t seconds);

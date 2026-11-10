@@ -291,12 +291,17 @@ void AudioCoreRuntime::SetOutputTarget(AudioSinkKind kind, const DlnaTarget& tar
 void AudioCoreRuntime::SetOutputProfile(const OutputProfile& profile) noexcept {
     if (abandoned_.load(std::memory_order_acquire)) return;
     OutputProfile requested = profile;
-    if (requested.streamBufferMs < 200) requested.streamBufferMs = 200;
-    if (requested.streamBufferMs > 3000) requested.streamBufferMs = 3000;
+    if (requested.kind == AudioSinkKind::Raat) {
+        requested.streamBufferMs = std::clamp(requested.streamBufferMs, 100u, 5000u);
+    } else {
+        if (requested.streamBufferMs < 200) requested.streamBufferMs = 200;
+        if (requested.streamBufferMs > 3000) requested.streamBufferMs = 3000;
+    }
 
     OutputProfile current;
     current.kind = outputKind_;
     current.dlna = dlnaTarget_;
+    current.raat = raatTarget_;
     current.streamBufferMs = streamBufferMs_;
     current.wasapiDeviceId = wasapiDeviceId_;
     current.asioDriverClsid = asioDriverClsid_;
@@ -308,6 +313,7 @@ void AudioCoreRuntime::SetOutputProfile(const OutputProfile& profile) noexcept {
     const auto apply = [this](const OutputProfile& value) noexcept {
         outputKind_ = value.kind;
         dlnaTarget_ = value.dlna;
+        raatTarget_ = value.raat;
         streamBufferMs_ = value.streamBufferMs;
         wasapiDeviceId_ = value.wasapiDeviceId;
         asioDriverClsid_ = value.asioDriverClsid;
@@ -1753,7 +1759,8 @@ void AudioCoreRuntime::Emit(AudioCoreRuntimeEvent event, HRESULT result) noexcep
         ? callbacks_.captureEventContext(callbacks_.context) : 0;
     snapshot.mediaGeneration = boundMediaGeneration_.load(std::memory_order_acquire);
     snapshot.sinkKind = coordinator_.SinkKind();
-    snapshot.sinkName = dlnaTarget_.friendlyName;
+    snapshot.sinkName = outputKind_ == AudioSinkKind::Raat
+        ? raatTarget_.friendlyName : dlnaTarget_.friendlyName;
     snapshot.converter = BoundConverter();
     snapshot.outputFormat = coordinator_.OutputFormat();
     snapshot.sourceFormat = coordinator_.SourceFormat();
@@ -1856,6 +1863,7 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     if (outputChangePending_) {
         outputKind_ = pendingProfile_.kind;
         dlnaTarget_ = pendingProfile_.dlna;
+        raatTarget_ = pendingProfile_.raat;
         streamBufferMs_ = pendingProfile_.streamBufferMs;
         wasapiDeviceId_ = pendingProfile_.wasapiDeviceId;
         asioDriverClsid_ = pendingProfile_.asioDriverClsid;
@@ -1969,6 +1977,7 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     config.sinkKind = outputKind_;
     config.sink.streamBufferMs = streamBufferMs_;
     config.sink.dlna = dlnaTarget_;
+    config.sink.raat = raatTarget_;
     config.sink.format = format;
     config.sink.allowResampling = allowConversion;
     // A new generation after a known pause reopens the physical stream. Keep
@@ -2082,12 +2091,16 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
             requiredPrebufferFrames_, static_cast<std::uint32_t>(usableFrames));
     }
     const auto rate = static_cast<std::uint64_t>(format.sampleRate);
-    if (outputKind_ == AudioSinkKind::Dlna) {
+    if (outputKind_ == AudioSinkKind::Dlna ||
+        outputKind_ == AudioSinkKind::Raat) {
         // Keep the reservoir near the configured target. The existing 9/10/11 ms
         // software pump performs the coarse drift correction; +/-10% covers
         // ordinary DAC clock drift with a 1-1.5 s reservoir.
-        nativePumpLowWaterFrames_ = rate * std::max<std::uint32_t>(streamBufferMs_ / 2u, 300u) / 1000u;
-        nativePumpHighWaterFrames_ = rate * (streamBufferMs_ + 500u) / 1000u;
+        const auto effectiveBufferMs = outputKind_ == AudioSinkKind::Raat
+            ? std::min<std::uint32_t>(streamBufferMs_, 1000u)
+            : streamBufferMs_;
+        nativePumpLowWaterFrames_ = rate * std::max<std::uint32_t>(effectiveBufferMs / 2u, 300u) / 1000u;
+        nativePumpHighWaterFrames_ = rate * (effectiveBufferMs + 500u) / 1000u;
     } else {
         const std::uint64_t baselineLow = rate * 3u / 10u;
         const std::uint64_t baselineHigh = rate / 2u;
