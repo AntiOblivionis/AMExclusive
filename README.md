@@ -8,7 +8,7 @@
 
 [中文](README.zh-CN.md)
 
-[Website](https://amexclusive.tgwgroup.ltd/en/) · [Documentation](https://amexclusive.tgwgroup.ltd/en/docs/)
+[Website](https://amexclusive.tgwgroup.ltd/en/) · [Documentation](https://amexclusive.tgwgroup.ltd/en/docs/) · [Technical article (Chinese)](https://tgwgroup.ltd/2026/11/11/about-amexclusive/) · [Support the developer](https://tgwgroup.ltd/2025/10/19/support-me/)
 
 ## Description
 
