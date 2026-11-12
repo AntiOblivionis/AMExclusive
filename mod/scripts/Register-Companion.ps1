@@ -49,10 +49,33 @@ $registered = $folder.RegisterTaskDefinition($taskName, $task, 6, $sid, $null, 3
 # Read back the persisted task, including the event and lifetime policy.
 $registered = $folder.GetTask($taskName)
 $definition = $registered.Definition
-$registeredPrincipal = $definition.Principal.UserId
-if ($registeredPrincipal -notmatch '^S-1-') {
-    $registeredPrincipal = (New-Object Security.Principal.NTAccount($registeredPrincipal)).Translate(
-        [Security.Principal.SecurityIdentifier]).Value
+# Principal.UserId can be an unqualified account name that Windows cannot
+# translate even when the persisted task identifies the correct user by SID.
+# Validate the persisted principal without weakening the exact SID check.
+try {
+    $registeredXml = [xml]$definition.XmlText
+    $registeredNamespaces = [System.Xml.XmlNamespaceManager]::new($registeredXml.NameTable)
+    $registeredNamespaces.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+    $principals = $registeredXml.SelectNodes('/t:Task/t:Principals/t:Principal', $registeredNamespaces)
+    if ($principals.Count -ne 1) { throw 'Ambiguous task principal.' }
+    $users = $principals[0].SelectNodes('t:UserId', $registeredNamespaces)
+    $groups = $principals[0].SelectNodes('t:GroupId', $registeredNamespaces)
+    $actionGroups = $registeredXml.SelectNodes('/t:Task/t:Actions', $registeredNamespaces)
+    if ($users.Count -ne 1 -or $groups.Count -ne 0 -or $actionGroups.Count -ne 1 -or
+        [string]::IsNullOrWhiteSpace($users[0].InnerText)) {
+        throw 'Invalid task principal.'
+    }
+    $context = $actionGroups[0].GetAttribute('Context')
+    if ($context -and $context -cne $principals[0].GetAttribute('id')) {
+        throw 'Task action principal mismatch.'
+    }
+    $registeredPrincipal = [string]$users[0].InnerText
+    if ($registeredPrincipal -notmatch '^S-1-') {
+        $registeredPrincipal = (New-Object Security.Principal.NTAccount($registeredPrincipal)).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+    }
+} catch {
+    throw (Get-InstallerText '无法验证伴生计划任务的运行账户。' 'Cannot verify the companion task user identity.')
 }
 if (-not $registered.Enabled -or $definition.Actions.Count -ne 1 -or
     $definition.Actions.Item(1).Path -ne $broker -or

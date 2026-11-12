@@ -96,9 +96,11 @@ struct LocalSeekFingerprint final {
     std::array<std::uintptr_t, 2> frame2;
 };
 
-inline constexpr std::array<LocalSeekFingerprint, 2> kLocalSeekFingerprints{{
+inline constexpr std::array<LocalSeekFingerprint, 3> kLocalSeekFingerprints{{
     {L"1.6.4.90", 0x0040B9FA, 0x0082F6BC, {0x00B1E8AD, 0x00B1E972}},
     {L"1.7.0.155", 0x00435FE6, 0x008669AB, {0x00B5BCA1, 0x00B5BD64}},
+    // Static 1.7.0.156 seek candidate; live seek validation is pending.
+    {L"1.7.0.156", 0x00435FE6, 0x008669AB, {0x00B5BD15, 0x00B5BDD8}},
 }};
 
 inline bool MatchesLocalSeekReset(std::uintptr_t frame0, std::uintptr_t frame1,
