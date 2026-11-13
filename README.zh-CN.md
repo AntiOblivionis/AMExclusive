@@ -6,6 +6,10 @@
 
 ### Make Apple Music on Windows a “Pro” Hi-Fi Player
 
+<p align="left">
+  <a href="https://ko-fi.com/J1F02AL174"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi"></a>
+</p>
+
 [English](README.md)
 
 [官网](https://amexclusive.tgwgroup.ltd/zh/) · [使用文档](https://amexclusive.tgwgroup.ltd/zh/docs/) · [技术文章](https://tgwgroup.ltd/2026/11/11/about-amexclusive/) · [支持开发者](https://tgwgroup.ltd/2025/10/19/support-me/)
