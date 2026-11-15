@@ -6,6 +6,7 @@
 /scripts/
 /mod/tests/*
 !/mod/tests/WasapiDrainProbe.cpp
+!/mod/tests/StartupBindingProbe.cpp
 !/mod/tests/README.md
 /mod/src/Controller.cpp
 /mod/src/PcmProbeDll.cpp

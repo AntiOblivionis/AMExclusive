@@ -16,6 +16,23 @@ target_include_directories(am_exclusive_drain_probe PRIVATE src)
 target_compile_definitions(am_exclusive_drain_probe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(am_exclusive_drain_probe PRIVATE ole32 uuid avrt)
 
+# Control-plane regression probe: deliberately aborts before OpenEndpoint.
+add_executable(am_exclusive_startup_probe EXCLUDE_FROM_ALL
+  tests/StartupBindingProbe.cpp
+  src/audio_v2/AudioCoreCoordinator.cpp
+  src/audio_v2/AudioCoreRuntime.cpp
+  src/audio_v2/ResampledPcmSource.cpp
+  src/audio_v2/WasapiExclusiveSink.cpp)
+target_include_directories(am_exclusive_startup_probe PRIVATE
+  src "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/rigtorp-SPSCQueue/include")
+target_compile_definitions(am_exclusive_startup_probe PRIVATE
+  UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(am_exclusive_startup_probe PRIVATE ole32 uuid avrt)
+if(MSVC)
+  target_compile_options(am_exclusive_startup_probe PRIVATE /W4 /permissive- /EHsc /guard:cf /wd4324)
+  target_link_options(am_exclusive_startup_probe PRIVATE /guard:cf)
+endif()
+
 include(FetchContent)
 FetchContent_Declare(
   minhook
