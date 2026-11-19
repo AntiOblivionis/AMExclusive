@@ -148,6 +148,7 @@ private:
     std::uint64_t drainStartPosition_{};
     std::uint64_t drainWaitStartedTick_{};
     bool drainPositionValid_{};
+    bool drainResumeAttempted_{};
     bool pausedWithBuffer_{};
     bool silencePrimePending_{};
     // Device position and committed PCM share the same stream-relative origin.
