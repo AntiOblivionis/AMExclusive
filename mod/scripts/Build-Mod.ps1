@@ -2,7 +2,8 @@
 param(
     [ValidateSet('Debug', 'Release')][string]$Configuration = 'Release',
     [string]$BuildDirectory = 'build',
-    [string]$WinUIMetadataDirectory
+    [string]$WinUIMetadataDirectory,
+    [switch]$SetupOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,22 +38,40 @@ if (-not $clPath) {
 if (-not $cmakePath) { throw 'cmake.exe was not found in PATH or the selected Visual Studio Build Tools instance.' }
 if (-not $clPath) { throw 'An x64 MSVC compiler could not be activated through Visual Studio DevShell.' }
 
-if ($WinUIMetadataDirectory) {
-    $metadataDirectory = (Resolve-Path -LiteralPath $WinUIMetadataDirectory).Path
+if ($SetupOnly) {
+    if (-not (Test-Path -LiteralPath (Join-Path $build 'CMakeCache.txt') -PathType Leaf)) {
+        throw "SetupOnly requires an existing configured build directory: $build"
+    }
+    # Rebuild the installer resource/link so it embeds the signed runtime files
+    # that were copied into the output directory after the initial build.
+    $generatedResource = Join-Path $build 'generated\setup\AMExclusive-Setup.rc'
+    if (Test-Path -LiteralPath $generatedResource) {
+        Remove-Item -LiteralPath $generatedResource -Force
+    }
+    $setupOutput = Join-Path (Join-Path $build $Configuration) 'AMExclusive-Setup.exe'
+    if (Test-Path -LiteralPath $setupOutput) {
+        Remove-Item -LiteralPath $setupOutput -Force
+    }
+    & $cmakePath --build $build --config $Configuration --target am_exclusive_setup --parallel
+    if ($LASTEXITCODE -ne 0) { throw "CMake setup build failed: $LASTEXITCODE" }
 } else {
-    $package = Get-AppxPackage -Name AppleInc.AppleMusicWin -ErrorAction Stop
-    if (-not $package) { throw 'Apple Music is not installed; supply -WinUIMetadataDirectory to build with standalone WinUI metadata.' }
-    $metadataDirectory = $package.InstallLocation
-}
-if (-not (Test-Path -LiteralPath (Join-Path $metadataDirectory 'Microsoft.UI.Xaml.winmd') -PathType Leaf)) {
-    throw "Microsoft.UI.Xaml.winmd was not found in: $metadataDirectory"
-}
+    if ($WinUIMetadataDirectory) {
+        $metadataDirectory = (Resolve-Path -LiteralPath $WinUIMetadataDirectory).Path
+    } else {
+        $package = Get-AppxPackage -Name AppleInc.AppleMusicWin -ErrorAction Stop
+        if (-not $package) { throw 'Apple Music is not installed; supply -WinUIMetadataDirectory to build with standalone WinUI metadata.' }
+        $metadataDirectory = $package.InstallLocation
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $metadataDirectory 'Microsoft.UI.Xaml.winmd') -PathType Leaf)) {
+        throw "Microsoft.UI.Xaml.winmd was not found in: $metadataDirectory"
+    }
 
-& $cmakePath -S $root -B $build -A x64 "-DAPPLE_MUSIC_PACKAGE_DIR=$metadataDirectory"
-if ($LASTEXITCODE -ne 0) { throw "CMake configure failed: $LASTEXITCODE" }
+    & $cmakePath -S $root -B $build -A x64 "-DAPPLE_MUSIC_PACKAGE_DIR=$metadataDirectory"
+    if ($LASTEXITCODE -ne 0) { throw "CMake configure failed: $LASTEXITCODE" }
 
-& $cmakePath --build $build --config $Configuration --parallel
-if ($LASTEXITCODE -ne 0) { throw "CMake build failed: $LASTEXITCODE" }
+    & $cmakePath --build $build --config $Configuration --parallel
+    if ($LASTEXITCODE -ne 0) { throw "CMake build failed: $LASTEXITCODE" }
+}
 
 $output = Join-Path $build $Configuration
 $setupPath = Join-Path $output 'AMExclusive-Setup.exe'

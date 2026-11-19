@@ -1,0 +1,243 @@
+name: Sign Setup
+
+# Builds the current self-contained installer, signs the runtime PE files,
+# rebuilds AMExclusive-Setup.exe with those signed files embedded, then signs
+# the installer itself. This workflow does not create a GitHub Release.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build-and-sign:
+    name: Sign runtime and AMExclusive-Setup.exe
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+      SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+      SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+      AME_EXPECTED_SIGNER_SUBJECT: ${{ vars.AME_EXPECTED_SIGNER_SUBJECT }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Require SignPath configuration
+        run: |
+          $missing = @()
+          foreach ($name in @('SIGNPATH_API_TOKEN', 'SIGNPATH_ORGANIZATION_ID', 'SIGNPATH_PROJECT_SLUG', 'SIGNPATH_SIGNING_POLICY_SLUG')) {
+            if (-not [Environment]::GetEnvironmentVariable($name)) { $missing += $name }
+          }
+          if ($missing.Count -gt 0) {
+            throw "Missing signing configuration: $($missing -join ', ')"
+          }
+
+      - name: Download verified WinUI metadata
+        run: ./mod/scripts/Get-WinUIMetadata.ps1 -OutputDirectory "$env:RUNNER_TEMP/ame-winui"
+
+      - name: Build the unsigned runtime and installer
+        run: |
+          ./mod/scripts/Build-Mod.ps1 -Configuration Release `
+            -BuildDirectory "$env:RUNNER_TEMP/ame-build" `
+            -WinUIMetadataDirectory "$env:RUNNER_TEMP/ame-winui"
+
+      - name: Verify the unsigned installer payload
+        run: |
+          $setup = "$env:RUNNER_TEMP/ame-build/dist/AMExclusive-Setup.exe"
+          $process = Start-Process -FilePath $setup -ArgumentList '--extract-test' -Wait -PassThru -NoNewWindow
+          if ($process.ExitCode -ne 0) { throw "Setup extraction check failed: $($process.ExitCode)" }
+
+      - name: Stage runtime PE files
+        run: |
+          $stage = "$env:RUNNER_TEMP/ame-runtime-unsigned"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          $release = "$env:RUNNER_TEMP/ame-build/Release"
+          foreach ($name in @('am-exclusive-broker.exe', 'am_exclusive_media_control.exe', 'am-exclusive-hook.dll', 'am-exclusive-ui.dll')) {
+            Copy-Item -LiteralPath (Join-Path $release $name) -Destination (Join-Path $stage $name) -Force
+          }
+
+      - name: Upload runtime for SignPath
+        id: upload-runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: ame-runtime-unsigned
+          path: ${{ runner.temp }}/ame-runtime-unsigned
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign runtime PE files with SignPath Foundation
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload-runtime.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: ${{ runner.temp }}/ame-runtime-signed
+
+      - name: Install signed runtime PE files
+        run: |
+          $signed = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/ame-runtime-signed" -Recurse -File)
+          foreach ($name in @('am-exclusive-broker.exe', 'am_exclusive_media_control.exe', 'am-exclusive-hook.dll', 'am-exclusive-ui.dll')) {
+            $file = $signed | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+            if (-not $file) { throw "SignPath did not return $name." }
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path "$env:RUNNER_TEMP/ame-build/Release" $name) -Force
+          }
+
+      - name: Record signed runtime PE files
+        continue-on-error: true
+        run: |
+          $signed = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/ame-runtime-signed" -Recurse -File)
+          $signtool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
+          if (-not $signtool) {
+            $candidate = Get-ChildItem -LiteralPath "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Directory |
+              Sort-Object Name -Descending |
+              ForEach-Object { Join-Path $_.FullName 'x64\signtool.exe' } |
+              Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+              Select-Object -First 1
+            if ($candidate) { $signtool = $candidate }
+          }
+          $expected = $env:AME_EXPECTED_SIGNER_SUBJECT
+          $report = @()
+
+          foreach ($name in @('am-exclusive-broker.exe', 'am_exclusive_media_control.exe', 'am-exclusive-hook.dll', 'am-exclusive-ui.dll')) {
+            $file = $signed | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+            if (-not $file) { throw "SignPath did not return $name." }
+
+            $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            $signtoolResult = 'not-run'
+            if ($signtool) {
+              & $signtool verify /pa /all /q $file.FullName 2>&1 | Out-Null
+              $signtoolResult = "exit $LASTEXITCODE"
+              $global:LASTEXITCODE = 0
+            } else {
+              $signtoolResult = 'signtool.exe not found'
+            }
+            $signerSubject = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { '' }
+            $timeStamper = if ($signature.TimeStamperCertificate) { $signature.TimeStamperCertificate.Subject } else { '' }
+            $expectedMatch = if ($expected) { ($signerSubject -match [Regex]::Escape($expected)) } else { $null }
+            $report += [pscustomobject]@{
+                File = $name
+                Status = [string]$signature.Status
+                StatusMessage = $signature.StatusMessage
+                Signer = $signerSubject
+                TimeStamper = $timeStamper
+                Signtool = $signtoolResult
+                ExpectedSigner = $expected
+                ExpectedSignerMatch = $expectedMatch
+            }
+          }
+
+          $report | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "$env:RUNNER_TEMP/ame-runtime-signature-report.json" -Encoding utf8
+          $report | Format-Table File, Status, Signer, Signtool -AutoSize | Out-String | Write-Output
+
+      - name: Rebuild the installer with signed runtime files embedded
+        run: |
+          ./mod/scripts/Build-Mod.ps1 -Configuration Release `
+            -BuildDirectory "$env:RUNNER_TEMP/ame-build" -SetupOnly
+
+      - name: Verify the rebuilt installer payload
+        run: |
+          $setup = "$env:RUNNER_TEMP/ame-build/dist/AMExclusive-Setup.exe"
+          $process = Start-Process -FilePath $setup -ArgumentList '--extract-test' -Wait -PassThru -NoNewWindow
+          if ($process.ExitCode -ne 0) { throw "Rebuilt setup extraction check failed: $($process.ExitCode)" }
+
+      - name: Stage the unsigned installer
+        run: |
+          $stage = "$env:RUNNER_TEMP/ame-setup-unsigned"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item -LiteralPath "$env:RUNNER_TEMP/ame-build/dist/AMExclusive-Setup.exe" `
+            -Destination (Join-Path $stage 'AMExclusive-Setup.exe') -Force
+
+      - name: Upload installer for SignPath
+        id: upload-installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ame-setup-unsigned
+          path: ${{ runner.temp }}/ame-setup-unsigned
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign the installer with SignPath Foundation
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: ${{ runner.temp }}/ame-setup-signed
+
+      - name: Record signed installer
+        continue-on-error: true
+        run: |
+          $signed = Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/ame-setup-signed" -Recurse -File |
+            Where-Object { $_.Name -eq 'AMExclusive-Setup.exe' } |
+            Select-Object -First 1
+          if (-not $signed) { throw 'SignPath did not return AMExclusive-Setup.exe.' }
+
+          $signature = Get-AuthenticodeSignature -LiteralPath $signed.FullName
+          $signtool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
+          if (-not $signtool) {
+            $candidate = Get-ChildItem -LiteralPath "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Directory |
+              Sort-Object Name -Descending |
+              ForEach-Object { Join-Path $_.FullName 'x64\signtool.exe' } |
+              Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+              Select-Object -First 1
+            if ($candidate) { $signtool = $candidate }
+          }
+          $signtoolResult = if ($signtool) {
+            & $signtool verify /pa /all /q $signed.FullName 2>&1 | Out-Null
+            $code = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            "exit $code"
+          } else {
+            'signtool.exe not found'
+          }
+          $signerSubject = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { '' }
+          $expected = $env:AME_EXPECTED_SIGNER_SUBJECT
+          $installerReport = [pscustomobject]@{
+            File = 'AMExclusive-Setup.exe'
+            Status = [string]$signature.Status
+            StatusMessage = $signature.StatusMessage
+            Signer = $signerSubject
+            TimeStamper = if ($signature.TimeStamperCertificate) { $signature.TimeStamperCertificate.Subject } else { '' }
+            Signtool = $signtoolResult
+            ExpectedSigner = $expected
+            ExpectedSignerMatch = if ($expected) { ($signerSubject -match [Regex]::Escape($expected)) } else { $null }
+          }
+
+          $runtimeReport = @()
+          $runtimeReportPath = "$env:RUNNER_TEMP/ame-runtime-signature-report.json"
+          if (Test-Path -LiteralPath $runtimeReportPath) {
+            $runtimeReport = @(Get-Content -LiteralPath $runtimeReportPath -Raw | ConvertFrom-Json)
+          }
+          $report = [ordered]@{
+            Policy = $env:SIGNPATH_SIGNING_POLICY_SLUG
+            GeneratedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+            Runtime = $runtimeReport
+            Installer = $installerReport
+          }
+          $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$env:RUNNER_TEMP/ame-setup-signed/signature-report.json" -Encoding utf8
+          $installerReport | Format-List File, Status, Signer, TimeStamper, Signtool | Out-String | Write-Output
+          Write-Warning 'Signature results are recorded in signature-report.json; trust/timestamp failures do not block this workflow.'
+
+      - name: Upload the signed installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: AMExclusive-Setup-x64-signed
+          path: ${{ runner.temp }}/ame-setup-signed
+          if-no-files-found: error
+          retention-days: 14
