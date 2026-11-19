@@ -3037,6 +3037,8 @@ AppleOSStatus __cdecl HookV2AudioUnitSetProperty(void* unit, std::uint32_t prope
         binding = L"cross-thread-unambiguous";
     }
     RememberAudioUnitInputFormat(unit, *streamFormat, sourceBitDepth, observationId);
+    g_audioCoreRuntime.OnAudioUnitInputFormatCommitted(
+        unit, rate, streamFormat->mChannelsPerFrame, sourceBitDepth, observationId);
     Log(L"v2 AudioUnit input format remembered unit=" +
         std::to_wstring(reinterpret_cast<std::uintptr_t>(unit)) + L" rate=" +
         std::to_wstring(rate) + L" sourceBitDepth=" + std::to_wstring(sourceBitDepth) +

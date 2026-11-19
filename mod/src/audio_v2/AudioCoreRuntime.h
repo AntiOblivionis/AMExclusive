@@ -191,6 +191,13 @@ public:
                                 std::uint32_t sampleRate, std::uint32_t channels,
                                 std::uint32_t sourceBitDepth,
                                 std::uint64_t observationId = 0) noexcept;
+    // First playback can start before Apple's adaptive AAC -> ALAC handoff
+    // commits the decoder's input format on the already initialized child.
+    // Revisit only that unresolved graph; preserve its observed Start edge.
+    void OnAudioUnitInputFormatCommitted(void* unit, std::uint32_t sampleRate,
+                                         std::uint32_t channels,
+                                         std::uint32_t sourceBitDepth,
+                                         std::uint64_t observationId) noexcept;
     void OnAudioUnitStarted(void* unit) noexcept;
     void OnAudioUnitStopped(void* unit) noexcept;
     void OnAudioUnitUninitialized(void* unit) noexcept;

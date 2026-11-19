@@ -927,6 +927,37 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
     Wake();
 }
 
+void AudioCoreRuntime::OnAudioUnitInputFormatCommitted(
+    void* unit, std::uint32_t sampleRate, std::uint32_t channels,
+    std::uint32_t sourceBitDepth, std::uint64_t observationId) noexcept {
+    if (!UiEnabled() || !unit || sampleRate < 8000 || sampleRate > 768000 ||
+        channels != 2) return;
+    ControlScope lock(*this);
+    // A prefetched decoder or a different AudioUnit must not replace a live
+    // generation. Only fill in the identity missing from the current graph's
+    // original Initialize; an actual later Initialize still owns replacements.
+    if (graphUnit_ != unit || graphBound_ || graphConverter_ || graphObservationId_ != 0)
+        return;
+    void* candidate{};
+    auto bits = sourceBitDepth;
+    if (bits != 0) {
+        registry_.FindCandidate(sampleRate, channels, bits, observationId, candidate);
+    } else {
+        registry_.FindCandidateAnyPrecision(sampleRate, channels, observationId,
+                                            candidate, bits);
+    }
+    graphRate_ = sampleRate;
+    graphChannels_ = channels;
+    graphSourceBits_ = bits;
+    // Leave an unresolved observation open for the later ALAC format commit.
+    if (candidate) {
+        graphConverter_ = candidate;
+        graphObservationId_ = observationId;
+    }
+    TryBindGraphLocked();
+    Wake();
+}
+
 void AudioCoreRuntime::OnAudioUnitStarted(void* unit) noexcept {
     if (!UiEnabled()) return;
     ControlScope lock(*this);
@@ -937,12 +968,18 @@ void AudioCoreRuntime::OnAudioUnitStarted(void* unit) noexcept {
     if (graphUnit_ == unit) {
         graphStarted_ = true;
         TryBindGraphLocked();
-    } else if ((graphBound_ || pendingGraphBind_.converter) && graphUnit_ && unit) {
+    } else if ((graphBound_ || pendingGraphBind_.converter ||
+                (!graphConverter_ && graphObservationId_ == 0 &&
+                 graphRate_ >= 8000 && graphRate_ <= 768000 && graphChannels_ == 2)) &&
+               graphUnit_ && unit) {
         // Apple starts the hardware-output parent AudioUnit (for example
         // auou/7820) after initializing the child graph AudioUnit that owns
         // the P0 converter (7823). The child identity is already fixed by
         // the stream-format commit and bound converter, so this first parent
         // start is the graph-start edge for activation purposes.
+        // On cold start this edge can precede the ALAC cookie/format commit.
+        // Remember it while the identified child is still unresolved, so its
+        // late bind does not require a second Start (or a user track skip).
         graphStarted_ = true;
         graphOutputUnit_ = unit;
     }

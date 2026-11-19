@@ -30,3 +30,24 @@ hardware.
 
 These are transport/control tests. They do not establish audible correctness
 or Apple Music lifecycle behavior.
+
+## Cold-start graph-binding regression probe
+
+```powershell
+cmake --build <build-directory> --config Release --target am_exclusive_startup_probe
+<build-directory>\Release\am_exclusive_startup_probe.exe
+```
+
+This probe does not acquire an audio endpoint or play audio. It reproduces
+the first-play ordering observed on Apple Music 1.7.0.155: the child AudioUnit
+initializes with unknown source precision, its hardware-output parent starts,
+and the ALAC cookie/decoder registration and actual child input-format commit
+arrive later. Without the late commit notification the graph stays unbound.
+
+The probe verifies that a late commit for the active unresolved child binds
+the exact registered decoder and preserves the early parent Start at 44.1,
+48, 96 and 192 kHz. Its handoff callback deliberately returns E_ABORT before
+OpenEndpoint, proving that the activation gates were reached without touching
+hardware. It also checks unrelated-unit, rate-mismatch, live-generation and
+retired-graph guards. These are deterministic control-plane checks; they do
+not establish audible correctness or USB reconnection recovery.
