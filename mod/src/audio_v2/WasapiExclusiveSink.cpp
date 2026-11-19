@@ -16,6 +16,12 @@ namespace {
 
 constexpr REFERENCE_TIME kReferenceTimePerSecond = 10000000;
 constexpr REFERENCE_TIME kDefaultPeriod = 200000; // 20 ms
+// A drain that has not moved the device clock this far into a pending
+// end-of-stream restarts the client once; a clock still pinned after the
+// grace period below cannot be proven to advance, so the stream is completed
+// instead of faulting the generation.
+constexpr ULONGLONG kDrainResumeAfterMs = 200;
+constexpr ULONGLONG kDrainPinnedMs = 750;
 
 void Release(IUnknown*& value) noexcept {
     if (value) value->Release();
@@ -540,9 +546,10 @@ HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
 HRESULT WasapiExclusiveSink::CheckEndOfStreamDrain() noexcept {
     const auto now = GetTickCount64();
     if (drainWaitStartedTick_ == 0) drainWaitStartedTick_ = now;
-    // An unavailable/stalled clock must not hold a generation forever. This
-    // deadline can only fault, never certify playback. Pause/resume restarts
-    // the watchdog while retaining the device-clock drain boundary.
+    // An unavailable/stalled clock must not hold a generation forever. The
+    // deadline bounds the wait; it is no longer fatal, see the pinned-clock
+    // handling below. Pause/resume restarts the watchdog while retaining the
+    // device-clock drain boundary.
     const auto elapsed = now - drainWaitStartedTick_;
     drainElapsedMs_.store(elapsed, std::memory_order_relaxed);
     // Before the first IAudioClient::Start of this stream the device clock is
@@ -566,9 +573,28 @@ HRESULT WasapiExclusiveSink::CheckEndOfStreamDrain() noexcept {
         endOfStreamComplete_.store(true, std::memory_order_release);
         return S_OK;
     }
-    // A late scheduler wake must still accept already-proven consumption.
+    // A source starvation stops the client; on some USB endpoints the clock
+    // stays parked after the restart, so the submitted tail keeps playing but
+    // the position never reaches the target again. Give the endpoint one
+    // explicit restart before concluding that the clock cannot be moved.
+    if (!drainResumeAttempted_ && elapsed >= kDrainResumeAfterMs) {
+        drainResumeAttempted_ = true;
+        if (client_) {
+            const HRESULT resume = client_->Start();
+            if (resume == S_OK) NoteClientStarted();
+        }
+    }
     // Time can fault an incomplete drain; it can never prove completion.
-    if (elapsed > drainMaxWaitMs_) return ammod::audio::kEndpointDrainTimeout;
+    // Retiring the generation here also leaves the next track silent until a
+    // manual skip, so a pinned clock is completed once the resume attempt has
+    // had its grace period. The unproven tail is at most one endpoint buffer,
+    // and a genuinely broken endpoint still fails on the next Open.
+    if (elapsed > drainMaxWaitMs_ ||
+        (drainResumeAttempted_ && position == drainStartPosition_ &&
+         elapsed >= kDrainPinnedMs)) {
+        RecordError(ammod::audio::kEndpointDrainTimeout);
+        endOfStreamComplete_.store(true, std::memory_order_release);
+    }
     return S_OK;
 }
 
@@ -645,6 +671,7 @@ void WasapiExclusiveSink::ResetClockTimeline() noexcept {
     clockReadResult_.store(S_OK, std::memory_order_relaxed);
     drainElapsedMs_.store(0, std::memory_order_relaxed);
     drainPositionValid_ = false;
+    drainResumeAttempted_ = false;
     drainStartPosition_ = 0;
     drainWaitStartedTick_ = 0;
 }
