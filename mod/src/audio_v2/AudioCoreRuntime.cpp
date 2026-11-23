@@ -867,23 +867,39 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
                                                std::uint32_t sampleRate,
                                                std::uint32_t channels,
                                                std::uint32_t sourceBitDepth,
-                                               std::uint64_t observationId) noexcept {
+                                               std::uint64_t observationId,
+                                               bool advisorySourcePrecision) noexcept {
     if (!UiEnabled() || !unit) return;
     ControlScope lock(*this);
     ExtendSeekQuietPeriodLocked();
-    if (!candidateConverter && sampleRate != 0 && channels != 0 && sourceBitDepth != 0) {
-        // AudioUnitInitialize commonly runs on a render/control thread
-        // different from the converter setup thread. Resolve the converter by
-        // the cross-thread format observation rather than assuming TLS.
-        registry_.FindCandidate(sampleRate, channels, sourceBitDepth, observationId,
-                                candidateConverter);
-    }
-    if (!candidateConverter && sampleRate != 0 && channels != 0 && sourceBitDepth == 0) {
-        // Some Apple output units expose only the LPCM tuple.  Once the
-        // decoder cookie has supplied precision, resolve the compressed P0
-        // registration by rate/channel and carry its source depth forward.
-        registry_.FindCandidateAnyPrecision(sampleRate, channels, observationId,
-                                             candidateConverter, sourceBitDepth);
+    if (!candidateConverter && sampleRate != 0 && channels != 0) {
+        if (advisorySourcePrecision) {
+            // A historical cookie can describe an already disposed decoder.
+            // Only the exact observation or a unique newer live lossless
+            // source can supply precision for this cross-thread AudioUnit.
+            if (!registry_.FindCandidateAnyPrecision(sampleRate, channels, observationId,
+                                                       candidateConverter, sourceBitDepth)) {
+                void* liveConverter{};
+                std::uint32_t liveBits{};
+                ConverterRegistrationSnapshot live{};
+                if (registry_.FindCandidateAnyPrecision(sampleRate, channels, 0,
+                                                        liveConverter, liveBits, true) &&
+                    liveBits != 0 && registry_.Snapshot(liveConverter, live) &&
+                    (live.registration.encodedFormat == kAlac ||
+                     live.registration.encodedFormat == kQlac) &&
+                    live.registration.observationId > observationId) {
+                    candidateConverter = liveConverter;
+                    sourceBitDepth = liveBits;
+                    observationId = live.registration.observationId;
+                }
+            }
+        } else if (sourceBitDepth != 0) {
+            registry_.FindCandidate(sampleRate, channels, sourceBitDepth, observationId,
+                                    candidateConverter);
+        } else {
+            registry_.FindCandidateAnyPrecision(sampleRate, channels, observationId,
+                                                 candidateConverter, sourceBitDepth);
+        }
     }
     // Apple initializes the hardware-output parent AudioUnit after the child
     // graph unit that owns the P0 converter (the inverse order of the parent

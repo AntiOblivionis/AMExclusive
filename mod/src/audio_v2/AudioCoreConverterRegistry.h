@@ -258,7 +258,8 @@ public:
     bool FindCandidateAnyPrecision(std::uint32_t sampleRate, std::uint32_t channels,
                                    std::uint64_t observationId,
                                    void*& converter,
-                                   std::uint32_t& sourceBitDepth) const noexcept {
+                                   std::uint32_t& sourceBitDepth,
+                                   bool requireUnique = false) const noexcept {
         converter = nullptr;
         sourceBitDepth = 0;
         const Slot* best{};
@@ -270,6 +271,9 @@ public:
                 continue;
             }
             const auto encoded = slot.encodedFormat.load(std::memory_order_relaxed);
+            // A live local source with this format also makes a rate-only
+            // match ambiguous, even though this lookup returns compressed sources.
+            if (requireUnique && encoded == 0x6C70636Du) return false;
             if (encoded != 0x616C6163u && encoded != 0x716C6163u &&
                 encoded != 0x71616163u) continue;
             const auto depth = slot.sourceBitDepth.load(std::memory_order_relaxed);
@@ -280,6 +284,7 @@ public:
             if (depth != 0 && !IsSupportedSourceDepth(static_cast<std::uint16_t>(depth))) continue;
             const auto observed = slot.observationId.load(std::memory_order_relaxed);
             if (observationId != 0 && observed != observationId) continue;
+            if (requireUnique && best) return false;
             if (observed < bestObservation) continue;
             best = &slot;
             bestObservation = observed;

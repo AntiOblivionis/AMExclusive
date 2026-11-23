@@ -813,6 +813,7 @@ struct AudioUnitInputFormatState {
     AudioStreamBasicDescription format{};
     std::uint32_t sourceBitDepth{};
     std::uint64_t observationId{};
+    bool advisorySourcePrecision{};
 };
 std::unordered_map<void*, AudioUnitInputFormatState> g_audioUnitInputFormats;
 std::atomic<std::uint64_t> g_v2ObservedRenderCalls{};
@@ -1344,9 +1345,11 @@ void RetireAudioUnitEpoch(void* unit) {
 
 void RememberAudioUnitInputFormat(void* unit, const AudioStreamBasicDescription& format,
                                   std::uint32_t sourceBitDepth,
-                                  std::uint64_t observationId) {
+                                  std::uint64_t observationId,
+                                  bool advisorySourcePrecision) {
     std::lock_guard lock(g_audioUnitEpochMutex);
-    g_audioUnitInputFormats[unit] = {format, sourceBitDepth, observationId};
+    g_audioUnitInputFormats[unit] = {format, sourceBitDepth, observationId,
+                                    advisorySourcePrecision};
 }
 
 bool FindAudioUnitInputFormat(void* unit, AudioUnitInputFormatState& state) {
@@ -3032,11 +3035,11 @@ AppleOSStatus __cdecl HookV2AudioUnitSetProperty(void* unit, std::uint32_t prope
         (qlacCandidateMatches ? L"same-thread-qlac" :
          (localPcmCandidateMatches ? L"same-thread-pre-src-lpcm" :
           (hasFreshCandidate ? L"fresh-non-p0" : L"unknown")));
-    if (!sourceBitDepth && ResolveUnambiguousQlacBitDepth(
-            rate, streamFormat->mChannelsPerFrame, sourceBitDepth, observationId)) {
-        binding = L"cross-thread-unambiguous";
-    }
-    RememberAudioUnitInputFormat(unit, *streamFormat, sourceBitDepth, observationId);
+    const bool advisorySourcePrecision = !sourceBitDepth && ResolveUnambiguousQlacBitDepth(
+        rate, streamFormat->mChannelsPerFrame, sourceBitDepth, observationId);
+    if (advisorySourcePrecision) binding = L"cross-thread-cookie-hint";
+    RememberAudioUnitInputFormat(unit, *streamFormat, sourceBitDepth, observationId,
+                                 advisorySourcePrecision);
     Log(L"v2 AudioUnit input format remembered unit=" +
         std::to_wstring(reinterpret_cast<std::uintptr_t>(unit)) + L" rate=" +
         std::to_wstring(rate) + L" sourceBitDepth=" + std::to_wstring(sourceBitDepth) +
@@ -3217,6 +3220,7 @@ AppleOSStatus __cdecl HookV2AudioUnitInitialize(void* unit) {
                                             : (fresh ? g_threadGraphFormat.sourceBitDepth : 0u);
         const auto observationId = hasRemembered ? remembered.observationId
                                                  : (fresh ? g_threadGraphFormat.observationId : 0u);
+        const bool advisorySourcePrecision = hasRemembered && remembered.advisorySourcePrecision;
         const bool sameObservedCandidate = fresh &&
             (!hasRemembered || remembered.observationId == 0 ||
              remembered.observationId == g_threadGraphFormat.observationId);
@@ -3226,12 +3230,12 @@ AppleOSStatus __cdecl HookV2AudioUnitInitialize(void* unit) {
         // those observations may overwrite g_threadGraphFormat but are not P0.
         // Treating such an unregistered work converter as authoritative skips
         // ResolveCandidate() and can leave a seek rebuild started but unbound.
-        const bool registeredObservedCandidate = sameObservedCandidate &&
+        const bool registeredObservedCandidate = !advisorySourcePrecision && sameObservedCandidate &&
             g_audioCoreRuntime.IsConverterRegistered(g_threadGraphFormat.converter);
         void* candidateConverter = registeredObservedCandidate
             ? g_threadGraphFormat.converter : nullptr;
         std::uint32_t resolvedSourceBitDepth = sourceBitDepth;
-        if (!candidateConverter && rate != 0 && channels == 2) {
+        if (!advisorySourcePrecision && !candidateConverter && rate != 0 && channels == 2) {
             const bool resolved = g_audioCoreRuntime.ResolveCandidate(
                 rate, channels, resolvedSourceBitDepth, observationId, candidateConverter);
             Log(L"v2 graph candidate resolution rate=" + std::to_wstring(rate) +
@@ -3250,7 +3254,8 @@ AppleOSStatus __cdecl HookV2AudioUnitInitialize(void* unit) {
             std::to_wstring(hasRemembered && !sameObservedCandidate) + L" qpc=" +
             std::to_wstring(CurrentQpc()));
         g_audioCoreRuntime.OnAudioUnitInitialized(
-            unit, candidateConverter, rate, channels, sourceBitDepth, observationId);
+            unit, candidateConverter, rate, channels, sourceBitDepth, observationId,
+            advisorySourcePrecision);
     }
     return result;
 }

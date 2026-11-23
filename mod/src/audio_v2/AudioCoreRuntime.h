@@ -190,7 +190,8 @@ public:
     void OnAudioUnitInitialized(void* unit, void* candidateConverter,
                                 std::uint32_t sampleRate, std::uint32_t channels,
                                 std::uint32_t sourceBitDepth,
-                                std::uint64_t observationId = 0) noexcept;
+                                std::uint64_t observationId = 0,
+                                bool advisorySourcePrecision = false) noexcept;
     void OnAudioUnitStarted(void* unit) noexcept;
     void OnAudioUnitStopped(void* unit) noexcept;
     void OnAudioUnitUninitialized(void* unit) noexcept;
