@@ -314,7 +314,7 @@ private:
     bool DirectSelectionPending() const noexcept;
     bool RetireDirectSelectionLocked() noexcept;
     bool BeginEndOfStreamDrainLocked(void* converter, bool requireShortTail) noexcept;
-    void FinalizeEndOfStreamDrainLocked() noexcept;
+    HRESULT FinalizeEndOfStreamDrainLocked(HRESULT drainResult = S_OK) noexcept;
     void RetireCompletedCaptureLocked(void* converter) noexcept;
     void TryBindPendingGraphLocked() noexcept;
     void RetireCaptureLocked(bool keepGraph, bool keepPendingCapture = false) noexcept;

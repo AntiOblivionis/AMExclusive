@@ -1439,15 +1439,30 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
             ControlScope lock(*this);
             nextDiagnosticTelemetryTick_ = 0;
             if (graphBound_ && coordinator_.SinkState() == WasapiSinkState::Faulted) {
-                HRESULT sinkError = coordinator_.Sink().Stats().lastError;
-                if (SUCCEEDED(sinkError)) sinkError = E_UNEXPECTED;
-                uiEnabled_.store(false, std::memory_order_release);
-                Emit(AudioCoreRuntimeEvent::Faulted, sinkError);
-                RetireCaptureLocked(false);
-                registry_.RetireAll();
-                continue;
+                const auto sink = coordinator_.Sink().Stats();
+                HRESULT sinkError = sink.lastError;
+                const bool terminalDrainTimedOut =
+                    sinkError == ammod::audio::kEndpointDrainTimeout &&
+                    coordinator_.Phase() == AudioCoreGatePhase::Active &&
+                    endOfStreamDrainPending_ && endOfStreamDrainConverter_ &&
+                    endOfStreamDrainConverter_ == BoundConverter() &&
+                    sink.clientStarts != 0 && sink.submittedFrames != 0 &&
+                    sink.endOfStreamSubmitted && !sink.endOfStreamComplete &&
+                    SUCCEEDED(sink.clockReadResult);
+                if (terminalDrainTimedOut) {
+                    sinkError = FinalizeEndOfStreamDrainLocked(sinkError);
+                }
+                if (!terminalDrainTimedOut || FAILED(sinkError)) {
+                    if (SUCCEEDED(sinkError)) sinkError = E_UNEXPECTED;
+                    uiEnabled_.store(false, std::memory_order_release);
+                    Emit(AudioCoreRuntimeEvent::Faulted, sinkError);
+                    RetireCaptureLocked(false);
+                    registry_.RetireAll();
+                    continue;
+                }
+            } else {
+                (void)FinalizeEndOfStreamDrainLocked();
             }
-            FinalizeEndOfStreamDrainLocked();
             TryBindPendingGraphLocked();
             if (!graphBound_) {
                 if (void* pendingLocal =
@@ -1975,8 +1990,9 @@ void AudioCoreRuntime::TryActivateLocked() noexcept {
     Emit(AudioCoreRuntimeEvent::Active, S_OK);
 }
 
-void AudioCoreRuntime::FinalizeEndOfStreamDrainLocked() noexcept {
-    if (!endOfStreamDrainPending_ || !coordinator_.EndOfStreamComplete()) return;
+HRESULT AudioCoreRuntime::FinalizeEndOfStreamDrainLocked(HRESULT drainResult) noexcept {
+    if (!endOfStreamDrainPending_ ||
+        (SUCCEEDED(drainResult) && !coordinator_.EndOfStreamComplete())) return S_OK;
 
     const auto drainedConverter = endOfStreamDrainConverter_;
     const auto localSuccessor = pendingLocalSuccessor_;
@@ -1984,9 +2000,15 @@ void AudioCoreRuntime::FinalizeEndOfStreamDrainLocked() noexcept {
     endOfStreamDrainConverter_ = nullptr;
     pendingLocalSuccessor_ = nullptr;
 
-    // SRC completion requires device-clock drain evidence after terminal
-    // submission; native-rate output now uses the same device-clock drain.
+    // A watchdog timeout ends this stream with its original error still logged
+    // by CloseExit. It leaves the selected successor eligible for handoff.
     RetireCompletedCaptureLocked(drainedConverter);
+
+    if (FAILED(drainResult)) {
+        // Close preserves the original sink error unless teardown itself fails.
+        const HRESULT closeResult = coordinator_.Sink().Stats().lastError;
+        if (FAILED(closeResult) && closeResult != drainResult) return closeResult;
+    }
 
     if (localSuccessor) {
         ConverterRegistrationSnapshot snapshot{};
@@ -2002,14 +2024,15 @@ void AudioCoreRuntime::FinalizeEndOfStreamDrainLocked() noexcept {
         }
     }
     TryBindPendingGraphLocked();
+    return S_OK;
 }
 
 void AudioCoreRuntime::RetireCompletedCaptureLocked(void* converter) noexcept {
     const auto successor = pendingGraphBind_;
     RetireCaptureLocked(true, true);
     if (graphConverter_ == converter) graphConverter_ = nullptr;
-    // Only natural completion/producer disposal may carry a blocked successor
-    // across retirement. Skip, seek, rejection and UI Off use plain retirement.
+    // Keep only the selected successor across a handoff retirement.
+    // Skip, seek, rejection and UI Off use plain retirement.
     if (successor.converter && successor.converter != converter &&
         successor.unit == graphUnit_ && successor.converter == graphConverter_) {
         pendingGraphBind_ = successor;
