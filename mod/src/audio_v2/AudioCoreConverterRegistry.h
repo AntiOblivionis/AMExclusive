@@ -259,7 +259,8 @@ public:
                                    std::uint64_t observationId,
                                    void*& converter,
                                    std::uint32_t& sourceBitDepth,
-                                   bool requireUnique = false) const noexcept {
+                                   bool requireUnique = false,
+                                   std::uint64_t ignoredRegistrationId = 0) const noexcept {
         converter = nullptr;
         sourceBitDepth = 0;
         const Slot* best{};
@@ -268,6 +269,10 @@ public:
             if (slot.key.load(std::memory_order_acquire) <= kReservedKey ||
                 slot.rate.load(std::memory_order_relaxed) != sampleRate ||
                 slot.channels.load(std::memory_order_relaxed) != channels) {
+                continue;
+            }
+            if (ignoredRegistrationId != 0 &&
+                slot.registrationId.load(std::memory_order_relaxed) == ignoredRegistrationId) {
                 continue;
             }
             const auto encoded = slot.encodedFormat.load(std::memory_order_relaxed);

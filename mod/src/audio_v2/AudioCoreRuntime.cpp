@@ -643,6 +643,7 @@ bool AudioCoreRuntime::BeginEndOfStreamDrainLocked(void* converter,
     if (!coordinator_.SealEndOfStream()) return false;
     endOfStreamDrainPending_ = true;
     endOfStreamDrainConverter_ = converter;
+    endOfStreamDrainUnit_ = graphUnit_;
     return true;
 }
 
@@ -877,14 +878,35 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
             // A historical cookie can describe an already disposed decoder.
             // Only the exact observation or a unique newer live lossless
             // source can supply precision for this cross-thread AudioUnit.
+            const auto hintedDepth = sourceBitDepth;
             if (!registry_.FindCandidateAnyPrecision(sampleRate, channels, observationId,
                                                        candidateConverter, sourceBitDepth)) {
+                // After a sealed streaming EOF and Uninitialize of the same child,
+                // the old source can still be draining at a different source depth.
+                // Exclude only that bound registration from the usual uniqueness check.
+                const auto& previousSource = coordinator_.SourceFormat();
+                ConverterRegistrationSnapshot predecessor{};
+                std::uint64_t ignoredRegistrationId{};
+                if (endOfStreamDrainPending_ && !graphUnit_ && unit == endOfStreamDrainUnit_ &&
+                    !seekFence_ && !userPauseIntent_ && !DirectSelectionPending() &&
+                    hintedDepth != 0 && previousSource.sampleRate == sampleRate &&
+                    previousSource.channels == channels && previousSource.sourceValidBits != hintedDepth &&
+                    registry_.Snapshot(endOfStreamDrainConverter_, predecessor) && predecessor.bound &&
+                    predecessor.registration.mediaGeneration == coordinator_.MediaGeneration() &&
+                    predecessor.registration.observationId < observationId &&
+                    (predecessor.registration.encodedFormat == kAlac ||
+                     predecessor.registration.encodedFormat == kQlac)) {
+                    ignoredRegistrationId = predecessor.registrationId;
+                }
+
                 void* liveConverter{};
                 std::uint32_t liveBits{};
                 ConverterRegistrationSnapshot live{};
                 if (registry_.FindCandidateAnyPrecision(sampleRate, channels, 0,
-                                                        liveConverter, liveBits, true) &&
-                    liveBits != 0 && registry_.Snapshot(liveConverter, live) &&
+                                                        liveConverter, liveBits, true,
+                                                        ignoredRegistrationId) &&
+                    liveBits != 0 && (ignoredRegistrationId == 0 || liveBits == hintedDepth) &&
+                    registry_.Snapshot(liveConverter, live) &&
                     (live.registration.encodedFormat == kAlac ||
                      live.registration.encodedFormat == kQlac) &&
                     live.registration.observationId > observationId) {
@@ -932,6 +954,7 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
         // will repopulate graphOutputUnit_.
         graphOutputUnit_ = nullptr;
     }
+    endOfStreamDrainUnit_ = nullptr;
     graphUnit_ = unit;
     graphConverter_ = candidateConverter;
     graphRate_ = sampleRate;
@@ -2100,6 +2123,7 @@ void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph, bool keepPendingCaptu
     streamingEofCandidateConverter_.store(nullptr, std::memory_order_release);
     endOfStreamDrainPending_ = false;
     endOfStreamDrainConverter_ = nullptr;
+    endOfStreamDrainUnit_ = nullptr;
     pendingLocalSuccessor_ = nullptr;
     pendingLocalRebindConverter_.store(nullptr, std::memory_order_release);
     const bool hasCapture = graphBound_ ||

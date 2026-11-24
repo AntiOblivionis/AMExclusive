@@ -411,6 +411,7 @@ private:
     std::atomic<void*> streamingEofCandidateConverter_{};
     bool endOfStreamDrainPending_{};
     void* endOfStreamDrainConverter_{};
+    void* endOfStreamDrainUnit_{};
     std::atomic<std::uint64_t> directSelectionArmEpoch_{};
     std::atomic<std::uint64_t> directSelectionArmGeneration_{};
     std::atomic<std::uint64_t> transportSkipArmEpoch_{};
