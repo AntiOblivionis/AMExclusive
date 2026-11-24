@@ -194,7 +194,7 @@ public:
                                 bool advisorySourcePrecision = false) noexcept;
     void OnAudioUnitStarted(void* unit) noexcept;
     void OnAudioUnitStopped(void* unit) noexcept;
-    void OnAudioUnitUninitialized(void* unit) noexcept;
+    void OnAudioUnitUninitialized(void* unit, std::uint64_t lastObservation = 0) noexcept;
 
     void OnNativeClientInitialized(void* client, const wchar_t* endpoint,
                                    AUDCLNT_SHAREMODE shareMode, DWORD flags,
@@ -386,6 +386,12 @@ private:
     bool seekFence_{};
     std::uint64_t latestSeekEpoch_{};
     ULONGLONG seekFenceReleaseTick_{};
+    struct SeekRebuild final {
+        void* unit{};
+        std::uint32_t sampleRate{};
+        std::uint64_t lastObservation{};
+        std::uint64_t lastRegistration{};
+    } seekRebuild_{};
     bool nativeInitialized_{};
     bool nativeStarted_{};
     bool graphBound_{};

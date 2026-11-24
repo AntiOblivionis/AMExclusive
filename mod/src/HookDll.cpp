@@ -3315,11 +3315,13 @@ AppleOSStatus __cdecl HookV2AudioUnitUninitialize(void* unit) {
     if (ammod::ProcessExiting()) return g_v2OriginalAudioUnitUninitialize ? g_v2OriginalAudioUnitUninitialize(unit) : -1;
     const auto result = g_v2OriginalAudioUnitUninitialize
         ? g_v2OriginalAudioUnitUninitialize(unit) : -1;
+    const auto lastObservation = result == 0
+        ? g_formatObservationSequence.load() : 0;
     Log(L"v2 AudioUnitUninitialize unit=" +
         std::to_wstring(reinterpret_cast<std::uintptr_t>(unit)) +
         L" result=" + std::to_wstring(result) + L" qpc=" +
         std::to_wstring(CurrentQpc()));
-    g_audioCoreRuntime.OnAudioUnitUninitialized(unit);
+    g_audioCoreRuntime.OnAudioUnitUninitialized(unit, lastObservation);
     RetireAudioUnitEpoch(unit);
     return result;
 }

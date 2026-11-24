@@ -84,6 +84,7 @@ bool AudioCoreRuntime::Start(const AudioCoreRuntimeCallbacks& callbacks) noexcep
     observedPlaybackPlaying_ = false;
     observedPlaybackItem_ = pausedPlaybackItem_ = pausedPlaybackGeneration_ = 0;
     seekFence_ = false;
+    seekRebuild_ = {};
     latestSeekEpoch_ = 0;
     seekFenceReleaseTick_ = 0;
     streamingProducerDrainPending_ = false;
@@ -195,6 +196,7 @@ void AudioCoreRuntime::SetUiEnabled(bool enabled) noexcept {
     userPauseIntent_ = false;
     nativeStartedAfterUserPause_ = false;
     seekFence_ = false;
+    seekRebuild_ = {};
     streamingProducerDrainPending_ = false;
     streamingProducerDrainConverter_ = nullptr;
     streamingEofCandidateConverter_.store(nullptr, std::memory_order_release);
@@ -351,6 +353,7 @@ void AudioCoreRuntime::OnTransportSkip(std::uint64_t epoch) noexcept {
         directSelectionSkipEpoch_.store(epoch, std::memory_order_release);
     }
     ControlScope lock(*this);
+    seekRebuild_ = {};
     if (transportSkip) {
         const auto armedGeneration =
             transportSkipArmGeneration_.load(std::memory_order_acquire);
@@ -416,6 +419,7 @@ bool AudioCoreRuntime::DirectSelectionPending() const noexcept {
 
 bool AudioCoreRuntime::RetireDirectSelectionLocked() noexcept {
     if (!DirectSelectionPending()) return false;
+    seekRebuild_ = {};
     AdvanceEventEpochLocked();
     const auto converter = boundConverter_.load(std::memory_order_acquire);
     // Preserve only an already selected, identity-checked successor. Never
@@ -435,6 +439,12 @@ void AudioCoreRuntime::OnTransportSeekBegin(std::uint64_t epoch) noexcept {
     latestSeekEpoch_ = epoch;
     seekFence_ = true;
     seekFenceReleaseTick_ = 0;
+    seekRebuild_ = {};
+    ConverterRegistrationSnapshot outgoing{};
+    if (graphUnit_ && registry_.Snapshot(BoundConverter(), outgoing) && outgoing.bound &&
+        (outgoing.registration.encodedFormat == kAlac || outgoing.registration.encodedFormat == kQlac)) {
+        seekRebuild_ = {graphUnit_, outgoing.registration.outputFormat.sampleRate};
+    }
     // Silence the currently audible generation as soon as the user grabs the
     // scrubber. Apple may rebuild several transient graphs while the pointer
     // moves; those graphs may capture P0, but they are not allowed to own the
@@ -901,11 +911,20 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
 
                 void* liveConverter{};
                 std::uint32_t liveBits{};
+                const bool uniqueLive = registry_.FindCandidateAnyPrecision(
+                    sampleRate, channels, 0, liveConverter, liveBits, true, ignoredRegistrationId);
+                // A seek can leave transient decoders registered after the child
+                // is torn down. Retry the uniqueness check only for the same child
+                // with a fresh cookie and decoder registration after its teardown.
+                const bool uniqueAfterSeek = !uniqueLive && seekFence_ && !graphUnit_ &&
+                    !userPauseIntent_ && !DirectSelectionPending() && seekRebuild_.unit == unit &&
+                    seekRebuild_.sampleRate == sampleRate && seekRebuild_.lastRegistration != 0 &&
+                    observationId > seekRebuild_.lastObservation &&
+                    registry_.FindCandidateAnyPrecision(sampleRate, channels, 0, liveConverter,
+                                                        liveBits, true, 0, seekRebuild_.lastRegistration);
                 ConverterRegistrationSnapshot live{};
-                if (registry_.FindCandidateAnyPrecision(sampleRate, channels, 0,
-                                                        liveConverter, liveBits, true,
-                                                        ignoredRegistrationId) &&
-                    liveBits != 0 && (ignoredRegistrationId == 0 || liveBits == hintedDepth) &&
+                if ((uniqueLive || uniqueAfterSeek) && liveBits != 0 &&
+                    ((ignoredRegistrationId == 0 && !uniqueAfterSeek) || liveBits == hintedDepth) &&
                     registry_.Snapshot(liveConverter, live) &&
                     (live.registration.encodedFormat == kAlac ||
                      live.registration.encodedFormat == kQlac) &&
@@ -955,6 +974,7 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
         graphOutputUnit_ = nullptr;
     }
     endOfStreamDrainUnit_ = nullptr;
+    seekRebuild_ = {};
     graphUnit_ = unit;
     graphConverter_ = candidateConverter;
     graphRate_ = sampleRate;
@@ -1042,12 +1062,16 @@ void AudioCoreRuntime::OnAudioUnitStopped(void* unit) noexcept {
     Wake();
 }
 
-void AudioCoreRuntime::OnAudioUnitUninitialized(void* unit) noexcept {
+void AudioCoreRuntime::OnAudioUnitUninitialized(void* unit, std::uint64_t lastObservation) noexcept {
     if (!UiEnabled()) return;
     ControlScope lock(*this);
     ExtendSeekQuietPeriodLocked();
     if (graphUnit_ != unit) return;
     (void)RetireDirectSelectionLocked();
+    if (seekFence_ && seekRebuild_.unit == unit && lastObservation != 0) {
+        seekRebuild_.lastObservation = lastObservation;
+        seekRebuild_.lastRegistration = registry_.LatestRegistrationId();
+    }
     pendingGraphBind_ = {};
     ClearPendingCaptureLocked();
     graphPaused_ = false;
@@ -1911,6 +1935,7 @@ void AudioCoreRuntime::TryActivateLocked() noexcept {
         if (seekFenceReleaseTick_ == 0 || GetTickCount64() < seekFenceReleaseTick_) return;
         seekFence_ = false;
         seekFenceReleaseTick_ = 0;
+        seekRebuild_ = {};
     }
     if (!UiEnabled() || !graphBound_ || !graphStarted_ || !nativeInitialized_ ||
         !nativeStarted_ || coordinator_.Phase() != AudioCoreGatePhase::Capturing ||
